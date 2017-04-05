@@ -30,7 +30,7 @@ var (
 )
 
 func main() {
-	flags.Parse("http", "https", "insecure", "letscache", "log", "tls")
+	flags.Parse(flags.Server)
 	http.Handle("/", newServer())
 	if !flags.InsecureHTTP {
 		go func() {
@@ -52,7 +52,8 @@ var sourceRepo = map[string]string{
 
 	"android.upspin.io": "https://upspin.googlesource.com/android",
 	"augie.upspin.io":   "https://upspin.googlesource.com/augie",
-	"cloud.upspin.io":   "https://upspin.googlesource.com/cloud",
+	"aws.upspin.io":     "https://upspin.googlesource.com/aws",
+	"gcp.upspin.io":     "https://upspin.googlesource.com/gcp",
 }
 
 var (
