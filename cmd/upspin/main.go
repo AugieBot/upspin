@@ -63,6 +63,9 @@ its -l flag and debugging enabled, run
 
 	upspin -log debug ls -l
 
+As a shorthand, a lone at sign (@) at the beginning of an Upspin path
+stands for the current user's Upspin root.
+
 For a list of available subcommands and global flags, run
 
 	upspin -help
@@ -105,7 +108,7 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("upspin: ")
 	flag.Usage = usage
-	flags.Parse() // enable all flags
+	flags.Parse(flags.Client)
 
 	if len(flag.Args()) < 1 {
 		fmt.Fprintln(os.Stderr, intro)
