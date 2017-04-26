@@ -9,7 +9,6 @@ import (
 
 	"upspin.io/path"
 	"upspin.io/subcmd"
-	"upspin.io/upspin"
 )
 
 func (s *State) put(args ...string) {
@@ -27,9 +26,9 @@ TODO: Delete in favor of cp?
 		fs.Usage()
 	}
 
-	data := s.ReadAll(*inFile)
+	data := s.ReadAll(subcmd.Tilde(*inFile))
 	// Must be a valid Upspin name.
-	parsed, err := path.Parse(upspin.PathName(fs.Arg(0)))
+	parsed, err := path.Parse(s.AtSign(fs.Arg(0)))
 	if err != nil {
 		s.Exit(err)
 	}
