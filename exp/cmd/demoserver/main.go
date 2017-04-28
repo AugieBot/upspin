@@ -42,7 +42,7 @@ import (
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
-	flags.Parse("config", "insecure", "http", "https", "addr", "log", "letscache", "tls")
+	flags.Parse(flags.Server)
 
 	addr := upspin.NetAddr(flags.NetAddr)
 	ep := upspin.Endpoint{
@@ -62,7 +62,7 @@ func main() {
 	http.Handle("/api/Store/", storeserver.New(cfg, s.StoreServer(), addr))
 	http.Handle("/api/Dir/", dirserver.New(cfg, s.DirServer(), addr))
 
-	https.ListenAndServeFromFlags(nil, "demoserver")
+	https.ListenAndServeFromFlags(nil)
 }
 
 // box represents an opened box.
