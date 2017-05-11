@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package main
+package keyserver
 
 import (
 	"bytes"
@@ -38,6 +38,8 @@ const (
 	signupNotifyAddress = "upspin-sendgrid@google.com"
 
 	noHTML = "" // for mail.Send
+
+	serverName = "keyserver"
 )
 
 // signupHandler implements an http.Handler that handles user creation requests
