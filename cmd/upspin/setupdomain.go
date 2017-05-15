@@ -17,7 +17,6 @@ import (
 	yaml "gopkg.in/yaml.v2"
 
 	"upspin.io/config"
-	"upspin.io/flags"
 	"upspin.io/subcmd"
 	"upspin.io/upspin"
 )
@@ -46,13 +45,14 @@ If any state exists at the given location (-where) then the command aborts.
 `
 	)
 	fs := flag.NewFlagSet("setupdomain", flag.ExitOnError)
-	where := fs.String("where", filepath.Join(config.Home(), "upspin", "deploy"), "`directory` to store private configuration files")
+	whereFlag := fs.String("where", filepath.Join(config.Home(), "upspin", "deploy"), "`directory` to store private configuration files")
 	domain := fs.String("domain", "", "domain `name` for this Upspin installation")
+	project := fs.String("project", "", "GCP `project` name")
 	curveName := fs.String("curve", "p256", "cryptographic curve `name`: p256, p384, or p521")
 	putUsers := fs.Bool("put-users", false, "put server users to the key server")
 	cluster := fs.Bool("cluster", false, "generate keys for upspin-dir@domain and upspin-store@domain (default is upspin@domain only)")
 	s.ParseFlags(fs, args, help, "setupdomain [-where=$HOME/upspin/deploy] [-cluster] -domain=<name>")
-	if *where == "" {
+	if *whereFlag == "" {
 		s.Failf("the -where flag must not be empty")
 		fs.Usage()
 	}
@@ -67,16 +67,22 @@ If any state exists at the given location (-where) then the command aborts.
 		s.Exitf("no such curve %q", *curveName)
 	}
 
+	where := subcmd.Tilde(*whereFlag)
+
 	if !*cluster {
 		if *putUsers {
 			s.Exitf("the -put-users flag requires -cluster")
 		}
-		s.setuphost(*where, *domain, *curveName)
+		s.setuphost(where, *domain, *curveName)
 		return
+	}
+	if *project == "" {
+		s.Failf("the -project flag must be provided")
+		fs.Usage()
 	}
 
 	var (
-		baseDir         = filepath.Join(*where, *domain)
+		baseDir         = filepath.Join(where, *domain)
 		dirServerPath   = filepath.Join(baseDir, "dirserver")
 		storeServerPath = filepath.Join(baseDir, "storeserver")
 		dirConfig       = filepath.Join(dirServerPath, "config")
@@ -107,19 +113,19 @@ If any state exists at the given location (-where) then the command aborts.
 
 	// Generate keys for the dirserver and the storeserver.
 	var noProquint string
-	dirPublic, dirPrivate, dirProquint, err := createKeys(*curveName, noProquint)
+	dirPublic, dirPrivate, dirProquint, err := s.createKeys(*curveName, noProquint)
 	if err != nil {
 		s.Exit(err)
 	}
-	storePublic, storePrivate, storeProquint, err := createKeys(*curveName, noProquint)
+	storePublic, storePrivate, storeProquint, err := s.createKeys(*curveName, noProquint)
 	if err != nil {
 		s.Exit(err)
 	}
-	err = writeKeys(dirServerPath, dirPublic, dirPrivate)
+	err = s.writeKeys(dirServerPath, dirPublic, dirPrivate)
 	if err != nil {
 		s.Exit(err)
 	}
-	err = writeKeys(storeServerPath, storePublic, storePrivate)
+	err = s.writeKeys(storeServerPath, storePublic, storePrivate)
 	if err != nil {
 		s.Exit(err)
 	}
@@ -170,9 +176,9 @@ If any state exists at the given location (-where) then the command aborts.
 
 	err = setupDomainTemplate.Execute(os.Stdout, setupDomainData{
 		Dir:       baseDir,
-		Where:     *where,
+		Where:     where,
 		Domain:    *domain,
-		Project:   flags.Project,
+		Project:   *project,
 		UserName:  s.Config.UserName(),
 		Signature: fmt.Sprintf("%x-%x", sig.R, sig.S),
 
@@ -227,7 +233,7 @@ Once the DNS change propagates the key server will use the TXT record to verify
 that {{.UserName}} is authorized to register users under {{.Domain}}.
 To register the users listed above, run this command:
 
-	$ upspin -project={{.Project}} setupdomain -where={{.Where}} -cluster -put-users -domain={{.Domain}}
+	$ upspin setupdomain -project={{.Project}} -where={{.Where}} -cluster -put-users -domain={{.Domain}}
 
 `))
 
@@ -264,11 +270,11 @@ func (s *State) setuphost(where, domain, curve string) {
 
 	// Generate and write keys for the server user.
 	var noProquint string
-	pub, pri, proquint, err := createKeys(curve, noProquint)
+	pub, pri, proquint, err := s.createKeys(curve, noProquint)
 	if err != nil {
 		s.Exit(err)
 	}
-	err = writeKeys(cfgPath, pub, pri)
+	err = s.writeKeys(cfgPath, pub, pri)
 	if err != nil {
 		s.Exit(err)
 	}
@@ -290,7 +296,6 @@ func (s *State) setuphost(where, domain, curve string) {
 		Dir:       cfgPath,
 		Where:     where,
 		Domain:    domain,
-		Project:   flags.Project,
 		UserName:  s.Config.UserName(),
 		Signature: fmt.Sprintf("%x-%x", sig.R, sig.S),
 
