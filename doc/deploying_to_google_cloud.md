@@ -8,15 +8,15 @@ them to serve user data.
 It assumes you already have the Upspin software installed,
 as described at the bottom of the [overview document](/doc/overview.md).
 
-The server binaries are built from the source in the directories
-`cmd/dirserver` and `cmd/storeserver` in the repository stored at
-https://upspin.googlesource.com/upspin.
+The source code specific to the Google Cloud Platform is located in the
+`gcp.upspin.io` repository, including the `dirserver-gcp` and
+`storeserver-gcp` servers and the `upspin-deploy-gcp` deployment tool.
 
 To use Google Cloud Platform services you must first create a Billing Account
 (to pay for the services) and a Project (a group of related services identified
 by a name called the *project ID*).
 Then you must create Upspin users for your servers using the `upspin
-setupdomain` command, and use the `upspin-deploy` command to set up the
+setupdomain` command, and use the `upspin-deploy-gcp` command to set up the
 necessary services and build and deploy the servers.
 Once they're running, Google Cloud Platform will choose IP addresses for them
 and you can then point your domain to those addresses.
@@ -86,7 +86,7 @@ for clarity.
 This command sets up users for our example domain:
 
 ```
-local$ upspin -project=example-project setupdomain -cluster -domain=example.com
+local$ upspin setupdomain -cluster -domain=example.com -project=example-project
 ```
 
 and should print something like this:
@@ -115,7 +115,7 @@ Once the DNS change propagates the key server will use the TXT record to
 verify that you@gmail.com is authorized to create users under example.com.
 To create the server users for this domain, run this command:
 
-  $ upspin -project=example-project setupdomain -cluster -put-users example.com
+  $ upspin setupdomain -cluster -project=example-project -put-users example.com
 ```
 
 ---
@@ -148,7 +148,7 @@ special variant of the `setupdomain` command with by the `-put-users` flag.
 Run this next:
 
 ```
-local$ upspin -project=example-project setupdomain -cluster -put-users example.com
+local$ upspin setupdomain -cluster -project=example-project -put-users example.com
 ```
 
 The command should print something like this:
@@ -163,10 +163,10 @@ At this point, you are ready to deploy the services on the cloud platform.
 ## Create instances and deploy servers
 
 The next step is to deploy a set of servers running on the cloud.
-This is done with the `upspin-deploy` command.
+This is done with the `upspin-deploy-gcp` command.
 
-Before issuing the command, however, one must have installed gcloud and
-kubectl, as part of setting up an account with Google Cloud Platform (GCP).
+Before issuing the command, however, one must have installed `gcloud` and
+`kubectl`, as part of setting up an account with Google Cloud Platform (GCP).
 The steps for that are covered by [GCP documentation](https://cloud.google.com/sdk/).
 
 Install the Google Cloud SDK by following
@@ -178,24 +178,29 @@ Install the components Upspin needs:
 local$ gcloud components install kubectl beta
 ```
 
-Ensure `gcloud`is authenticatedby running
-
+Ensure `gcloud`is authenticated by running
 
 ```
 local$ gcloud auth login
 local$ gcloud auth application-default login
 ```
 
-The following command creates a raft of Google Cloud Platform services under
-`example-project` and deploys binaries to the cloud, serving requests on
-various hosts of domain example.com.
+Install the `upspin-deploy-gcp` command:
 
 ```
-local$ upspin-deploy -create -domain=example.com -project=example-project
+local$ go get -u gcp.upspin.io/cmd/upspin-deploy-gcp
 ```
 
-If the above is successful, there will be two new servers running on GCP: the
-dir server and the store server.
+Now use `upspin-deploy-gcp` to provision Google Cloud Platform services (inside
+`example-project`) and deploy the server binaries.
+Each server will serve requests on a distinct host under the domain example.com.
+
+```
+local$ upspin-deploy-gcp -create -domain=example.com -project=example-project
+```
+
+If the command is successful, there will be two new servers running on GCP:
+the directory and store servers.
 They must now be bound to the DNS names within the domain, that is,
 `dir.example.com` and `store.example.com`.
 The details are printed at the tail of the output of `upspin-deploy`:
@@ -248,7 +253,7 @@ create an Upspin tree in the directory server.
 Of course, the command you run should list the users of your own servers.
 
 ```
-local$ upspin -project=example-project setupwriters -domain=example.com you@gmail.com
+local$ upspin setupwriters -domain=example.com -project=example-project you@gmail.com
 ```
 
 The servers are now available for general use.
