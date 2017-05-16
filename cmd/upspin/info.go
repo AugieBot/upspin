@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"os"
@@ -35,7 +36,8 @@ of the link.
 		fs.Usage()
 	}
 	for _, name := range fs.Args() {
-		entries, err := s.DirServer(upspin.PathName(name)).Glob(name)
+		name := s.AtSign(name)
+		entries, err := s.DirServer(name).Glob(string(name))
 		// ErrFollowLink is OK; we still get the relevant entry.
 		if err != nil && err != upspin.ErrFollowLink {
 			s.Exit(err)
@@ -58,8 +60,9 @@ type infoDirEntry struct {
 	*upspin.DirEntry
 	state *State
 	// The following fields are computed as we run.
-	access    *access.Access
-	lastUsers string
+	access     *access.Access
+	accessFile string
+	lastUsers  string
 }
 
 func (d *infoDirEntry) TimeString() string {
@@ -75,17 +78,26 @@ func (d *infoDirEntry) Rights() []access.Right {
 }
 
 func (d *infoDirEntry) Readers() string {
-	d.state.sharer.addAccess(d.DirEntry)
+	if d.access != nil {
+		d.WhichAccess()
+	}
 	d.lastUsers = "<nobody>"
 	if d.IsDir() {
 		return "is a directory"
 	}
-	_, users, _, err := d.state.sharer.readers(d.DirEntry)
+	users, err := d.access.Users(access.Read, d.state.Client.Get)
 	if err != nil {
 		return err.Error()
 	}
-	d.lastUsers = users
-	return users
+	var b bytes.Buffer
+	for i, user := range users {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(string(user))
+	}
+	d.lastUsers = b.String()
+	return d.lastUsers
 }
 
 func (d *infoDirEntry) Sequence() int64 {
@@ -128,6 +140,9 @@ func (d *infoDirEntry) Users(right access.Right) string {
 }
 
 func (d *infoDirEntry) WhichAccess() string {
+	if d.access != nil {
+		return d.accessFile
+	}
 	var acc *access.Access
 	accEntry, err := d.state.whichAccessFollowLinks(d.Name)
 	if err != nil {
@@ -153,6 +168,7 @@ func (d *infoDirEntry) WhichAccess() string {
 		}
 	}
 	d.access = acc
+	d.accessFile = accFile
 	return accFile
 }
 
@@ -227,7 +243,7 @@ const infoText = `{{.Name}}
 
 // checkGroupFile diagnoses likely problems with the contents and rights
 // of the Group file.
-// TODO: We could check that packing is Plain but that should never be a problem.
+// TODO: We could check that packing is plain text but that should never be a problem.
 func (s *State) checkGroupFile(name upspin.PathName) {
 	parsed, err := path.Parse(name)
 	if err != nil {
