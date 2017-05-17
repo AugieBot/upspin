@@ -219,6 +219,13 @@ type Packer interface {
 	// only that of the Upspin user invoking the method. The Packdata
 	// in entry must contain a wrapped key for that user.
 	Name(config Config, entry *DirEntry, path PathName) error
+
+	// Countersign updates the signatures in the DirEntry when a writer
+	// is in the process of switching to a new key. It checks that
+	// the first existing signature verifies under the old key, copies
+	// that one over the second existing signature, and creates a new
+	// first signature using the key from factotum.
+	Countersign(oldKey PublicKey, f Factotum, d *DirEntry) error
 }
 
 const (
@@ -720,6 +727,9 @@ type Config interface {
 	// connections. If the returned pointer is nil then the default system root
 	// certificates should be used.
 	CertPool() *x509.CertPool
+
+	// Flags returns the configured command flags for the named command.
+	Flags(cmd string) map[string]string
 }
 
 // Dialer defines how to connect and authenticate to a server. Each
