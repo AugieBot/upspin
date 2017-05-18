@@ -36,6 +36,9 @@ its -l flag and debugging enabled, run
 
 	upspin -log debug ls -l
 
+As a shorthand, a lone at sign (@) at the beginning of an Upspin path
+stands for the current user's Upspin root.
+
 For a list of available subcommands and global flags, run
 
 	upspin -help
@@ -48,8 +51,10 @@ Upspin commands:
 	cp
 	deletestorage
 	deploy
+	deploy-gcp
 	get
 	getref
+	github
 	info
 	keygen
 	link
@@ -62,44 +67,26 @@ Upspin commands:
 	setupdomain
 	setupserver
 	setupstorage
+	setupstorage-gcp
 	setupwriters
 	share
 	signup
 	snapshot
 	tar
 	user
+	watch
 	whichaccess
 Global flags:
-  -addr host:port
-    	publicly accessible network address (host:port)
   -blocksize size
     	size of blocks when writing large files (default 1048576)
-  -cachedir directory
-    	directory containing all file caches (default "/Users/r/upspin")
   -cachesize bytes
     	max disk bytes for cache (default 5000000000)
   -config file
-    	user's configuration file (default "/Users/r/upspin/config")
-  -http address
-    	address for incoming insecure network connections (default ":80")
-  -https address
-    	address for incoming secure network connections (default ":443")
-  -kind kind
-    	server implementation kind (inprocess, gcp) (default "inprocess")
-  -letscache directory
-    	Let's Encrypt cache directory
+    	user's configuration file (default "/home/user/upspin/config")
   -log level
     	level of logging: debug, info, error, disabled (default info)
-  -project project
-    	GCP project name
-  -serverconfig value
-    	comma-separated list of configuration options (key=value) for this server
-  -storeserveruser string
-    	user name of the StoreServer
-  -tls_cert file
-    	TLS Certificate file in PEM format
-  -tls_key file
-    	TLS Key file in PEM format
+  -prudent
+    	protect against malicious directory server
   -writethrough
     	make storage cache writethrough
 
@@ -131,6 +118,10 @@ arguments must not be directories unless the -R flag is set.
 If the final argument is not a directory, cp requires exactly two
 path names and copies the contents of the first to the second.
 The -R flag requires that the final argument be a directory.
+
+All file names given to cp must be fully qualified paths,
+either locally or within Upspin. For local paths, this means
+they must be absolute paths or start with '.', '..',  or '~'.
 
 When copying from one Upspin path to another Upspin path, cp can be
 very efficient, copying only the references to the data rather than
@@ -241,11 +232,6 @@ first key. Keygen can be used to create new keys.
 
 See the description for rotate for information about updating keys.
 
-Note: If used interactively with a shell that keeps a command history, the
--secretseed option may cause the secret to be saved in the history file.
-If so, the history file should be cleared after running keygen with the
--secretseed option.
-
 Flags:
   -curve name
     	cryptographic curve name: p256, p384, or p521 (default "p256")
@@ -253,21 +239,22 @@ Flags:
     	print more information about the command
   -rotate
     	rotate existing keys and replace them with new ones
-  -secretseed seed
-    	128 bit secret seed in proquint format
+  -secretseed string
+    	the seed containing a 128 bit secret in proquint format or a file that contains it
   -where directory
-    	directory to store keys (default "/Users/r/.ssh")
+    	directory to store keys (default "/home/user/.ssh")
 
 
 
 Sub-command link
 
-Usage: upspin link original_path link_path
+Usage: upspin link [-f] original_path link_path
 
-Link creates an Upspin link. The link is created at the first path
-argument and points to the second path argument.
+Link creates an Upspin link. The link is created at the second path
+argument and points to the first path argument.
 
 Flags:
+  -f	force creation of link when original path is inaccessible
   -help
     	print more information about the command
 
@@ -354,10 +341,14 @@ Rm does not delete the associated storage, which is rarely necessary
 or wise: storage can be shared between items and unused storage is
 better recovered by automatic means.
 
+Rm does not delete the targets of links, only the links themselves.
+
 See the deletestorage command for more information about deleting
 storage.
 
 Flags:
+  -R	recur into subdirectories
+  -f	continue if errors occur
   -help
     	print more information about the command
 
@@ -426,7 +417,7 @@ Flags:
   -put-users
     	put server users to the key server
   -where directory
-    	directory to store private configuration files (default "/Users/r/upspin/deploy")
+    	directory to store private configuration files (default "/home/user/upspin/deploy")
 
 
 
@@ -456,7 +447,7 @@ Flags:
   -host name
     	host name of upspinserver (empty implies the cluster dir.domain and store.domain)
   -where directory
-    	directory to store private configuration files (default "/Users/r/upspin/deploy")
+    	directory to store private configuration files (default "/home/user/upspin/deploy")
   -writers users
     	additional users to be given write access to this server
 
@@ -464,39 +455,17 @@ Flags:
 
 Sub-command setupstorage
 
-Usage: upspin -project=<gcp_project_name> setupstorage -domain=<name> <bucket_name>
-
-Setupstorage is the second step in establishing an upspinserver,
-It sets up cloud storage for your Upspin installation. You may skip this step
-if you wish to store Upspin data on your server's local disk.
-The first step is 'setupdomain' and the final step is 'setupserver'.
-
-Setupstorage creates a Google Cloud Storage bucket and a service account for
-accessing that bucket. It then writes the service account private key to
-$where/$domain/serviceaccount.json and updates the server configuration files
-in that directory to use the specified bucket.
-
-Before running this command, you must create a Google Cloud Project and
-associated Billing Account using the Cloud Console:
-	https://cloud.google.com/console
-The project ID can be any available string, but for clarity it's helpful to
-pick something that resembles your domain name.
-
-You must also install the Google Cloud SDK:
-	https://cloud.google.com/sdk/downloads
-Authenticate and enable the necessary APIs:
-	$ gcloud auth login
-	$ gcloud --project <project> beta service-management enable iam.googleapis.com storage_api
-And, finally, authenticate again in a different way:
-	$ gcloud auth application-default login
-
+flag provided but not defined: -letscache
+Usage: upspin setupstorage -domain=<name> -path=<storage_dir>
 Flags:
   -domain name
     	domain name for this Upspin installation
   -help
     	print more information about the command
+  -path directory
+    	directory on the server in which to keep Upspin storage (default is $HOME/upspin/server/storage)
   -where directory
-    	directory to store private configuration files (default "/Users/r/upspin/deploy")
+    	directory to store private configuration files (default "/home/user/upspin/deploy")
 
 
 
@@ -519,7 +488,7 @@ Flags:
   -help
     	print more information about the command
   -where directory
-    	directory containing private configuration files (default "/Users/r/upspin/deploy")
+    	directory containing private configuration files (default "/home/user/upspin/deploy")
 
 
 
@@ -591,11 +560,6 @@ recreate or reuse prior keys.
 The -signuponly flag tells signup to skip the generation of the configuration
 file and keys and only send the signup request to the key server.
 
-Note: If used interactively with a shell that keeps a command history, the
--secretseed option may cause the secret to be saved in the history file.
-If so, the history file should be cleared after running signup with the
--secretseed option.
-
 Flags:
   -curve name
     	cryptographic curve name: p256, p384, or p521 (default "p256")
@@ -605,8 +569,10 @@ Flags:
     	create a new user even if keys and config file exist
   -help
     	print more information about the command
-  -secretseed seed
-    	128 bit secret seed in proquint format
+  -rotate
+    	always false during sign up
+  -secretseed string
+    	the seed containing a 128 bit secret in proquint format or a file that contains it
   -server address
     	Store and Directory server address (if combined)
   -signuponly
@@ -614,7 +580,7 @@ Flags:
   -store address
     	Store server address
   -where directory
-    	directory to store keys (default "/Users/r/.ssh")
+    	directory to store keys (default "/home/user/.ssh")
 
 
 
@@ -691,6 +657,22 @@ Flags:
     	input file (default standard input)
   -put
     	write new user record
+
+
+
+Sub-command watch
+
+Usage: upspin watch [-order=n] path
+
+Watch watches the given Upspin path beginning with the specified order and
+prints the events to standard output. An order of -1, the default, will send
+the current state of the tree rooted at the given path.
+
+Flags:
+  -help
+    	print more information about the command
+  -order int
+    	order (default -1)
 
 
 
