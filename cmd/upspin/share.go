@@ -50,7 +50,7 @@ See the description for rotate for information about updating keys.
 	fs.Bool("q", false, "suppress output. Default is to show state for every file")
 	s.ParseFlags(fs, args, help, "share path...")
 	if fs.NArg() == 0 {
-		fs.Usage()
+		usageAndExit(fs)
 	}
 
 	if *recur {
@@ -300,9 +300,12 @@ func userListToString(userList []upspin.UserName) string {
 }
 
 // allEntries expands the arguments to find all the DirEntries identifying items to examine.
+// The returned slice contains no directories and no links, only plain files.
 func (s *Sharer) allEntries(names []upspin.PathName) []*upspin.DirEntry {
 	var entries []*upspin.DirEntry
-	// We will not follow links; don't use Client. Use the directory server directly.
+	// We will not follow links past this point; don't use Client.
+	// Use the directory server directly.
+	// Glob has processed the higher-level links to get us here.
 	for _, name := range names {
 		entry, err := s.state.DirServer(name).Lookup(name)
 		if err != nil {

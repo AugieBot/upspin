@@ -8,13 +8,16 @@
 package main // import "upspin.io/cmd/upspinserver"
 
 import (
+	"upspin.io/cloud/https"
 	"upspin.io/serverutil/upspinserver"
 
-	// Storage implementations.
+	// Storage implementation.
 	_ "upspin.io/cloud/storage/disk"
-	_ "upspin.io/cloud/storage/gcs"
 )
 
 func main() {
-	upspinserver.Main()
+	server, ready := upspinserver.Main()
+	opt := https.OptionsFromFlags()
+	opt.LetsEncryptHosts = []string{string(server.Addr)}
+	https.ListenAndServe(ready, opt)
 }
