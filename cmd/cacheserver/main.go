@@ -20,7 +20,7 @@ const serverName = "cacheserver"
 
 func main() {
 	flag.Usage = usage
-	flags.Parse()
+	flags.Parse(flags.Server, "cachedir")
 
 	// Load configuration and keys for this server. It needn't have a real username.
 	cfg, err := config.FromFile(flags.Config)
@@ -56,5 +56,4 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "\tgo doc upspin.io/cmd/cacheserver")
 	fmt.Fprintln(os.Stderr, "")
 	flag.PrintDefaults()
-	os.Exit(2)
 }
