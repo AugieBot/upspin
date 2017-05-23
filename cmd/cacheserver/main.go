@@ -16,16 +16,21 @@ import (
 	"upspin.io/upspin"
 )
 
-const serverName = "cacheserver"
+const cmdName = "cacheserver"
 
 func main() {
 	flag.Usage = usage
-	flags.Parse()
+	flags.Parse(flags.Server, "cachedir")
 
 	// Load configuration and keys for this server. It needn't have a real username.
 	cfg, err := config.FromFile(flags.Config)
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	// Set any flags contained in the config.
+	if err := config.SetFlagValues(cfg, cmdName); err != nil {
+		log.Fatalf("%s: %s", cmdName, err)
 	}
 
 	// Serving address comes from config with flag overriding.
@@ -56,5 +61,4 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "\tgo doc upspin.io/cmd/cacheserver")
 	fmt.Fprintln(os.Stderr, "")
 	flag.PrintDefaults()
-	os.Exit(2)
 }

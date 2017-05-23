@@ -21,6 +21,7 @@ import (
 
 	"upspin.io/config"
 	"upspin.io/flags"
+	"upspin.io/subcmd"
 	"upspin.io/upspin"
 	"upspin.io/user"
 )
@@ -90,19 +91,20 @@ file and keys and only send the signup request to the key server.
 
 	// Check flags.
 	if fs.NArg() != 1 {
-		fs.Usage()
+		s.Failf("after flags parsed, expected 1 argument but saw %d", fs.NArg())
+		usageAndExit(fs)
 	}
 	if *bothServer != "" {
 		if *dirServer != "" || *storeServer != "" {
 			s.Failf("if -server provided -dir and -store must not be set")
-			fs.Usage()
+			usageAndExit(fs)
 		}
 		*dirServer = *bothServer
 		*storeServer = *bothServer
 	}
 	if *dirServer == "" || *storeServer == "" {
 		s.Failf("-dir and -store must both be provided")
-		fs.Usage()
+		usageAndExit(fs)
 	}
 
 	// Parse -dir and -store flags as addresses and construct remote endpoints.
@@ -142,7 +144,7 @@ file and keys and only send the signup request to the key server.
 		UserName:  userName,
 		Dir:       dirEndpoint,
 		Store:     storeEndpoint,
-		SecretDir: *where,
+		SecretDir: subcmd.Tilde(*where),
 		Packing:   "ee",
 	})
 	if err != nil {
