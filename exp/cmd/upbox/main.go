@@ -21,6 +21,8 @@ Configuration files must be in YAML format, of this general form:
 	  user: joe
 	- name: myserver
 	  importpath: github.com/user/myserver
+	  flags:
+	    debug: cockroach
 	keyserver: key.uspin.io
 	domain: exmaple.com
 
@@ -224,6 +226,7 @@ func (cfg *Config) Run() error {
 			"-log=" + *logLevel,
 			"-tls_cert=" + filepath.Join(tmpDir, "cert.pem"),
 			"-tls_key=" + filepath.Join(tmpDir, "key.pem"),
+			"-letscache=", // disable
 			"-https=" + s.addr,
 			"-addr=" + s.addr,
 		}
@@ -232,6 +235,9 @@ func (cfg *Config) Run() error {
 				"-test_user="+s.User,
 				"-test_secrets="+userDir(s.User),
 			)
+		}
+		for k, v := range s.Flags {
+			args = append(args, fmt.Sprintf("-%s=%v", k, v))
 		}
 		cmd := exec.Command(s.Name, args...)
 		cmd.Stdout = prefix(s.Name+":\t", os.Stdout)
@@ -286,6 +292,16 @@ func (cfg *Config) Run() error {
 		cmd.Stdout = prefix("key-bootstrap:\t", os.Stdout)
 		cmd.Stderr = prefix("key-bootstrap:\t", os.Stderr)
 		if err := cmd.Run(); err != nil {
+			return err
+		}
+	}
+
+	// Wait for the other services to start.
+	for _, s := range cfg.Servers {
+		if s.addr == cfg.KeyServer {
+			continue
+		}
+		if err := waitReady(s.addr); err != nil {
 			return err
 		}
 	}
