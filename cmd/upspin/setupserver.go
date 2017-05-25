@@ -51,10 +51,10 @@ The calling user must be the same one that ran 'upspin setupdomain'.
 	s.ParseFlags(fs, args, help, "setupserver -domain=<domain> -host=<host> [-where=$HOME/upspin/deploy] [-writers=user,...]")
 	if *domain == "" || *host == "" {
 		s.Failf("the -domain and -host flags must be provided")
-		fs.Usage()
+		usageAndExit(fs)
 	}
 
-	cfgPath := filepath.Join(*where, *domain)
+	cfgPath := filepath.Join(subcmd.Tilde(*where), *domain)
 	cfg := s.ReadServerConfig(cfgPath)
 
 	// Stash the provided host name in the server config file.

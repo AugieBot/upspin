@@ -37,9 +37,26 @@ The keys identify settings, and there several defined:
 * `keyserver:` Which key server to use.
 * `dirserver:` Server that holds user's directory tree.
 * `storeserver:` Server to write new storage.
-* `cache:` Address of local cache server.
+* `cache:` Whether to use a local store and directory cache server.
 * `secrets:` Directory holding private keys.
 * `tlscerts:` Directory holding TLS certificates.
+
+One can also specify values for flags used by various commands.
+The syntax is:
+
+```
+cmdflags:
+ command-name:
+  flag-name: flag-value
+  ...
+```
+
+The `cacheserver` and `upspinfs` commands honor these settings.
+The flags must be in the command line flag set of the command
+or will generate an error.
+These flag values will supersede the value of any flags not
+set to their default.
+Thus one can override these settings in the command line.
 
 Not all of these settings must be present.
 In practice, you will likely need only `username`, `dirserver`, `storeserver`,
@@ -57,6 +74,10 @@ username: ann@example.com
 dirserver: dir.example.com
 storeserver: store.example.com
 cache: localhost:8888
+cmdflags:
+ cacheserver:
+  cachedir: /usr/augie/tmp
+  cachesize: 5000000000
 ```
 
 This should be mostly self-explanatory.
@@ -76,7 +97,7 @@ remote,dir.example.com:443
 with a comma separating the transport and address and a colon separating the
 address and port.
 
-In practice, though the transport and port are elided because the default
+In practice, though, the transport and port are omitted because the default
 transport, `remote`, defines a service provided across a network connection,
 and the default port, 443, is the standard port for encrypted (TLS)
 communications, as used by the HTTPS protocol.
@@ -89,6 +110,7 @@ dir.example.com
 Other than `remote`, the default, the only other transports are `inprocess`,
 which defines a service in the process as the client and is typically used only
 for debugging, and `unassigned`, which represents a server that does not exist.
+These appear in config files only rarely, and only for expert use.
 
 ## Settings
 
@@ -104,7 +126,7 @@ safest, securest packing.
 Others are `plain`, which leaves the data untouched, and `eeintegrity`, which
 like `plain` leaves the data untouched but adds an end-to-end integrity check
 that can detect tampering.
-It is used to store things like Access files, which must be readable by outside
+Integrity packing is used to store things like Access files, which must be readable by outside
 agents such as directory servers but must also be secured.
 If the packing is not set in the config file, `ee` is assumed.
 
@@ -121,12 +143,15 @@ It must be set.
 new data created by the user.
 It must be set.
 
-* The **`cache`** setting names a (typically local) cache server that speeds up
+* The **`cache`** setting specifies a local cache server that speeds up
 interactions with Upspin by caching directories and storage blocks.
-It is usually run as a service on the local machine at some convenient address
-such as `localhost:8888`.
 If the cache is not set by the config file, none is used.
-For more information about the cache server, run
+The value can be:
+	* `y[es]` to run a cache server on a default address
+	* `n[o]` to not run a cache server
+	* the address of the cache server (normally used for debugging)
+
+	For more information about the cache server, run
 
 ```
 go doc upspin.io/cmd/cacheserver
@@ -134,7 +159,8 @@ go doc upspin.io/cmd/cacheserver
 
 * The **`secrets`** setting identifies a directory in which the user's public
 and private keys are stored.
-If not set, the keys are assumed to live in the directory `$HOME/.ssh`.
+If not set, the keys are assumed to live in the directory `.ssh` within
+the user's home directory (on Unix, `$HOME/.ssh`).
 
 * The **`tlscerts`** setting identifies a directory in which to locate TLS
 certificate root authorities.

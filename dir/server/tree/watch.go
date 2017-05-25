@@ -100,7 +100,7 @@ func (t *Tree) Watch(p path.Parsed, order int64, done <-chan struct{}) (<-chan *
 		closed:  0,
 	}
 
-	if order == -1 {
+	if order == upspin.WatchCurrent {
 		// Send the current state first. We must flush the tree so we
 		// know our logs are current (or we need to recover the tree
 		// from the logs).
@@ -130,6 +130,18 @@ func (t *Tree) Watch(p path.Parsed, order int64, done <-chan struct{}) (<-chan *
 		// the watcher for this tree once the current state is sent.
 		go w.sendCurrentAndWatch(clone, t, p, offset)
 	} else {
+		if order == upspin.WatchNew {
+			// We must flush the tree so we know our logs are current (or we
+			// need to recover the tree from the logs).
+			err := t.flush()
+			if err != nil {
+				return nil, errors.E(op, err)
+			}
+
+			// Set order to the current offset
+			order = t.log.LastOffset()
+		}
+
 		// Set up the notification hook.
 		err = t.addWatcher(p, w)
 		if err != nil {
@@ -169,7 +181,6 @@ func (w *watcher) sendCurrentAndWatch(clone, orig *Tree, p path.Parsed, offset i
 
 	n, _, err := clone.loadPath(p)
 	if err != nil && !errors.Match(errNotExist, err) {
-		log.Error.Printf("%s: error loading path: %s", op, err)
 		w.sendError(err)
 		w.close()
 		return
@@ -190,7 +201,6 @@ func (w *watcher) sendCurrentAndWatch(clone, orig *Tree, p path.Parsed, offset i
 		}
 		err = clone.traverse(n, 0, fn)
 		if err != nil {
-			log.Error.Printf("%s: error traversing tree: %s", op, err)
 			w.sendError(err)
 			w.close()
 			return
@@ -201,7 +211,6 @@ func (w *watcher) sendCurrentAndWatch(clone, orig *Tree, p path.Parsed, offset i
 	err = orig.addWatcher(p, w)
 	orig.mu.Unlock()
 	if err != nil {
-		log.Error.Printf("%s: error adding watcher: %s", op, err)
 		w.sendError(err)
 		w.close()
 		return
@@ -256,7 +265,7 @@ func (w *watcher) sendError(err error) {
 	case <-time.After(3 * watcherTimeout):
 		// Can't send another error since we timed out again. Log an
 		// error and close the watcher.
-		log.Error.Printf("dir/server/tree.sendError: %s", errTimeout)
+		log.Error.Printf("dir/server/tree: timed out sending error: %v", err)
 	}
 }
 
@@ -306,7 +315,6 @@ func (w *watcher) watch(offset int64) {
 		offset, err = w.sendEventFromLog(offset)
 		if err != nil {
 			if err != errTimeout && err != errClosed {
-				log.Error.Printf("watch: sending error to client: %s", err)
 				w.sendError(err)
 			}
 			return

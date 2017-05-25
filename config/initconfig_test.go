@@ -6,14 +6,17 @@ package config
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 
 	"upspin.io/pack"
+	"upspin.io/rpc/local"
 	"upspin.io/upspin"
 
 	_ "upspin.io/pack/ee"
@@ -33,6 +36,7 @@ type expectations struct {
 	storeserver upspin.Endpoint
 	packing     upspin.Packing
 	secrets     string
+	cmdflags    map[string]map[string]string
 }
 
 type envs struct {
@@ -87,6 +91,143 @@ storeserver: inprocess`
 	if !strings.Contains(err.Error(), "unrecognized key") {
 		t.Fatalf("expected bad key error; got %q", err)
 	}
+}
+
+func TestCmdFlags(t *testing.T) {
+	config := `
+keyserver: key.example.com
+cmdflags:
+ cacheserver:
+  cachedir: /tmp
+  cachesize: 1000000000
+ upspinfs:
+  cachedir: /tmp
+dirserver: remote,dir.example.com
+storeserver: store.example.com:8080
+secrets: ` + secretsDir + "\n"
+	expect := expectations{
+		username:    "noone@nowhere.org",
+		packing:     upspin.EEPack,
+		keyserver:   upspin.Endpoint{Transport: upspin.Remote, NetAddr: "key.example.com:443"},
+		dirserver:   upspin.Endpoint{Transport: upspin.Remote, NetAddr: "dir.example.com:443"},
+		storeserver: upspin.Endpoint{Transport: upspin.Remote, NetAddr: "store.example.com:8080"},
+		cmdflags: map[string]map[string]string{
+			"cacheserver": map[string]string{"cachedir": "/tmp", "cachesize": "1000000000"},
+			"upspinfs":    map[string]string{"cachedir": "/tmp"},
+		},
+	}
+	testConfig(t, &expect, config)
+}
+
+func TestSetFlagValues(t *testing.T) {
+	// Define flags with defaults.
+	flag.CommandLine = flag.NewFlagSet("hooha", flag.ContinueOnError)
+	cacheSizeFlag := flag.Int64("cachesize", 5e9, "max disk `bytes` for cache")
+	writethroughFlag := flag.Bool("writethrough", false, "make storage cache writethrough")
+
+	// Expected values
+	expectedSize := int64(4000000000)
+	expectedWT := true
+
+	configuration := `
+secrets: ` + secretsDir + `
+cmdflags:
+ cacheserver:
+  cachesize: ` + fmt.Sprintf("%d", expectedSize) + `
+  writethrough: ` + fmt.Sprintf("%t", expectedWT) + `
+`
+	config, err := InitConfig(strings.NewReader(configuration))
+	if err != nil {
+		t.Fatalf("could not parse config %v: %v", configuration, err)
+	}
+	if err := SetFlagValues(config, "cacheserver"); err != nil {
+		t.Fatalf("could not apply config flags %v: %v", configuration, err)
+	}
+	if *cacheSizeFlag != expectedSize {
+		t.Fatalf("cachesize got %v, expected %v", *cacheSizeFlag, expectedSize)
+	}
+	if *writethroughFlag != expectedWT {
+		t.Fatalf("cachesize got %v, expected %v", *cacheSizeFlag, expectedSize)
+	}
+
+	// Add an undefined flag and expect an error from the apply.
+	configuration = `
+secrets: ` + secretsDir + `
+cmdflags:
+ cacheserver:
+  cachesize: ` + fmt.Sprintf("%d", expectedSize) + `
+  writethrough: ` + fmt.Sprintf("%v", expectedWT) + `
+  cachedir: /tmp
+`
+	config, err = InitConfig(strings.NewReader(configuration))
+	if err != nil {
+		t.Fatalf("could not parse config %v: %v", configuration, err)
+	}
+	if err := SetFlagValues(config, "cacheserver"); err == nil {
+		t.Fatalf("SetFlagValues should have failed %v", configuration)
+	}
+
+}
+
+func TestCacheValues(t *testing.T) {
+	// Test values for cache:.
+	base := "secrets: " + secretsDir + "\n"
+	baseConfig, err := InitConfig(strings.NewReader(base))
+	if err != nil {
+		t.Fatalf("could not parse config %v: %v", base, err)
+	}
+	localAddr := local.LocalName(baseConfig, "cacheserver")
+	tests := []struct {
+		val    string
+		expect string
+	}{
+		{"y", localAddr},
+		{"yes", localAddr},
+		{"true", localAddr},
+		{"n", ""},
+		{"no", ""},
+		{"false", ""},
+		{"remote,server.example.com", "remote,server.example.com"},
+	}
+	for _, test := range tests {
+		configuration := base + "cache: " + test.val + "\n"
+		config, err := InitConfig(strings.NewReader(configuration))
+		if err != nil {
+			t.Fatalf("could not parse config %v: %v", configuration, err)
+		}
+		ep, err := parseTestEndpoint(test.expect)
+		if err != nil {
+			t.Fatalf("bad test: %v: %s", test, err)
+		}
+		if ep.String() != config.CacheEndpoint().String() {
+			t.Fatalf("expect %s got %s", ep, config.CacheEndpoint())
+		}
+	}
+}
+
+func parseTestEndpoint(text string) (upspin.Endpoint, error) {
+	if text == "" {
+		return upspin.Endpoint{}, nil
+	}
+
+	ep, err := upspin.ParseEndpoint(text)
+	// If no transport is provided, assume remote transport.
+	if err != nil && !strings.Contains(text, ",") {
+		var err2 error
+		if ep, err2 = upspin.ParseEndpoint("remote," + text); err2 == nil {
+			err = nil
+		}
+	}
+	if err != nil {
+		return upspin.Endpoint{}, err
+	}
+
+	// If it's a remote and the provided address does not include a port,
+	// assume port 443.
+	if ep.Transport == upspin.Remote && !strings.Contains(string(ep.NetAddr), ":") {
+		ep.NetAddr += ":443"
+	}
+	return *ep, nil
 }
 
 func TestEnv(t *testing.T) {
@@ -254,5 +395,11 @@ func testConfig(t *testing.T, expect *expectations, configuration string) {
 	}
 	if config.Packing() != expect.packing {
 		t.Errorf("got %v expected %v", config.Packing(), expect.packing)
+	}
+	for cmd, eflags := range expect.cmdflags {
+		flags := config.Flags(cmd)
+		if !reflect.DeepEqual(eflags, flags) {
+			t.Errorf("cmdflags for %s got %v expected %v", cmd, flags, eflags)
+		}
 	}
 }
