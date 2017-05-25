@@ -22,11 +22,11 @@ argument and points to the first path argument.
 	// backwards, but it's also the same as in cp, with the new name second.
 	s.ParseFlags(fs, args, help, "link [-f] original_path link_path")
 	if fs.NArg() != 2 {
-		fs.Usage()
+		usageAndExit(fs)
 	}
 
-	originalPath := upspin.PathName(fs.Arg(0))
-	linkPath := upspin.PathName(fs.Arg(1))
+	originalPath := upspin.PathName(s.AtSign(fs.Arg(0)))
+	linkPath := upspin.PathName(s.AtSign(fs.Arg(1)))
 
 	if !force {
 		_, err := s.Client.Lookup(originalPath, false)
