@@ -9,10 +9,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"syscall"
 	"testing"
 	"time"
 )
+
+const timeout = 10 * time.Second
 
 // TestShutdown launches a child process, sends it SIGTERM, and, by reading its
 // standard output, checks that the process runs the required shutdown
@@ -40,7 +41,7 @@ var shutdownMessages = []string{
 }
 
 func testShutdown(t *testing.T, clean bool) {
-	cmd := exec.Command(os.Args[0], "-test.run=TestShutdown")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestShutdown$")
 	cmd.Env = []string{shutdownEnv + "=true"}
 	if !clean {
 		cmd.Env = append(cmd.Env, shutdownKillEnv+"=true")
@@ -78,7 +79,7 @@ func testShutdown(t *testing.T, clean bool) {
 			cmd.Process.Kill()
 			t.Fatal(err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(timeout):
 		t.Fatal("timed out waiting for child process to say hello")
 	}
 
@@ -108,11 +109,6 @@ func testShutdown(t *testing.T, clean bool) {
 		waitErr <- cmd.Wait()
 	}()
 
-	// Kill the process and wait for it to exit.
-	if err := syscall.Kill(cmd.Process.Pid, syscall.SIGTERM); err != nil {
-		t.Fatal(err)
-	}
-
 	// Check that the output was what we expected.
 	if err := <-readErr; err != nil {
 		cmd.Process.Kill()
@@ -127,7 +123,7 @@ func testShutdown(t *testing.T, clean bool) {
 		} else if err == nil && !clean {
 			t.Fatal("child process exited cleanly, want non-zero status")
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(timeout):
 		cmd.Process.Kill()
 		t.Fatal("timed out waiting for child process to exit")
 	}
@@ -142,8 +138,6 @@ func testShutdownChildProcess() {
 		}
 	}
 
-	fmt.Println(shutdownMessages[0])
-
 	Handle(func() {
 		fmt.Println(shutdownMessages[2])
 	})
@@ -155,6 +149,8 @@ func testShutdownChildProcess() {
 			select {} // Block forever, stalling Shutdown.
 		}
 	})
+
+	fmt.Println(shutdownMessages[0])
 
 	Now(0)
 
