@@ -3,6 +3,7 @@
 // license that can be found in the LICENSE file.
 
 // +build !windows
+// +build !openbsd
 
 package main
 
@@ -684,6 +685,7 @@ func (h *handle) Write(context gContext.Context, req *fuse.WriteRequest, resp *f
 	if newSize > h.n.attr.Size {
 		h.n.attr.Size = newSize
 	}
+	h.n.attr.Mtime = time.Now()
 	return nil
 }
 
