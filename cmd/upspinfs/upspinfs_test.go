@@ -4,6 +4,7 @@
 //
 
 // +build !windows
+// +build !openbsd
 
 package main
 
@@ -117,7 +118,7 @@ func mount() error {
 	}
 
 	// A directory for cache files.
-	testConfig.cacheDir, err = ioutil.TempDir("/tmp", "upspincache")
+	testConfig.cacheDir, err = ioutil.TempDir("", "upspincache")
 	if err != nil {
 		return err
 	}

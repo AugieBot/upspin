@@ -3,6 +3,7 @@
 // license that can be found in the LICENSE file.
 
 // +build !windows
+// +build !openbsd
 
 /*
 Package ose is a version of the file ops from the os package using encrypted files.
@@ -155,6 +156,13 @@ func (file *File) Close() error {
 	}
 	os.Remove(file.name)
 	return file.f.Close()
+}
+
+// Pin increases the reference count so the file will not be removed.
+func (file *File) Pin() {
+	state.Lock()
+	file.refs++
+	state.Unlock()
 }
 
 // Stat returns the status of a file.

@@ -32,7 +32,7 @@ import (
 
 var (
 	zeroEndpoint      upspin.Endpoint
-	inprocessEndpoint upspin.Endpoint = upspin.Endpoint{
+	inprocessEndpoint = upspin.Endpoint{
 		Transport: upspin.InProcess,
 		NetAddr:   "", // ignored
 	}
@@ -173,7 +173,7 @@ func startCombinedServer(cfg upspin.Config) (*upspin.Endpoint, error) {
 	ep, _ := upspin.ParseEndpoint("remote," + addr)
 
 	ready := make(chan struct{})
-	go https.ListenAndServe(ready, "test", addr, nil)
+	go https.ListenAndServe(ready, &https.Options{Addr: addr})
 	<-ready
 	return ep, nil
 }
@@ -195,7 +195,7 @@ func startCacheServer(cfg upspin.Config) (*upspin.Endpoint, error) {
 	ep, _ := upspin.ParseEndpoint("remote," + addr)
 
 	// Create a directory for the cacheserver's log and data.
-	flags.CacheDir, err = ioutil.TempDir("/tmp", "cacheserver")
+	flags.CacheDir, err = ioutil.TempDir("", "cacheserver")
 	if err != nil {
 		return nil, err
 	}
