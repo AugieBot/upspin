@@ -7,6 +7,7 @@ package https // import "upspin.io/cloud/https"
 
 import (
 	"crypto/tls"
+	"go/build"
 	"net"
 	"net/http"
 	"os"
@@ -53,8 +54,8 @@ type Options struct {
 }
 
 var defaultOptions = &Options{
-	CertFile: filepath.Join(os.Getenv("GOPATH"), "/src/upspin.io/rpc/testdata/cert.pem"),
-	KeyFile:  filepath.Join(os.Getenv("GOPATH"), "/src/upspin.io/rpc/testdata/key.pem"),
+	CertFile: filepath.Join(build.Default.GOPATH, "/src/upspin.io/rpc/testdata/cert.pem"),
+	KeyFile:  filepath.Join(build.Default.GOPATH, "/src/upspin.io/rpc/testdata/key.pem"),
 }
 
 func (opt *Options) applyDefaults() {
@@ -131,12 +132,8 @@ func ListenAndServe(ready chan<- struct{}, opt *Options) {
 		}
 	} else if dir := opt.LetsEncryptCache; dir != "" {
 		log.Info.Printf("https: serving HTTPS on %q using Let's Encrypt certificates", addr)
-		fi, err := os.Stat(dir)
-		if err != nil {
-			log.Fatalf("https: could not read -letscache directory: %v", err)
-		}
-		if !fi.IsDir() {
-			log.Fatalf("https: could not read -letscache directory: %v is not a directory", dir)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			log.Fatalf("https: could not create or read -letscache directory: %v", err)
 		}
 		m.Cache = autocert.DirCache(dir)
 		config = &tls.Config{GetCertificate: m.GetCertificate}
