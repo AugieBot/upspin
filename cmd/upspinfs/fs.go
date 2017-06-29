@@ -25,6 +25,7 @@ import (
 	"upspin.io/access"
 	"upspin.io/bind"
 	"upspin.io/client"
+	"upspin.io/client/clientutil"
 	"upspin.io/errors"
 	"upspin.io/log"
 	"upspin.io/path"
@@ -883,7 +884,6 @@ func (link *node) upspinPathToHostPath(target upspin.PathName) (string, error) {
 
 // Symlink implements fs.NodeReadlinker.Readlink.
 func (n *node) Readlink(ctx gContext.Context, req *fuse.ReadlinkRequest) (string, error) {
-	const op = "upspinfs/fs.Readlink"
 	log.Debug.Printf("Readlink %q -> %q", n, n.link)
 	return n.upspinPathToHostPath(n.link)
 }
@@ -921,11 +921,6 @@ func (n *node) exists() {
 	delete(f.enoentMap, n.uname)
 	f.nodeMap[n.uname] = n
 	f.Unlock()
-}
-
-// delay exists for testing.  We can insert a call to it anywhere we want to fake a delay.
-func delay() {
-	time.Sleep(200 * time.Millisecond)
 }
 
 // debug is used by the FUSE library to output error messages.
@@ -1013,7 +1008,7 @@ func (fs *upspinFS) checkAccess(name upspin.PathName, owner upspin.UserName, rig
 		// Everyone else can do nothing.
 		return errors.E(errors.Permission, name)
 	}
-	accessData, err := fs.client.Get(whichAccess.Name)
+	accessData, err := clientutil.ReadAll(fs.config, whichAccess)
 	if err != nil {
 		return err
 	}
