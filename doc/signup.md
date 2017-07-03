@@ -47,23 +47,24 @@ instructions below.
 
 ## Install the Upspin commands
 
-Upspin is written in Go, so the first step is to install the Go tool chain.
-You will need Go version 1.8 or later.
-You can get it from
-[https://golang.org/doc/install](https://golang.org/doc/install).
+Download an archive of the Upspin command-line tools from [the download
+page](/dl/), and extract it to a directory that's in your system `PATH`.
 
-Once you have Go installed, Upspin can be fetched by running, in a terminal,
-the command
+The archive includes the `upspin` command-line tool (to create, access, share,
+and administer data stored in Upspin), the `cacheserver` daemon (a cache for
+remote Upspin data), and, on macOS and Linux systems, the `upspinfs` program (a
+[FUSE](https://github.com/libfuse/libfuse) filesystem, to mount the Upspin file
+system in your local file tree).
 
+> If your operating system is not listed on the download page, you can obtain
+> the binaries by installing Upspin from source.
+> First [install Go](https://golang.org/doc/install) and then use `go get` to
+> fetch Upspin and its dependencies and build them:
+> ```
+$ go get upspin.io/cmd/...
 ```
-$ go get -u upspin.io/...
-```
-
-This will install all the libraries, plus tools such as the `upspin` command
-that provides a command-line interface to create, access, share, and administer
-data stored in Upspin.
-If you are on a Unix system, it will also install the `upspinfs` program, which
-uses FUSE to connect the Upspin name space to your local file tree.
+> This will install the Upspin commands to `$GOPATH/bin`, which you should add
+> to your system `PATH` if you haven't already.
 
 ## Generating keys and registering your identity
 
@@ -229,10 +230,45 @@ cache server that improves performance. The cache server is particularly
 important, and the setup instructions are in the [Upspin configuration](/doc/config.md)
 document.
 
-For details about `upspinfs`, run
+## Browsing Upspin Files on Linux and macOS
+
+Upspin includes a tool called `upspinfs` that creates a virtual filesystem
+where you can browse Upspin trees as if they were on disk.
+
+Here is an example of its use.
+
+Make a directory in which to mount the Upspin namespace:
 
 ```
-$ go doc upspinfs
+$ mkdir $HOME/up
 ```
 
-TODO: There should be more about `upspinfs`.
+Then run the `upspinfs` daemon with the directory created above:
+
+```
+$ upspinfs $HOME/up
+```
+
+Now you have access to the full Upspin name space:
+
+```
+$ ls $HOME/up/you@gmail.com
+```
+
+The `upspinfs` daemon will exit when the file system is unmounted.
+
+If you encounter an error when you run `upspinfs` the second time such as:
+
+```
+mount helper error: fusermount: failed to open mountpoint for reading: Transport endpoint is not connected
+fuse.Mount failed: fusermount: exit status 1
+```
+
+just un-mount and try again.
+
+To learn more about `upspinfs`, run
+
+```
+$ go doc upspin.io/cmd/upspinfs
+```
+TODO: Talk about `cacheserver`.
