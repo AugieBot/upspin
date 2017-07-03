@@ -185,11 +185,11 @@ Now provision a server and deploy the `upspinserver` binary to it.
 
 ### Provision a server
 
-You can run an `upspinserver` on any server, including Linux, MacOS, Windows,
+You can run an `upspinserver` on any server, including Linux, macOS, Windows,
 and [more](https://golang.org/doc/install#requirements), as long as it has a
 publicly-accessible IP address and can run Go programs.
 
-> Note that Upspin has been mostly developed under Linux and MacOS.
+> Note that Upspin has been mostly developed under Linux and macOS.
 > You may encounter issues running it on other platforms.
 
 For a personal Upspin installation, a server with 1 CPU core, 2GB of memory,
@@ -228,9 +228,18 @@ guides:
 
 ## Test connectivity
 
-Using your web browser, navigate to the URL of your `upspinserver`
-(`https://upspin.example.com/`).
-You should see the text:
+At this point, you should have an `upspinserver` running on your server in
+"setup mode", which means that it is ready to be configured by the `upspin
+setupserver` command.
+This state is indicated by a log message printed on startup:
+
+```
+Configuration file not found. Running in setup mode.
+```
+
+Test that the `upspinserver` is accessible from the outside by making an HTTP
+request to it. Using your web browser, navigate to the URL of your
+`upspinserver` (`https://upspin.example.com/`). You should see the text:
 
 ```
 Unconfigured Upspin Server
