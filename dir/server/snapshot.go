@@ -23,7 +23,6 @@ import (
 // Snapshots are automatically taken every 12 hours.
 const (
 	snapshotSuffix          = "snapshot"
-	snapshotGlob            = "*+" + snapshotSuffix + "@*"
 	snapshotControlFile     = "TakeSnapshot"
 	snapshotDateFormat      = "2006/01/02/"
 	snapshotTimeFormat      = "15:04"
@@ -103,7 +102,7 @@ func (s *server) snapshotLoop() {
 // it's time to perform a new snapshot for them and if so snapshots them.
 func (s *server) snapshotAll() error {
 	const op = "dir/server.snapshotAll"
-	users, err := tree.ListUsers(snapshotGlob, s.logDir)
+	users, err := tree.ListUsersWithSuffix(snapshotSuffix, s.logDir)
 	if err != nil {
 		log.Error.Printf("%s: error listing snapshot users: %s", op, err)
 		return err
@@ -240,8 +239,8 @@ func (s *server) takeSnapshot(dstDir path.Parsed, srcDir upspin.PathName) error 
 	return nil
 }
 
-// makeSnapshotPath makes the full path name, creating any necessary
-// subdirectories.
+// makeSnapshotPath makes all directories leading up to (but not including)
+// name.
 func (s *server) makeSnapshotPath(name upspin.PathName) error {
 	p, err := path.Parse(name)
 	if err != nil {
@@ -249,7 +248,7 @@ func (s *server) makeSnapshotPath(name upspin.PathName) error {
 	}
 	// Traverse the path one element of a time making each subdir. We start
 	// from 1 as we don't try to make the root.
-	for i := 1; i <= p.NElem(); i++ {
+	for i := 1; i < p.NElem(); i++ {
 		err = s.mkDirIfNotExist(p.First(i))
 		if err != nil {
 			return err
