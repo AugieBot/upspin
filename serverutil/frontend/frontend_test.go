@@ -21,9 +21,8 @@ var (
 	testResponse = "ok"
 	testDocPath  = "testdata/doc"
 
-	testServer http.Handler
-	addr       string
-	once       sync.Once
+	addr string
+	once sync.Once
 )
 
 func startServer() {
@@ -32,7 +31,7 @@ func startServer() {
 		os.Exit(1)
 	}
 	*docPath = testDocPath
-	s := newServer().(*server)
+	s := newServer(nil).(*server)
 	s.mux.Handle("/_test", canonicalHostHandler{http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, testResponse)
 	})})
