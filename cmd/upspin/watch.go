@@ -7,7 +7,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"os"
 )
 
 func (s *State) watch(args ...string) {
@@ -15,12 +14,17 @@ func (s *State) watch(args ...string) {
 Watch watches the given Upspin path beginning with the specified order and
 prints the events to standard output. An order of -1, the default, will send
 the current state of the tree rooted at the given path.
+
+The -glob flag can be set to false to have watch skip Glob processing,
+treating its arguments as literal text even if they contain special
+characters. (Leading @ signs are always expanded.)
 `
 	fs := flag.NewFlagSet("watch", flag.ExitOnError)
+	glob := globFlag(fs)
 	order := fs.Int64("order", -1, "order")
 	s.ParseFlags(fs, args, help, "watch [-order=n] path")
 
-	names := s.GlobAllUpspinPath(fs.Args())
+	names := s.expandUpspin(fs.Args(), *glob)
 	if len(names) != 1 {
 		usageAndExit(fs)
 	}
@@ -38,7 +42,7 @@ the current state of the tree rooted at the given path.
 	}
 	for e := range events {
 		if e.Error != nil {
-			fmt.Fprintf(os.Stderr, "watch: error: %s\n", e.Error) // TODO: Failf? Set exitCode?
+			fmt.Fprintf(s.Stderr, "watch: error: %s\n", e.Error) // TODO: Failf? Set exitCode?
 			continue
 		}
 
@@ -59,6 +63,6 @@ the current state of the tree rooted at the given path.
 			d, _ := de.Size()
 			size = fmt.Sprintf("%10d", d)
 		}
-		fmt.Printf("%s [%s] %s %s\n", de.Time, attr, size, de.Name)
+		s.Printf("%s [%s] %s %s\n", de.Time, attr, size, de.Name)
 	}
 }
