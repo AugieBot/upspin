@@ -24,6 +24,7 @@ import (
 	"upspin.io/flags"
 	"upspin.io/metric"
 	"upspin.io/subcmd"
+	"upspin.io/upspin"
 
 	// Load useful packers
 	_ "upspin.io/pack/ee"
@@ -105,37 +106,48 @@ type State struct {
 }
 
 func main() {
-	log.SetFlags(0)
-	log.SetPrefix("upspin: ")
-	flag.Usage = usage
-	flags.Parse(flags.Client)
-
-	if len(flag.Args()) < 1 {
+	state, args, ok := setup(flag.CommandLine, os.Args[1:])
+	if !ok {
 		fmt.Fprintln(os.Stderr, intro)
 		os.Exit(2)
 	}
-
-	op := strings.ToLower(flag.Arg(0))
-	state := newState(op)
-	args := flag.Args()[1:]
-
-	if !strings.Contains(state.Name, "setup") && !strings.Contains(state.Name, "signup") {
-		cacheutil.Start(state.Config)
-	}
-
 	// Shell cannot be in commands because of the initialization loop,
 	// and anyway we should avoid recursion in the interpreter.
 	if state.Name == "shell" {
-		// Start the cache if needed.
-		state.init()
-		state.shell(args...)
+		state.shell(args[1:]...)
 		state.ExitNow()
-		return
+		os.Exit(0)
 	}
-	cmd := state.getCommand(state.Name)
-	state.init()
-	cmd(state, args...)
+	state.run(args)
 	state.ExitNow()
+}
+
+// setup initializes the upspin command given the full command-line argument
+// list, args. It applies any global flags set on the command line and returns
+// the initialized State and the arg list after the global flags, starting with
+// the subcommand ("ls", "info", etc.) that will be run.
+func setup(fs *flag.FlagSet, args []string) (*State, []string, bool) {
+	log.SetFlags(0)
+	log.SetPrefix("upspin: ")
+	fs.Usage = usage
+	flags.ParseArgsInto(fs, args, flags.Client)
+	if len(fs.Args()) < 1 {
+		return nil, nil, false
+	}
+	state := newState(strings.ToLower(fs.Arg(0)))
+	state.init()
+	// Start the cache if needed.
+	if !strings.Contains(state.Name, "setup") && !strings.Contains(state.Name, "signup") {
+		cacheutil.Start(state.Config)
+	}
+	return state, fs.Args(), true
+}
+
+// run runs a single command specified by the arguments, which should begin with
+// the subcommand ("ls", "info", etc.).
+func (state *State) run(args []string) {
+	cmd := state.getCommand(args[0])
+	cmd(state, args[1:]...)
 }
 
 func usage() {
@@ -186,6 +198,7 @@ func printCommands() {
 // If the command still can't be found, it exits after listing the
 // commands that do exist.
 func (s *State) getCommand(op string) func(*State, ...string) {
+	op = strings.ToLower(op)
 	fn := commands[op]
 	if fn != nil {
 		return fn
@@ -237,4 +250,47 @@ func (s *State) init() {
 	}
 	s.enableMetrics()
 	return
+}
+
+func (s *State) Printf(format string, args ...interface{}) {
+	fmt.Fprintf(s.Stdout, format, args...)
+}
+
+// writeOut writes to the named file or to stdout if it is empty
+func (s *State) writeOut(file string, data []byte) {
+	// Write to outfile or to stdout if none set
+	if file == "" {
+		_, err := s.Stdout.Write(data)
+		if err != nil {
+			s.Exitf("copying to output failed: %v", err)
+		}
+		return
+	}
+	output := s.CreateLocal(subcmd.Tilde(file))
+	_, err := output.Write(data)
+	if err != nil {
+		s.Exitf("copying to output failed: %v", err)
+	}
+	if err := output.Close(); err != nil {
+		s.Exitf("closing to output failed: %v", err)
+	}
+}
+
+// globFlag sets a "-glob=true" flag in the FlagSet.
+func globFlag(fs *flag.FlagSet) *bool {
+	return fs.Bool("glob", true, "apply glob processing to the arguments")
+}
+
+// expandUpspin turns the list of string arguments into Upspin path names.
+// If glob is true, it "globs" and @-expands the arguments.
+// Otherwise, it interprets leading @ symbols but does no other processing.
+func (s *State) expandUpspin(args []string, doGlob bool) []upspin.PathName {
+	if doGlob {
+		return s.GlobAllUpspinPath(args)
+	}
+	paths := make([]upspin.PathName, len(args))
+	for i, arg := range args {
+		paths[i] = upspin.PathName(s.AtSign(arg))
+	}
+	return paths
 }
