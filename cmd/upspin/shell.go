@@ -8,7 +8,6 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
-	"os"
 	"strings"
 )
 
@@ -17,6 +16,12 @@ func (s *State) shell(args ...string) {
 	const help = `
 Shell runs an interactive session for Upspin subcommands.
 When running the shell, the leading "upspin" is assumed on each command.
+
+The shell has a simple interface, free of quoting or other features usually
+associated with interactive shells.  It is intended only for testing and is kept
+simple for reasons of comprehensibility, portability, and maintainability.  Those
+who need quoting or line editing or other such features should use their regular
+shell and run upspinfs or invoke the upspin command line-by-line.
 `
 	fs := flag.NewFlagSet("shell", flag.ExitOnError)
 	promptFlag := fs.String("prompt", promptPlaceholder, "interactive `prompt`")
@@ -27,7 +32,7 @@ When running the shell, the leading "upspin" is assumed on each command.
 	}
 	prompt := func() {
 		if len(*promptFlag) > 0 {
-			fmt.Fprint(os.Stderr, *promptFlag)
+			fmt.Fprint(s.Stderr, *promptFlag)
 		}
 	}
 	if *promptFlag == promptPlaceholder {
@@ -35,7 +40,7 @@ When running the shell, the leading "upspin" is assumed on each command.
 	}
 	s.Interactive = true
 	defer func() { s.Interactive = false }()
-	scanner := bufio.NewScanner(os.Stdin)
+	scanner := bufio.NewScanner(s.Stdin)
 	for prompt(); scanner.Scan(); prompt() {
 		s.exec(scanner.Text(), *verbose)
 	}
@@ -67,11 +72,11 @@ func (s *State) exec(line string, verbose bool) {
 	}
 	fn := s.getCommand(strings.ToLower(words[0]))
 	if fn == nil {
-		fmt.Fprintf(os.Stderr, "upspin: no such command %q\n", words[0])
+		fmt.Fprintf(s.Stderr, "upspin: no such command %q\n", words[0])
 		return
 	}
 	if verbose {
-		fmt.Fprintln(os.Stderr, " + "+strings.Join(words, " "))
+		fmt.Fprintln(s.Stderr, " + "+strings.Join(words, " "))
 	}
 	s.Name = words[0]
 	fn(s, words[1:]...)

@@ -95,6 +95,9 @@ type server struct {
 	// now returns the time now. It's usually just upspin.Now but is
 	// overridden for tests.
 	now func() upspin.Time
+
+	// dialed reports whether the instance was created using Dial, not New.
+	dialed bool
 }
 
 var _ upspin.DirServer = (*server)(nil)
@@ -236,7 +239,9 @@ func (s *server) lookupWithPermissions(op string, name upspin.PathName, opts ...
 		if !canAny {
 			return nil, s.errPerm(op, p, opts...)
 		}
-		entry.MarkIncomplete()
+		if !access.IsAccessFile(name) && !access.IsGroupFile(name) {
+			entry.MarkIncomplete()
+		}
 	}
 	return entry, nil
 }
@@ -459,12 +464,14 @@ func (s *server) Glob(pattern string) ([]*upspin.DirEntry, error) {
 	o, m := newOptMetric(op)
 	defer m.Done()
 
+	// lookup implements serverutil.LookupFunc. It checks permissions.
 	lookup := func(name upspin.PathName) (*upspin.DirEntry, error) {
 		const op = "dir/server.Lookup"
 		o, ss := subspan(op, []options{o})
 		defer ss.End()
 		return s.lookupWithPermissions(op, name, o)
 	}
+	// lookup implements serverutil.ListFunc. It checks permissions.
 	listDir := func(dirName upspin.PathName) ([]*upspin.DirEntry, error) {
 		const op = "dir/server.listDir"
 		o, ss := subspan(op, []options{o})
@@ -479,49 +486,8 @@ func (s *server) Glob(pattern string) ([]*upspin.DirEntry, error) {
 	return entries, err
 }
 
-func (s *server) globWithoutPermissions(pattern string) ([]*upspin.DirEntry, error) {
-	const op = "dir/server.globWithoutPermissions"
-	o, m := newOptMetric(op)
-	defer m.Done()
-
-	lookup := func(name upspin.PathName) (*upspin.DirEntry, error) {
-		const op = "dir/server.Lookup"
-		o, ss := subspan(op, []options{o})
-		defer ss.End()
-		p, err := path.Parse(name)
-		if err != nil {
-			return nil, errors.E(op, name, err)
-		}
-		return s.lookup(op, p, !entryMustBeClean, o)
-	}
-	listDir := func(dirName upspin.PathName) ([]*upspin.DirEntry, error) {
-		const op = "dir/server.listDir"
-		o, ss := subspan(op, []options{o})
-		defer ss.End()
-		p, err := path.Parse(dirName)
-		if err != nil {
-			return nil, errors.E(op, dirName, err)
-		}
-		tree, err := s.loadTreeFor(p.User(), o)
-		if err != nil {
-			return nil, errors.E(op, err)
-		}
-		entries, _, err := tree.List(p)
-		if err != nil {
-			return nil, errors.E(op, err)
-		}
-		return entries, nil
-	}
-
-	entries, err := serverutil.Glob(pattern, lookup, listDir)
-	if err != nil && err != upspin.ErrFollowLink {
-		err = errors.E(op, err)
-	}
-	return entries, err
-}
-
 // listDir implements serverutil.ListFunc, with an additional options variadic.
-// dirName should always be a directory.
+// dirName should always be a directory. It checks permissions.
 func (s *server) listDir(op string, dirName upspin.PathName, opts ...options) ([]*upspin.DirEntry, error) {
 	parsed, err := path.Parse(dirName)
 	if err != nil {
@@ -529,6 +495,19 @@ func (s *server) listDir(op string, dirName upspin.PathName, opts ...options) ([
 	}
 
 	tree, err := s.loadTreeFor(parsed.User(), opts...)
+	if err != nil {
+		return nil, errors.E(op, err)
+	}
+
+	// Fetch the directory's contents.
+	entries, isDirty, err := tree.List(parsed)
+	if err == upspin.ErrFollowLink {
+		entry, err := s.errLink(op, entries[0], opts...)
+		if entry != nil {
+			return []*upspin.DirEntry{entry}, err
+		}
+		return nil, err
+	}
 	if err != nil {
 		return nil, errors.E(op, err)
 	}
@@ -545,21 +524,17 @@ func (s *server) listDir(op string, dirName upspin.PathName, opts ...options) ([
 	}
 	canRead, _, _ = s.hasRight(access.Read, parsed, opts...)
 
-	if canRead {
+	if canRead && isDirty {
 		// User wants DirEntries with valid blocks, so we must flush
-		// the Tree (we could check if !dirty first, but flush when
-		// nothing is dirty is cheap and doing everything again if it
-		// was dirty is expensive, so flush now).
+		// the Tree if something is dirty and try again.
 		err = tree.Flush()
 		if err != nil {
 			return nil, errors.E(op, err)
 		}
-	}
-
-	// Fetch the directory's contents.
-	entries, _, err := tree.List(parsed)
-	if err != nil {
-		return nil, errors.E(op, err)
+		entries, _, err = tree.List(parsed)
+		if err != nil { // Not ErrFollowLink
+			return nil, errors.E(op, err)
+		}
 	}
 	if !canRead {
 		for _, e := range entries {
@@ -764,6 +739,7 @@ func (s *server) Dial(ctx upspin.Config, e upspin.Endpoint) (upspin.Service, err
 	cp := *s // copy of the generator instance.
 	// Overwrite the userName and its sub-components (base, suffix, domain).
 	cp.userName = ctx.UserName()
+	cp.dialed = true
 	var err error
 	cp.userBase, cp.userSuffix, cp.userDomain, err = user.Parse(cp.userName)
 	if err != nil {
@@ -800,6 +776,10 @@ func (s *server) Close() {
 	if err := s.closeTree(s.userName); err != nil {
 		// TODO: return an error when Close expects it.
 		log.Error.Printf("%s: Error closing user tree %q: %q", op, s.userName, err)
+	}
+
+	if !s.dialed {
+		s.shutdown()
 	}
 }
 
@@ -929,16 +909,12 @@ func (s *server) errLink(op string, link *upspin.DirEntry, opts ...options) (*up
 func (s *server) shutdown() {
 	it := s.userTrees.NewIterator()
 	for {
-		k, v, next := it.GetAndAdvance()
+		k, _, next := it.GetAndAdvance()
 		if !next {
 			break
 		}
 		user := k.(upspin.UserName)
-		tree := v.(*tree.Tree)
-		err := tree.Close()
-		if err != nil {
-			log.Error.Printf("dir/server.shutdown: Error closing tree for user %s: %s", user, err)
-		}
+		s.closeTree(user)
 	}
 }
 
