@@ -5,9 +5,9 @@
 package server
 
 import (
+	"strings"
 	"time"
 
-	"strings"
 	"upspin.io/dir/server/tree"
 	"upspin.io/errors"
 	"upspin.io/log"
@@ -23,7 +23,6 @@ import (
 // Snapshots are automatically taken every 12 hours.
 const (
 	snapshotSuffix          = "snapshot"
-	snapshotGlob            = "*+" + snapshotSuffix + "@*"
 	snapshotControlFile     = "TakeSnapshot"
 	snapshotDateFormat      = "2006/01/02/"
 	snapshotTimeFormat      = "15:04"
@@ -103,7 +102,7 @@ func (s *server) snapshotLoop() {
 // it's time to perform a new snapshot for them and if so snapshots them.
 func (s *server) snapshotAll() error {
 	const op = "dir/server.snapshotAll"
-	users, err := tree.ListUsers(snapshotGlob, s.logDir)
+	users, err := tree.ListUsersWithSuffix(snapshotSuffix, s.logDir)
 	if err != nil {
 		log.Error.Printf("%s: error listing snapshot users: %s", op, err)
 		return err
@@ -161,18 +160,19 @@ func (s *server) shouldSnapshot(cfg *snapshotConfig) (bool, path.Parsed, error) 
 	}
 
 	// List today's snapshot directory, including any suffixed snapshot.
-	entries, err := s.globWithoutPermissions(p.String() + "/*")
+	tree, err := s.loadTreeFor(p.User())
 	if err != nil {
-		if err == upspin.ErrFollowLink {
-			// We need to get the real entry and we cannot resolve links on our own.
-			return false, path.Parsed{}, errors.E(op, errors.Internal, p.Path(), errors.Str("cannot follow a link to snapshot"))
-		}
-		if !errors.Match(errNotExist, err) {
-			// Some other error. Abort.
-			return false, path.Parsed{}, errors.E(op, err)
-		}
-		// Ok, proceed.
-	} else {
+		return false, path.Parsed{}, errors.E(op, err)
+	}
+	entries, _, err := tree.List(p)
+	if err == upspin.ErrFollowLink {
+		// We need to get the real entry and we cannot resolve links on our own.
+		return false, path.Parsed{}, errors.E(op, errors.Internal, p.Path(), errors.Str("cannot follow a link to snapshot"))
+	} else if err != nil && !errors.Match(errNotExist, err) {
+		// Some other error. Abort.
+		return false, path.Parsed{}, errors.E(op, err)
+	}
+	if len(entries) > 0 {
 		var mostRecent time.Time
 		for _, e := range entries {
 			parsed, _ := path.Parse(e.Name) // can't be an error.
@@ -240,8 +240,8 @@ func (s *server) takeSnapshot(dstDir path.Parsed, srcDir upspin.PathName) error 
 	return nil
 }
 
-// makeSnapshotPath makes the full path name, creating any necessary
-// subdirectories.
+// makeSnapshotPath makes all directories leading up to (but not including)
+// name.
 func (s *server) makeSnapshotPath(name upspin.PathName) error {
 	p, err := path.Parse(name)
 	if err != nil {
@@ -249,7 +249,7 @@ func (s *server) makeSnapshotPath(name upspin.PathName) error {
 	}
 	// Traverse the path one element of a time making each subdir. We start
 	// from 1 as we don't try to make the root.
-	for i := 1; i <= p.NElem(); i++ {
+	for i := 1; i < p.NElem(); i++ {
 		err = s.mkDirIfNotExist(p.First(i))
 		if err != nil {
 			return err
