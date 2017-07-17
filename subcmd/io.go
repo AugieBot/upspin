@@ -82,16 +82,15 @@ func Tilde(file string) string {
 // ReadAll reads all contents from a local input file or from stdin if
 // the input file name is empty
 func (s *State) ReadAll(fileName string) []byte {
-	var input *os.File
-	var err error
-	fileName = Tilde(fileName)
 	if fileName == "" {
-		input = os.Stdin
-	} else {
-		input = s.OpenLocal(fileName)
-		defer input.Close()
+		data, err := ioutil.ReadAll(s.Stdin)
+		if err != nil {
+			s.Exit(err)
+		}
+		return data
 	}
-
+	input := s.OpenLocal(Tilde(fileName))
+	defer input.Close()
 	data, err := ioutil.ReadAll(input)
 	if err != nil {
 		s.Exit(err)
@@ -146,9 +145,22 @@ func (s *State) ShouldNotExist(path string) {
 	}
 }
 
-// HasGlobChar reports whether the string contains a Glob metacharacter.
+// HasGlobChar reports whether the string contains an unescaped Glob metacharacter.
 func HasGlobChar(pattern string) bool {
-	return strings.ContainsAny(pattern, `\*?[`)
+	esc := false
+	for _, r := range pattern {
+		if esc {
+			esc = false // TODO: What if next rune is '/'?
+			continue
+		}
+		switch r {
+		case '\\':
+			esc = true
+		case '*', '[', '?':
+			return true
+		}
+	}
+	return false
 }
 
 // GlobAllUpspin processes the arguments, which should be Upspin paths,
@@ -173,7 +185,7 @@ func (s *State) GlobAllUpspinPath(args []string) []upspin.PathName {
 
 // GlobUpspin glob-expands the argument, which must be a syntactically
 // valid Upspin glob pattern (including a plain path name). If the path does
-// not exist, the function exits.
+// not exist or the pattern matches no paths, the function exits.
 func (s *State) GlobUpspin(pattern string) []*upspin.DirEntry {
 	// Must be a valid Upspin path.
 	pat := s.AtSign(pattern)
@@ -193,12 +205,15 @@ func (s *State) GlobUpspin(pattern string) []*upspin.DirEntry {
 	if err != nil {
 		s.Exit(err)
 	}
+	if len(entries) == 0 {
+		s.Exitf("no path matches %q", parsed)
+	}
 	return entries
 }
 
 // GlobUpspinPath glob-expands the argument, which must be a syntactically
 // valid Upspin glob pattern (including a plain path name). It returns just
-// the path names.
+// the path names. If the pattern matches no paths, the function exits.
 func (s *State) GlobUpspinPath(pattern string) []upspin.PathName {
 	// Note: We could call GlobUpspin but that might do an unnecessary Lookup.
 	pat := s.AtSign(pattern)
@@ -214,6 +229,9 @@ func (s *State) GlobUpspinPath(pattern string) []upspin.PathName {
 	if err != nil {
 		s.Exit(err)
 	}
+	if len(entries) == 0 {
+		s.Exitf("no path matches %q", parsed)
+	}
 	names := make([]upspin.PathName, len(entries))
 	for i, entry := range entries {
 		names[i] = entry.Name
@@ -226,13 +244,14 @@ func (s *State) GlobUpspinPath(pattern string) []upspin.PathName {
 func (s *State) GlobOneUpspinPath(pattern string) upspin.PathName {
 	entries := s.GlobUpspin(pattern)
 	if len(entries) != 1 {
-		s.Exitf("more than one file matches %s", pattern)
+		s.Exitf("more than one file matches %q", pattern)
 	}
 	return entries[0].Name
 }
 
 // GlobLocal glob-expands the argument, which should be a syntactically
-// valid Glob pattern (including a plain file name).
+// valid Glob pattern (including a plain file name). If the pattern is erroneous
+// or matches no files, the function exits.
 func (s *State) GlobLocal(pattern string) []string {
 	pattern = Tilde(pattern)
 	// If it has no metacharacters, leave it alone.
@@ -241,18 +260,26 @@ func (s *State) GlobLocal(pattern string) []string {
 	}
 	strs, err := filepath.Glob(pattern)
 	if err != nil {
-		// Bad pattern, so treat as a literal.
-		return []string{pattern}
+		// Bad pattern.
+		s.Exitf("bad local Glob pattern %q: %v", pattern, err)
+	}
+	if len(strs) == 0 {
+		s.Exitf("no path matches %q", pattern)
 	}
 	return strs
 }
 
 // GlobOneLocal glob-expands the argument, which must result in a
-// single local file name.
+// single local file name. If not, it exits.
 func (s *State) GlobOneLocal(pattern string) string {
 	strs := s.GlobLocal(pattern)
-	if len(strs) != 1 {
-		s.Exitf("more than one file matches %s", pattern)
+	switch len(strs) {
+	case 0:
+		s.Exitf("no path matches %q", pattern)
+	case 1:
+		// OK.
+	default:
+		s.Exitf("more than one file matches %q", pattern)
 	}
 	return strs[0]
 }
