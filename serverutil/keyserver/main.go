@@ -8,8 +8,12 @@ package keyserver // import "upspin.io/serverutil/keyserver"
 
 import (
 	"flag"
+	"io/ioutil"
 	"net/http"
+	"strings"
 
+	"upspin.io/cloud/mail/sendgrid"
+	"upspin.io/cloud/storage"
 	"upspin.io/config"
 	"upspin.io/errors"
 	"upspin.io/flags"
@@ -17,6 +21,7 @@ import (
 	"upspin.io/key/server"
 	"upspin.io/log"
 	"upspin.io/rpc/keyserver"
+	"upspin.io/serverutil/signup"
 	"upspin.io/upspin"
 
 	// Load required transports
@@ -44,7 +49,16 @@ func Main(setup func(upspin.KeyServer)) {
 	case "inprocess":
 		key = inprocess.New()
 	case "server":
-		key, err = server.New(flags.ServerConfig...)
+		var opts []storage.DialOpts
+		for _, o := range flags.ServerConfig {
+			opts = append(opts, storage.WithOptions(o))
+		}
+		var s storage.Storage
+		s, err = storage.Dial("GCS", opts...)
+		if err != nil {
+			break
+		}
+		key = server.New(s)
 	default:
 		err = errors.Errorf("bad -kind %q", flags.ServerKind)
 
@@ -57,16 +71,17 @@ func Main(setup func(upspin.KeyServer)) {
 		setup(key)
 	}
 
-	httpStore := keyserver.New(cfg, key, upspin.NetAddr(flags.NetAddr))
-	http.Handle("/api/Key/", httpStore)
+	http.Handle("/api/Key/", keyserver.New(cfg, key, upspin.NetAddr(flags.NetAddr)))
 
 	if logger, ok := key.(server.Logger); ok {
 		http.Handle("/log", logHandler{logger: logger})
 	}
+
 	if *mailConfigFile != "" {
+		signupURL := "https://" + flags.NetAddr + "/signup"
 		f := cfg.Factotum()
 		if f == nil {
-			log.Fatal("supplied config must include keys when -mail_config set")
+			log.Fatal("keyserver: supplied config must include keys when -mail_config set")
 		}
 		project := ""
 		flag.Visit(func(f *flag.Flag) {
@@ -75,12 +90,23 @@ func Main(setup func(upspin.KeyServer)) {
 			}
 			project = f.Value.String()
 		})
-		h, err := newSignupHandler(f, key, *mailConfigFile, project)
+		apiKey, err := parseMailConfig(*mailConfigFile)
 		if err != nil {
-			log.Fatal(err)
+			log.Fatalf("keyserver: %v", err)
 		}
-		http.Handle("/signup", h)
+		m := sendgrid.New(apiKey)
+		http.Handle("/signup", signup.NewHandler(signupURL, f, key, m, project))
 	} else {
 		log.Println("keyserver: -mail_config not set, /signup deactivated")
 	}
+}
+
+func parseMailConfig(name string) (apiKey string, err error) {
+	data, err := ioutil.ReadFile(name)
+	if err != nil {
+		return "", errors.E(errors.IO, err)
+	}
+	lines := strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)
+	apiKey = strings.TrimSpace(lines[0])
+	return
 }
