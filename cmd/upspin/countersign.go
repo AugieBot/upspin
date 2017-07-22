@@ -51,7 +51,12 @@ func (s *State) countersignCommand(fs *flag.FlagSet) {
 
 // countersign adds a second signature using factotum.
 func (c *Countersigner) countersign(entry *upspin.DirEntry) {
-	packer := lookupPacker(entry)
+	if entry.IsLink() && entry.Packdata == nil {
+		// TODO(ehg) This seems badly broken.
+		// Don't trust links yet if you don't trust your dirserver.
+		return
+	}
+	packer := c.oState.lookupPacker(entry)
 	newF := c.nState.Config.Factotum()
 	oldKey := c.oState.Config.Factotum().PublicKey()
 	err := packer.Countersign(oldKey, newF, entry)

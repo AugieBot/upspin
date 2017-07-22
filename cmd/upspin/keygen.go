@@ -18,6 +18,7 @@ import (
 
 	"upspin.io/config"
 	"upspin.io/errors"
+	"upspin.io/factotum"
 	"upspin.io/key/proquint"
 	"upspin.io/pack/ee"
 	"upspin.io/subcmd"
@@ -41,10 +42,9 @@ See the description for rotate for information about updating keys.
 	fs := flag.NewFlagSet("keygen", flag.ExitOnError)
 	fs.String("curve", "p256", "cryptographic curve `name`: p256, p384, or p521")
 	fs.String("secretseed", "", "the seed containing a 128 bit secret in proquint format or a file that contains it")
-	fs.String("where", filepath.Join(config.Home(), ".ssh"), "`directory` to store keys")
 	// TODO: We do not what rotate to appear in the usage message.
 	fs.Bool("rotate", false, "rotate existing keys and replace them with new ones")
-	s.ParseFlags(fs, args, help, "keygen [-curve=256] [-secretseed=seed] [-where=$HOME/.ssh]")
+	s.ParseFlags(fs, args, help, "keygen [-curve=256] [-secretseed=seed]")
 	if fs.NArg() != 0 {
 		usageAndExit(fs)
 	}
@@ -52,6 +52,11 @@ See the description for rotate for information about updating keys.
 }
 
 func (s *State) keygenCommand(fs *flag.FlagSet) {
+	f := s.Config.Factotum()
+	if f == nil || f.SecretsDir() == "" {
+		s.Exitf("keygen needs a directory in which to write secrets")
+	}
+	where := f.SecretsDir()
 	curve := subcmd.StringFlag(fs, "curve")
 	switch curve {
 	case "p256", "p384", "p521":
@@ -67,10 +72,6 @@ func (s *State) keygenCommand(fs *flag.FlagSet) {
 		s.Exitf("creating keys: %v", err)
 	}
 
-	where := subcmd.Tilde(subcmd.StringFlag(fs, "where"))
-	if where == "" {
-		s.Exitf("-where must not be empty")
-	}
 	rotate := subcmd.BoolFlag(fs, "rotate")
 	err = s.saveKeys(where, rotate, public, private)
 	if err != nil {
@@ -81,20 +82,28 @@ func (s *State) keygenCommand(fs *flag.FlagSet) {
 	if err != nil {
 		s.Exitf("writing keys: %v", err)
 	}
-	fmt.Fprintln(os.Stderr, "Upspin private/public key pair written to:")
-	fmt.Fprintf(os.Stderr, "\t%s\n", filepath.Join(where, "public.upspinkey"))
-	fmt.Fprintf(os.Stderr, "\t%s\n", filepath.Join(where, "secret.upspinkey"))
-	fmt.Fprintln(os.Stderr, "This key pair provides access to your Upspin identity and data.")
+	fmt.Fprintln(s.Stderr, "Upspin private/public key pair written to:")
+	fmt.Fprintf(s.Stderr, "\t%s\n", filepath.Join(where, "public.upspinkey"))
+	fmt.Fprintf(s.Stderr, "\t%s\n", filepath.Join(where, "secret.upspinkey"))
+	fmt.Fprintln(s.Stderr, "This key pair provides access to your Upspin identity and data.")
 	if secretFlag == "" {
-		fmt.Fprintln(os.Stderr, "If you lose the keys you can re-create them by running this command:")
-		fmt.Fprintf(os.Stderr, "\tupspin keygen -secretseed %s\n", secretStr)
-		fmt.Fprintln(os.Stderr, "Write this command down and store it in a secure, private place.")
-		fmt.Fprintln(os.Stderr, "Do not share your private key or this command with anyone.")
+		fmt.Fprintln(s.Stderr, "If you lose the keys you can re-create them by running this command:")
+		fmt.Fprintf(s.Stderr, "\tupspin keygen -curve %s -secretseed %s\n", curve, secretStr)
+		fmt.Fprintln(s.Stderr, "Write this command down and store it in a secure, private place.")
+		fmt.Fprintln(s.Stderr, "Do not share your private key or this command with anyone.")
 	}
 	if rotate {
-		fmt.Fprintln(os.Stderr, "\nTo install new keys in the key server, see 'upspin rotate -help'.")
+		fmt.Fprintln(s.Stderr, "\nTo install new keys in the key server, see 'upspin rotate -help'.")
 	}
-	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(s.Stderr)
+
+	// Update s factotum for succeeding subcmds.
+	fac, err := factotum.NewFromDir(where)
+	if err != nil {
+		// can't happen?
+		s.Exitf("keygen updated keys on disk, but unable to update factotum: %s", err)
+	}
+	s.State.Config = config.SetFactotum(s.State.Config, fac)
 }
 
 func (s *State) createKeys(curveName, secretFlag string) (public, private, secretStr string, err error) {
@@ -150,7 +159,13 @@ func validSecretSeed(seed string) bool {
 
 // writeKeyFile writes a single key to its file, removing the file
 // beforehand if necessary due to permission errors.
+// If the file's parent directory does not exist, writeKeyFile creates it.
 func (s *State) writeKeyFile(name, key string) error {
+	// Make the directory if it does not exist.
+	if err := os.MkdirAll(filepath.Dir(name), 0700); err != nil {
+		return err
+	}
+	// Create the file.
 	const create = os.O_RDWR | os.O_CREATE | os.O_TRUNC
 	fd, err := os.OpenFile(name, create, 0400)
 	if os.IsPermission(err) && os.Remove(name) == nil {
@@ -161,9 +176,13 @@ func (s *State) writeKeyFile(name, key string) error {
 	if err != nil {
 		return err
 	}
-	defer fd.Close()
+	// Write the key.
 	_, err = fd.WriteString(key)
-	return err
+	if err != nil {
+		fd.Close()
+		return err
+	}
+	return fd.Close()
 
 }
 
@@ -231,6 +250,6 @@ func (s *State) saveKeys(where string, rotate bool, newPublic, newPrivate string
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "Saved previous key pair to:\n\t%s\n", archiveFile)
+	fmt.Fprintf(s.Stderr, "Saved previous key pair to:\n\t%s\n", archiveFile)
 	return nil
 }

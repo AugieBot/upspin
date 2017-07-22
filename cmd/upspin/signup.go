@@ -138,13 +138,20 @@ file and keys and only send the signup request to the key server.
 		s.Exitf("%s already exists", flags.Config)
 	}
 
+	// Verify that SecretDir exists.
+	secretsDir := subcmd.Tilde(*where)
+	fi, err := os.Stat(secretsDir)
+	if err != nil || !fi.IsDir() {
+		s.Exitf("cannot store secrets in %s", secretsDir)
+	}
+
 	// Write the config file.
 	var configContents bytes.Buffer
 	err = configTemplate.Execute(&configContents, configData{
 		UserName:  userName,
 		Dir:       dirEndpoint,
 		Store:     storeEndpoint,
-		SecretDir: subcmd.Tilde(*where),
+		SecretDir: secretsDir,
 		Packing:   "ee",
 	})
 	if err != nil {
@@ -169,8 +176,8 @@ file and keys and only send the signup request to the key server.
 			s.Exit(err)
 		}
 	}
-	fmt.Fprintf(os.Stderr, "Configuration file written to:\n")
-	fmt.Fprintf(os.Stderr, "\t%s\n\n", flags.Config)
+	fmt.Fprintf(s.Stderr, "Configuration file written to:\n")
+	fmt.Fprintf(s.Stderr, "\t%s\n\n", flags.Config)
 
 	// Generate a new key.
 	s.keygenCommand(fs)
@@ -203,8 +210,8 @@ func (s *State) registerUser(configFile string) {
 	if r.StatusCode != http.StatusOK {
 		s.Exitf("key server error: %s", b)
 	}
-	fmt.Fprintf(os.Stderr, "A signup email has been sent to %q,\n", cfg.UserName())
-	fmt.Fprintf(os.Stderr, "please read it for further instructions.\n")
+	fmt.Fprintf(s.Stderr, "A signup email has been sent to %q,\n", cfg.UserName())
+	fmt.Fprintf(s.Stderr, "please read it for further instructions.\n")
 }
 
 // makeSignupURL returns an encoded URL used to sign up a new user with the
@@ -228,7 +235,7 @@ func makeSignupURL(cfg upspin.Config) (string, error) {
 type configData struct {
 	UserName   upspin.UserName
 	Store, Dir *upspin.Endpoint
-	SecretDir  string
+	SecretDir  string // TODO elsewhere we spell as secretsDir
 	Packing    string
 }
 
