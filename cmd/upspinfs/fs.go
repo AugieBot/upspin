@@ -25,6 +25,7 @@ import (
 	"upspin.io/access"
 	"upspin.io/bind"
 	"upspin.io/client"
+	"upspin.io/client/clientutil"
 	"upspin.io/errors"
 	"upspin.io/log"
 	"upspin.io/path"
@@ -341,8 +342,7 @@ func (n *node) openDir(context gContext.Context, req *fuse.OpenRequest, resp *fu
 	if err != nil {
 		return nil, e2e(errors.E(op, err))
 	}
-	pattern := path.Join(n.uname, "*")
-	de, err := dir.Glob(string(pattern))
+	de, err := dir.Glob(upspin.AllFilesGlob(n.uname))
 	if err != nil {
 		return nil, e2e(errors.E(op, err, n.uname))
 	}
@@ -782,7 +782,7 @@ func (n *node) Rename(ctx gContext.Context, req *fuse.RenameRequest, newDir fs.N
 }
 
 // The following Xattr calls exist to short circuit any xattr calls.  Without them,
-// the MacOS kernel will constantly look for ._ files.
+// the macOS kernel will constantly look for ._ files.
 
 // Getxattr implements fs.NodeGetxattrer.Getxattr.
 func (n *node) Getxattr(ctx gContext.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
@@ -883,7 +883,6 @@ func (link *node) upspinPathToHostPath(target upspin.PathName) (string, error) {
 
 // Symlink implements fs.NodeReadlinker.Readlink.
 func (n *node) Readlink(ctx gContext.Context, req *fuse.ReadlinkRequest) (string, error) {
-	const op = "upspinfs/fs.Readlink"
 	log.Debug.Printf("Readlink %q -> %q", n, n.link)
 	return n.upspinPathToHostPath(n.link)
 }
@@ -923,11 +922,6 @@ func (n *node) exists() {
 	f.Unlock()
 }
 
-// delay exists for testing.  We can insert a call to it anywhere we want to fake a delay.
-func delay() {
-	time.Sleep(200 * time.Millisecond)
-}
-
 // debug is used by the FUSE library to output error messages.
 func debug(msg interface{}) {
 	log.Debug.Printf("FUSE %v", msg)
@@ -953,6 +947,9 @@ func do(cfg upspin.Config, mountpoint string, cacheDir string) chan bool {
 		//fuse.NoAppleDouble(),
 		//fuse.NoAppleXattr(),
 	)
+	if err == fuse.ErrOSXFUSENotFound {
+		log.Fatal("FUSE for macOS is not installed. See https://osxfuse.github.io/")
+	}
 	if err != nil {
 		log.Fatalf("fuse.Mount failed: %s", err)
 	}
@@ -1013,7 +1010,7 @@ func (fs *upspinFS) checkAccess(name upspin.PathName, owner upspin.UserName, rig
 		// Everyone else can do nothing.
 		return errors.E(errors.Permission, name)
 	}
-	accessData, err := fs.client.Get(whichAccess.Name)
+	accessData, err := clientutil.ReadAll(fs.config, whichAccess)
 	if err != nil {
 		return err
 	}
