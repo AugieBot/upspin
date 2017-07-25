@@ -95,7 +95,7 @@ Domain configuration and keys for the user
 were generated and placed under the directory:
 	/home/you/upspin/deploy/example.com
 If you lose the keys you can re-create them by running this command
-	upspin keygen -where /home/you/upspin/deploy/example.com -secretseed zapal-zuhiv-visop-gagil.dadij-lnjul-takiv-fomin
+	upspin keygen -secretseed zapal-zuhiv-visop-gagil.dadij-lnjul-takiv-fomin /home/you/upspin/deploy/example.com
 Write this command down and store it in a secure, private place.
 Do not share your private key or this command with anyone.
 
@@ -185,11 +185,11 @@ Now provision a server and deploy the `upspinserver` binary to it.
 
 ### Provision a server
 
-You can run an `upspinserver` on any server, including Linux, MacOS, Windows,
+You can run an `upspinserver` on any server, including Linux, macOS, Windows,
 and [more](https://golang.org/doc/install#requirements), as long as it has a
 publicly-accessible IP address and can run Go programs.
 
-> Note that Upspin has been mostly developed under Linux and MacOS.
+> Note that Upspin has been mostly developed under Linux and macOS.
 > You may encounter issues running it on other platforms.
 
 For a personal Upspin installation, a server with 1 CPU core, 2GB of memory,
@@ -228,9 +228,18 @@ guides:
 
 ## Test connectivity
 
-Using your web browser, navigate to the URL of your `upspinserver`
-(`https://upspin.example.com/`).
-You should see the text:
+At this point, you should have an `upspinserver` running on your server in
+"setup mode", which means that it is ready to be configured by the `upspin
+setupserver` command.
+This state is indicated by a log message printed on startup:
+
+```
+Configuration file not found. Running in setup mode.
+```
+
+Test that the `upspinserver` is accessible from the outside by making an HTTP
+request to it. Using your web browser, navigate to the URL of your
+`upspinserver` (`https://upspin.example.com/`). You should see the text:
 
 ```
 Unconfigured Upspin Server
