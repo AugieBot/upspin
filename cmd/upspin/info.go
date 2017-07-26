@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
-	"os"
 	"text/tabwriter"
 	"text/template"
 	"time"
@@ -35,6 +34,7 @@ of the link.
 	if fs.NArg() == 0 {
 		usageAndExit(fs)
 	}
+
 	for _, name := range fs.Args() {
 		name := s.AtSign(name)
 		entries, err := s.DirServer(name).Glob(string(name))
@@ -160,11 +160,11 @@ func (d *infoDirEntry) WhichAccess() string {
 		accFile = string(accEntry.Name)
 		data, err := read(d.state.Client, accEntry.Name)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "cannot open access file %q: %s\n", accFile, err)
+			fmt.Fprintf(d.state.Stderr, "cannot open access file %q: %s\n", accFile, err)
 		}
 		acc, err = access.Parse(accEntry.Name, data)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "cannot parse access file %q: %s\n", accFile, err)
+			fmt.Fprintf(d.state.Stderr, "cannot parse access file %q: %s\n", accFile, err)
 		}
 	}
 	d.access = acc
@@ -181,7 +181,7 @@ func (s *State) printInfo(entry *upspin.DirEntry) {
 		state:    s,
 		DirEntry: entry,
 	}
-	writer := tabwriter.NewWriter(os.Stdout, 4, 4, 1, ' ', 0)
+	writer := tabwriter.NewWriter(s.Stdout, 4, 4, 1, ' ', 0)
 	err := infoTmpl.Execute(writer, infoDir)
 	if err != nil {
 		s.Exitf("executing info template: %v", err)
@@ -199,7 +199,7 @@ func (s *State) printInfo(entry *upspin.DirEntry) {
 		// Print the whole error indented, starting on the next line. This helps it stand out.
 		s.Exitf("Error: link %s has invalid target %s:\n\t%v", entry.Name, entry.Link, err)
 	}
-	fmt.Printf("Target of link %s:\n", entry.Name)
+	s.Printf("Target of link %s:\n", entry.Name)
 	s.printInfo(target)
 }
 
