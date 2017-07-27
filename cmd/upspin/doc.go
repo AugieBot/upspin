@@ -50,11 +50,8 @@ Upspin commands:
 	countersign
 	cp
 	deletestorage
-	deploy
-	deploy-gcp
 	get
 	getref
-	github
 	info
 	keygen
 	link
@@ -67,13 +64,13 @@ Upspin commands:
 	setupdomain
 	setupserver
 	setupstorage
-	setupstorage-gcp
 	setupwriters
 	share
 	signup
 	snapshot
 	tar
 	user
+	version
 	watch
 	whichaccess
 Global flags:
@@ -176,7 +173,13 @@ Usage: upspin get [-out=outputfile] path
 
 Get writes to standard output the contents identified by the Upspin path.
 
+The -glob flag can be set to false to have get skip Glob processing,
+treating its argument as literal text even if it contains special
+characters. (A leading @ sign is always expanded.)
+
 Flags:
+  -glob
+    	apply glob processing to the arguments (default true)
   -help
     	print more information about the command
   -out string
@@ -186,16 +189,19 @@ Flags:
 
 Sub-command getref
 
-Usage: upspin getref [-out=outputfile] ref
+Usage: upspin getref [-store endpoint] [-out=outputfile] ref
 
 Getref writes to standard output the contents identified by the reference from
-the user's default store server. It does not resolve redirections.
+the specified store endpoint, by default the user's default store server.
+It does not resolve redirections.
 
 Flags:
   -help
     	print more information about the command
   -out string
     	output file (default standard output)
+  -store string
+    	store endpoint (default the user's store)
 
 
 
@@ -219,16 +225,15 @@ Flags:
 
 Sub-command keygen
 
-Usage: upspin keygen [-curve=256] [-secretseed=seed] [-where=$HOME/.ssh]
+Usage: upspin keygen [-curve=256] [-secretseed=seed] <directory>
 
-Keygen creates a new Upspin key pair and stores the pair in local
-files secret.upspinkey and public.upspinkey in $HOME/.ssh. Existing
-key pairs are appended to $HOME/.ssh/secret2.upspinkey. Keygen does
-not update the information in the key server; use the user -put
-command for that.
+Keygen creates a new Upspin key pair and stores the pair in local files
+secret.upspinkey and public.upspinkey in the specified directory.
+Existing key pairs are appended to secret2.upspinkey.
+Keygen does not update the information in the key server;
+use the "user -put" command for that.
 
-New users should instead use the signup command to create their
-first key. Keygen can be used to create new keys.
+New users should instead use the "signup" command to create their first key.
 
 See the description for rotate for information about updating keys.
 
@@ -238,11 +243,9 @@ Flags:
   -help
     	print more information about the command
   -rotate
-    	rotate existing keys and replace them with new ones
+    	back up the existing keys and replace them with new ones
   -secretseed string
-    	the seed containing a 128 bit secret in proquint format or a file that contains it
-  -where directory
-    	directory to store keys (default "/home/user/.ssh")
+    	the seed containing a 128-bit secret in proquint format or a file that contains it
 
 
 
@@ -284,7 +287,13 @@ Usage: upspin mkdir directory...
 
 Mkdir creates Upspin directories.
 
+The -glob flag can be set to false to have mkdir skip Glob processing,
+treating its arguments as literal text even if they contain special
+characters. (Leading @ signs are always expanded.)
+
 Flags:
+  -glob
+    	apply glob processing to the arguments (default true)
   -help
     	print more information about the command
 
@@ -297,13 +306,19 @@ Usage: upspin put [-in=inputfile] path
 Put writes its input to the store server and installs a directory
 entry with the given path name to refer to the data.
 
-TODO: Delete in favor of cp?
+The -glob flag can be set to false to have put skip Glob processing,
+treating its arguments as literal text even if they contain special
+characters. (Leading @ signs are always expanded.)
 
 Flags:
+  -glob
+    	apply glob processing to the arguments (default true)
   -help
     	print more information about the command
   -in string
     	input file (default standard input)
+  -packing string
+    	packing to use (default from user's config)
 
 
 
@@ -337,6 +352,10 @@ Usage: upspin rm path...
 
 Rm removes Upspin files and directories from the name space.
 
+The -glob flag can be set to false to have rm skip Glob processing,
+treating its arguments as literal text even if they contain special
+characters. (Leading @ signs are always expanded.)
+
 Rm does not delete the associated storage, which is rarely necessary
 or wise: storage can be shared between items and unused storage is
 better recovered by automatic means.
@@ -349,6 +368,8 @@ storage.
 Flags:
   -R	recur into subdirectories
   -f	continue if errors occur
+  -glob
+    	apply glob processing to the arguments (default true)
   -help
     	print more information about the command
 
@@ -362,9 +383,9 @@ Rotate pushes an updated key to the key server.
 
 To update an Upspin key, the sequence is:
 
-  upspin keygen -rotate    # Create new key.
-  upspin countersign       # Update file signatures to use new key.
-  upspin rotate            # Save new key to key server.
+  upspin keygen -rotate <secrets-dir>   # Create new key.
+  upspin countersign                    # Update file signatures to use new key.
+  upspin rotate                         # Save new key to key server.
   upspin share -r -fix me@example.com/  # Update keys in file metadata.
 
 Keygen creates a new key and saves the old one. Countersign walks
@@ -522,6 +543,10 @@ the -unencryptforall flag in combination with -fix will rewrite the file
 using the EEIntegrity packing, decrypting it and making its contents
 visible to anyone.
 
+The -glob flag can be set to false to have share skip Glob processing,
+treating its arguments as literal text even if they contain special
+characters. (Leading @ signs are always expanded.)
+
 See the description for rotate for information about updating keys.
 
 Flags:
@@ -530,12 +555,36 @@ Flags:
     	repair incorrect share settings
   -force
     	replace wrapped keys regardless of current state
+  -glob
+    	apply glob processing to the arguments (default true)
   -help
     	print more information about the command
   -q	suppress output. Default is to show state for every file
   -r	recur into subdirectories; path must be a directory. assumes -d
   -unencryptforall
     	for currently encrypted read:all files only, rewrite using EEIntegrity; requires -fix or -force
+
+
+
+Sub-command shell
+
+Usage: upspin shell [-v] [-prompt=<prompt_string>]
+
+Shell runs an interactive session for Upspin subcommands.
+When running the shell, the leading "upspin" is assumed on each command.
+
+The shell has a simple interface, free of quoting or other features usually
+associated with interactive shells. It is intended only for testing and is kept
+simple for reasons of comprehensibility, portability, and maintainability.
+Those who need quoting or line editing or other such features should use their
+regular shell and run upspinfs or invoke the upspin command line-by-line.
+
+Flags:
+  -help
+    	print more information about the command
+  -prompt prompt
+    	interactive prompt (default "<username>")
+  -v	verbose; print to stderr each command before execution
 
 
 
@@ -582,8 +631,8 @@ Flags:
     	create a new user even if keys and config file exist
   -help
     	print more information about the command
-  -rotate
-    	always false during sign up
+  -secrets directory
+    	directory to store key pair
   -secretseed string
     	the seed containing a 128 bit secret in proquint format or a file that contains it
   -server address
@@ -592,8 +641,6 @@ Flags:
     	only send signup request to key server; do not generate config or keys
   -store address
     	Store server address
-  -where directory
-    	directory to store keys (default "/home/user/.ssh")
 
 
 
@@ -673,6 +720,18 @@ Flags:
 
 
 
+Sub-command version
+
+Usage: upspin version
+
+Version prints a summary of the git version used to build the command.
+
+Flags:
+  -help
+    	print more information about the command
+
+
+
 Sub-command watch
 
 Usage: upspin watch [-order=n] path
@@ -681,7 +740,13 @@ Watch watches the given Upspin path beginning with the specified order and
 prints the events to standard output. An order of -1, the default, will send
 the current state of the tree rooted at the given path.
 
+The -glob flag can be set to false to have watch skip Glob processing,
+treating its arguments as literal text even if they contain special
+characters. (Leading @ signs are always expanded.)
+
 Flags:
+  -glob
+    	apply glob processing to the arguments (default true)
   -help
     	print more information about the command
   -order int
@@ -696,7 +761,13 @@ Usage: upspin whichaccess path...
 Whichaccess reports the Upspin path of the Access file
 that controls permissions for each of the argument paths.
 
+The -glob flag can be set to false to have watchaccess skip Glob
+processing, treating its arguments as literal text even if they
+contain special characters. (Leading @ signs are always expanded.)
+
 Flags:
+  -glob
+    	apply glob processing to the arguments (default true)
   -help
     	print more information about the command
 
