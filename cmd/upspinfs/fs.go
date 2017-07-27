@@ -25,6 +25,7 @@ import (
 	"upspin.io/access"
 	"upspin.io/bind"
 	"upspin.io/client"
+	"upspin.io/client/clientutil"
 	"upspin.io/errors"
 	"upspin.io/log"
 	"upspin.io/path"
@@ -341,8 +342,7 @@ func (n *node) openDir(context gContext.Context, req *fuse.OpenRequest, resp *fu
 	if err != nil {
 		return nil, e2e(errors.E(op, err))
 	}
-	pattern := path.Join(n.uname, "*")
-	de, err := dir.Glob(string(pattern))
+	de, err := dir.Glob(upspin.AllFilesGlob(n.uname))
 	if err != nil {
 		return nil, e2e(errors.E(op, err, n.uname))
 	}
@@ -782,7 +782,7 @@ func (n *node) Rename(ctx gContext.Context, req *fuse.RenameRequest, newDir fs.N
 }
 
 // The following Xattr calls exist to short circuit any xattr calls.  Without them,
-// the MacOS kernel will constantly look for ._ files.
+// the macOS kernel will constantly look for ._ files.
 
 // Getxattr implements fs.NodeGetxattrer.Getxattr.
 func (n *node) Getxattr(ctx gContext.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) error {
@@ -804,31 +804,12 @@ func (n *node) Removexattr(ctx gContext.Context, req *fuse.RemovexattrRequest) e
 	return nil
 }
 
-// convertRelPath converts a host relative path into an Upspin one. It assumes
-// that the only difference is the separators. This will work with
-// windows and *nix. Not sure about other systems.
-func convertRelPath(path string) string {
+// convertPath converts a host path separators into upspin ones.
+func convertPath(path string) upspin.PathName {
 	if filepath.Separator == '/' {
-		return path
+		return upspin.PathName(path)
 	}
-	return strings.Replace(path, string(filepath.Separator), "/", -1)
-}
-
-// hostPathToUpspinPath takes a hostpath and returns an Upspin path.
-func (dir *node) hostPathToUpspinPath(hostpath string) (upspin.PathName, error) {
-	mountrel := strings.TrimPrefix(hostpath, dir.f.mountpoint)
-	if hostpath != mountrel {
-		// We have a path that is relative to the mount point.
-		// Convert the separator if necessary and return it as an
-		// Upspin path.
-		return upspin.PathName(convertRelPath(mountrel)), nil
-	}
-	// Not relative to the mountpoint. If it is rooted, it is outside Upspin.
-	if filepath.IsAbs(hostpath) {
-		return upspin.PathName(hostpath), errors.Str("symlink outside of upspin")
-	}
-	// This is relative to dir. Convert the separators and append to dir.
-	return path.Join(dir.uname, convertRelPath(hostpath)), nil
+	return upspin.PathName(strings.Replace(path, string(filepath.Separator), "/", -1))
 }
 
 // Symlink implements fs.Symlink.
@@ -836,14 +817,23 @@ func (n *node) Symlink(ctx gContext.Context, req *fuse.SymlinkRequest) (fs.Node,
 	const op = "upspinfs/fs.Symlink"
 	n.Lock()
 	defer n.Unlock()
-	target, err := n.hostPathToUpspinPath(req.Target)
-	if err != nil {
-		return nil, e2e(errors.E(op, n.uname, err))
+	target := req.Target
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(n.f.mountpoint, string(n.uname), target)
 	}
-	log.Debug.Printf("Symlink target %q", target)
-	nn := n.f.allocNode(n, req.NewName, os.ModeSymlink|unixPermissions, uint64(len(target)), time.Now())
-	nn.link = target
-	if err := n.f.cache.putRedirect(nn, target); err != nil {
+	target = filepath.Clean(target)
+	// Strip off mount point.
+	mountRel := strings.TrimPrefix(target, n.f.mountpoint)
+	upspinPath := convertPath(mountRel)
+	if target == mountRel {
+		// Don't let request walk above of the mount point.
+		return nil, errors.Str("symlink outside of upspin")
+
+	}
+	log.Debug.Printf("Symlink target %q", upspinPath)
+	nn := n.f.allocNode(n, req.NewName, os.ModeSymlink|unixPermissions, uint64(len(upspinPath)), time.Now())
+	nn.link = upspinPath
+	if err := n.f.cache.putRedirect(nn, upspinPath); err != nil {
 		return nil, e2e(errors.E(op, n.uname, err))
 	}
 	nn.exists()
@@ -883,7 +873,6 @@ func (link *node) upspinPathToHostPath(target upspin.PathName) (string, error) {
 
 // Symlink implements fs.NodeReadlinker.Readlink.
 func (n *node) Readlink(ctx gContext.Context, req *fuse.ReadlinkRequest) (string, error) {
-	const op = "upspinfs/fs.Readlink"
 	log.Debug.Printf("Readlink %q -> %q", n, n.link)
 	return n.upspinPathToHostPath(n.link)
 }
@@ -921,11 +910,6 @@ func (n *node) exists() {
 	delete(f.enoentMap, n.uname)
 	f.nodeMap[n.uname] = n
 	f.Unlock()
-}
-
-// delay exists for testing.  We can insert a call to it anywhere we want to fake a delay.
-func delay() {
-	time.Sleep(200 * time.Millisecond)
 }
 
 // debug is used by the FUSE library to output error messages.
@@ -1013,7 +997,7 @@ func (fs *upspinFS) checkAccess(name upspin.PathName, owner upspin.UserName, rig
 		// Everyone else can do nothing.
 		return errors.E(errors.Permission, name)
 	}
-	accessData, err := fs.client.Get(whichAccess.Name)
+	accessData, err := clientutil.ReadAll(fs.config, whichAccess)
 	if err != nil {
 		return err
 	}
