@@ -13,10 +13,16 @@ and other storage services to the name space.
 
 Performance is not a primary goal. Uniformity and security are.
 
+## Download
+
+- [Binary releases](/dl/) for Linux, macOS, and Windows
+
+
 ## Documentation
 
 - The [Upspin Overview](/doc/overview.md) document provides a high-level
   introduction to Upspin.
+- The [FAQ](/doc/faq.md) answers common questions about Upspin.
 - The [Signing up a new user](/doc/signup.md) document describes the process for
   generating keys and registering a user with the Upspin key server.
 - The [Upspin Security](/doc/security.md) document describes Upspin's security
