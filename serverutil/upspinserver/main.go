@@ -30,6 +30,7 @@ import (
 	"upspin.io/rpc/dirserver"
 	"upspin.io/rpc/storeserver"
 	"upspin.io/serverutil/perm"
+	"upspin.io/serverutil/web"
 	storeServer "upspin.io/store/server"
 	"upspin.io/subcmd"
 	"upspin.io/upspin"
@@ -44,10 +45,18 @@ import (
 )
 
 var (
-	cfgPath   = flag.String("serverconfig", filepath.Join(config.Home(), "upspin", "server"), "server configuration `directory`")
+	cfgPath   = flag.String("serverconfig", defaultCfgPath(), "server configuration `directory`")
 	enableWeb = flag.Bool("web", false, "enable Upspin web interface")
 	readyCh   = make(chan struct{})
 )
+
+func defaultCfgPath() string {
+	home, err := config.Homedir()
+	if err != nil {
+		home = "/"
+	}
+	return filepath.Join(home, "upspin", "server")
+}
 
 func Main() (ready chan struct{}) {
 	flags.Parse(flags.Server)
@@ -58,8 +67,8 @@ func Main() (ready chan struct{}) {
 		http.Handle("/", &setupHandler{})
 	} else if err != nil {
 		log.Fatal(err)
-	} else {
-		http.Handle("/", newWeb(cfg, perm))
+	} else if *enableWeb {
+		http.Handle("/", web.New(cfg, perm))
 	}
 
 	return readyCh
@@ -234,7 +243,9 @@ func (h *setupHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "OK")
 
 	h.done = true
-	h.web = newWeb(cfg, perm)
+	if *enableWeb {
+		h.web = web.New(cfg, perm)
+	}
 }
 
 func setupWriters(cfg upspin.Config) error {
@@ -273,6 +284,9 @@ func readServerConfig() (*subcmd.ServerConfig, error) {
 	cfgFile := filepath.Join(*cfgPath, subcmd.ServerConfigFile)
 	b, err := ioutil.ReadFile(cfgFile)
 	if err != nil {
+		// We can't return the usual errors.E because the caller wants
+		// to match on the raw error.  But give the admin a clue.
+		log.Printf("unable to read configuration: %s", err)
 		return nil, err
 	}
 	cfg := &subcmd.ServerConfig{}
