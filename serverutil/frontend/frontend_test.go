@@ -13,31 +13,29 @@ import (
 	"strings"
 	"sync"
 	"testing"
-
-	"upspin.io/test/testutil"
 )
 
 var (
 	testResponse = "ok"
 	testDocPath  = "testdata/doc"
 
-	testServer http.Handler
-	addr       string
-	once       sync.Once
+	addr string
+	once sync.Once
 )
 
 func startServer() {
-	if err := parseTemplates(testutil.Repo("doc/templates")); err != nil {
+	s, err := newServer(nil, testDocPath)
+	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	*docPath = testDocPath
-	s := newServer().(*server)
-	s.mux.Handle("/_test", canonicalHostHandler{http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.Handle("/", s)
+	mux.Handle("/_test", canonicalHostHandler{http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, testResponse)
 	})})
-	s.mux.HandleFunc("/_redirect", redirectHTTP)
-	testServer := httptest.NewServer(s)
+	mux.HandleFunc("/_redirect", redirectHTTP)
+	testServer := httptest.NewServer(mux)
 	addr = testServer.Listener.Addr().String()
 }
 
@@ -135,10 +133,14 @@ func TestGoImport(t *testing.T) {
 	}
 }
 
-func TestDocList(t *testing.T) {
+func TestDocRoot(t *testing.T) {
 	once.Do(startServer)
 	b := get(t, "http://"+addr+"/doc/")
-	expected := `<a href="/doc/test.md">Test</a>`
+	expected := `<h1>Documentation</h1>`
+	if !strings.Contains(string(b), expected) {
+		t.Errorf("expected response body to contain %q; body: %q", expected, b)
+	}
+	expected = `<title>Documentation · Upspin</title>`
 	if !strings.Contains(string(b), expected) {
 		t.Errorf("expected response body to contain %q; body: %q", expected, b)
 	}
