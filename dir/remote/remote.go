@@ -19,9 +19,6 @@ import (
 	"upspin.io/upspin/proto"
 )
 
-// requireAuthentication specifies whether the connection demands TLS.
-const requireAuthentication = true
-
 // dialConfig contains the destination and authenticated user of the dial.
 type dialConfig struct {
 	endpoint upspin.Endpoint
@@ -180,8 +177,12 @@ func (r *remote) Endpoint() upspin.Endpoint {
 
 func dialCache(op *operation, config upspin.Config, proxyFor upspin.Endpoint) upspin.Service {
 	// Are we using a cache?
-	ce := config.CacheEndpoint()
-	if ce.Transport == upspin.Unassigned {
+	ce, err := rpc.CacheEndpoint(config)
+	if err != nil {
+		op.error(errors.Invalid, err)
+		return nil
+	}
+	if ce == nil {
 		return nil
 	}
 
@@ -269,10 +270,6 @@ func (op *operation) String() string {
 
 func (op *operation) logErr(err error) {
 	log.Error.Printf("%s: %s", op, err)
-}
-
-func (op *operation) logf(format string, args ...interface{}) {
-	log.Printf("%s: "+format, append([]interface{}{op.op}, args...)...)
 }
 
 func (op *operation) error(args ...interface{}) error {

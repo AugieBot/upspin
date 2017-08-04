@@ -45,8 +45,7 @@ type cachedFile struct {
 	inStore bool   // True if this is a cached version of something in the store.
 	dirty   bool   // True if it needs to be written back on close.
 
-	file *os.File           // The cached file.
-	de   []*upspin.DirEntry // If this is a directory, its contents.
+	file *os.File // The cached file.
 }
 
 func newCache(config upspin.Config, dir string) *cache {
@@ -348,7 +347,7 @@ func (cf *cachedFile) writeback(h *handle) error {
 				// increase the ref count for the cached version
 				// so that the xattr at least lasts as long as
 				// upspinfs stays up. Not perfect but keeps
-				// MacOS finder happy.
+				// macOS finder happy.
 				// TODO(p): this might be improved by constraining
 				// to fewer error types.
 				cf.file.Pin()
