@@ -55,13 +55,22 @@ type Tree struct {
 	user     upspin.UserName
 	config   upspin.Config
 	packer   upspin.Packer
-	log      *Log
+	log      *Writer
 	logIndex *LogIndex
 	root     *node
 	// dirtyNodes is the set of dirty nodes, grouped by path length.
 	// The index of the slice is the path length of the nodes therein.
 	// The value of the map is ignored.
 	dirtyNodes []map[*node]bool
+
+	// shutdown is closed when the tree is closed. Any goroutine that needs
+	// to exit can select on it. Specially useful for watchers.
+	shutdown chan struct{}
+
+	// watchers tracks the number of running watchers.
+	// Its Add method should be called with mu held,
+	// and only if the shutdown channel is not closed.
+	watchers sync.WaitGroup
 }
 
 // String implements fmt.Stringer.
@@ -80,7 +89,7 @@ func (n *node) String() string {
 // the Log, the Tree's state is recovered from it.
 // TODO: Maybe new is doing too much work. Figure out how to break in two without
 // returning an inconsistent new tree if log is unprocessed.
-func New(config upspin.Config, log *Log, logIndex *LogIndex) (*Tree, error) {
+func New(config upspin.Config, log *Writer, logIndex *LogIndex) (*Tree, error) {
 	const op = "dir/server/tree.New"
 	if config == nil {
 		return nil, errors.E(op, errors.Invalid, errors.Str("config is nil"))
@@ -122,6 +131,7 @@ func New(config upspin.Config, log *Log, logIndex *LogIndex) (*Tree, error) {
 		packer:   packer,
 		log:      log,
 		logIndex: logIndex,
+		shutdown: make(chan struct{}),
 	}
 	// Do we have entries in the log to process, to recover from a crash?
 	err := t.recoverFromLog()
@@ -233,6 +243,17 @@ func (t *Tree) PutDir(dstDir path.Parsed, de *upspin.DirEntry) (*upspin.DirEntry
 		return nil, errors.E(op, errors.Invalid, errors.Str("can't PutDir at the root"))
 	}
 
+	// The destination must not exist nor cross a link.
+	if node, _, err := t.loadPath(dstDir); errors.Match(errors.E(errors.NotExist), err) {
+		// Destination does not exist; OK.
+	} else if err == upspin.ErrFollowLink {
+		return nil, errors.E(op, dstDir.Path(), errors.Errorf("destination path crosses link: %s", node.entry.Name))
+	} else if err != nil {
+		return nil, errors.E(op, err)
+	} else {
+		return nil, errors.E(op, dstDir.Path(), errors.Exist)
+	}
+
 	// Create a synthetic node and load its kids.
 	existingEntryNode := &node{
 		entry: *de,
@@ -251,13 +272,23 @@ func (t *Tree) PutDir(dstDir path.Parsed, de *upspin.DirEntry) (*upspin.DirEntry
 	if err != nil {
 		return nil, errors.E(op, err)
 	}
+	de = n.entry.Copy()
+	// Generate log entry.
+	logEntry := &LogEntry{
+		Op:    Put,
+		Entry: *de,
+	}
+	err = t.log.Append(logEntry)
+	if err != nil {
+		return nil, errors.E(op, err)
+	}
 	notifyWatchers(watchers)
 	// Flush now to create a new version of the root.
 	err = t.flush() // TODO: avoid this. Create a log operation PutDir.
 	if err != nil {
 		return nil, errors.E(op, err)
 	}
-	return n.entry.Copy(), nil
+	return de, nil
 }
 
 // addKid adds a node n with path nodePath as the kid of parent, whose path is parentPath.
@@ -420,11 +451,7 @@ func (t *Tree) loadKids(parent *node) error {
 	if err != nil {
 		return err
 	}
-	err = loadKidsFromBlock(parent, data)
-	if err != nil {
-		return err
-	}
-	return nil
+	return loadKidsFromBlock(parent, data)
 }
 
 // loadRoot loads the root into memory if it is not already loaded.
@@ -507,6 +534,9 @@ func (t *Tree) List(prefix path.Parsed) ([]*upspin.DirEntry, bool, error) {
 	}
 	if err != nil {
 		return nil, false, errors.E(op, err)
+	}
+	if node.entry.IsLink() {
+		return []*upspin.DirEntry{node.entry.Copy()}, node.dirty, upspin.ErrFollowLink
 	}
 	if !node.entry.IsDir() {
 		return []*upspin.DirEntry{node.entry.Copy()}, node.dirty, nil
@@ -711,6 +741,14 @@ func (t *Tree) flush() error {
 // results.
 func (t *Tree) Close() error {
 	const op = "dir/server/tree.Close"
+
+	// Notify watchers and any other goroutine that the tree is closing
+	// immediately.
+	t.mu.Lock()
+	close(t.shutdown)
+	t.mu.Unlock()
+	t.watchers.Wait()
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -721,8 +759,10 @@ func (t *Tree) Close() error {
 		}
 	}
 
-	check(t.flush())
-	check(t.log.Close())
+	if t.log != nil { // A nil log doesn't need to be flushed nor closed.
+		check(t.flush())
+		check(t.log.Close())
+	}
 	check(t.logIndex.Close())
 
 	if firstErr != nil {
@@ -752,11 +792,15 @@ func (t *Tree) recoverFromLog() error {
 	}
 
 	// Tree is not current. Replay all entries from the log.
+	lrd, err := t.log.NewReader()
+	if err != nil {
+		return errors.E(op, err)
+	}
 	recovered := 0
 	curr := lastProcessed
 	for {
 		log.Debug.Printf("%s: Recovering from log... %d", op, curr)
-		logEntry, next, err := t.log.ReadAt(curr)
+		logEntry, next, err := lrd.ReadAt(curr)
 		if err != nil {
 			log.Error.Printf("%s: Error in log recovery, possible data loss at offset %d: %s", op, lastProcessed, err)
 			err = t.log.Truncate(curr)
