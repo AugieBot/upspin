@@ -28,7 +28,7 @@ type dialConfig struct {
 
 // remote implements upspin.StoreServer.
 type remote struct {
-	rpc.Client // For sessions, Ping, and Close.
+	rpc.Client // For sessions and Close.
 	cfg        dialConfig
 
 	// If non-empty, the base HTTP URL under which references for this
@@ -113,8 +113,12 @@ func (r *remote) Endpoint() upspin.Endpoint {
 
 func dialCache(op *operation, config upspin.Config, proxyFor upspin.Endpoint) upspin.Service {
 	// Are we using a cache?
-	ce := config.CacheEndpoint()
-	if ce.Transport == upspin.Unassigned {
+	ce, err := rpc.CacheEndpoint(config)
+	if err != nil {
+		op.error(errors.Invalid, err)
+		return nil
+	}
+	if ce == nil {
 		return nil
 	}
 
