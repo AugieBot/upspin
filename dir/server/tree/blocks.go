@@ -41,20 +41,28 @@ func (t *Tree) store(n *node) error {
 	// Start packing.
 	bp, err := packer.Pack(t.config, &n.entry)
 	if err != nil {
-		return errors.E(err)
+		return err
 	}
 
 	// Pack and store child nodes, keeping blocks at ~BlockSize.
 	var data []byte
 	for _, kid := range n.kids {
-		// TODO: also check whether there are any Blocks with empty locations that are non-empty dirs or files.
 		if kid.dirty {
 			// We should write nodes from the bottom up, so this should never happen.
 			return errors.E(kid.entry.Name, errors.Internal, errors.Str("kid node is dirty"))
 		}
+		// Check whether there are any empty Blocks or locations that
+		// are non-empty dirs or files.
+		if len(kid.kids) != 0 {
+			for _, b := range kid.entry.Blocks {
+				if len(b.Location.Reference) == 0 || b.Size == 0 {
+					return errors.E(kid.entry.Name, errors.Internal, errors.Str("empty directory block when there exist kid blocks"))
+				}
+			}
+		}
 		block, err := kid.entry.Marshal()
 		if err != nil {
-			return errors.E(err)
+			return err
 		}
 
 		// Don't let blocks grow too much (but we never split a large DirEntry in the middle).
@@ -62,7 +70,7 @@ func (t *Tree) store(n *node) error {
 			// Flush now.
 			err = storeBlock(storeServer, bp, data)
 			if err != nil {
-				return errors.E(err)
+				return err
 			}
 			data = data[:0]
 		}
@@ -72,12 +80,12 @@ func (t *Tree) store(n *node) error {
 	if len(data) > 0 {
 		err = storeBlock(storeServer, bp, data)
 		if err != nil {
-			return errors.E(err)
+			return err
 		}
 	}
 	err = bp.Close()
 	if err != nil {
-		return errors.E(err)
+		return err
 	}
 	return nil
 }
@@ -131,14 +139,14 @@ func loadKidsFromBlock(n *node, block []byte) error {
 		var entry upspin.DirEntry
 		remaining, err := entry.Unmarshal(block)
 		if err != nil {
-			return errors.E(err)
+			return err
 		}
 		block = remaining
 
 		// Process this entry.
 		p, err := path.Parse(entry.Name)
 		if err != nil {
-			return errors.E(err)
+			return err
 		}
 		// elem is the next pathwise element to load. Normally, it's the
 		// next element in entryPath. But if it's a directory that
