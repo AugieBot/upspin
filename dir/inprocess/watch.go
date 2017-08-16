@@ -38,7 +38,9 @@ func (l *listener) want(event upspin.Event, parsed path.Parsed) (upspin.Event, b
 	if canAny, _ := l.server.can(access.AnyRight, parsed); !canAny {
 		return upspin.Event{}, false
 	}
-	if canRead, _ := l.server.can(access.Read, parsed); !canRead || event.Entry.IsDir() {
+	canRead, _ := l.server.can(access.Read, parsed)
+
+	if event.Entry.IsDir() || (!canRead && !access.IsAccessControlFile(event.Entry.SignedName)) {
 		// Must make a copy of the entry before cleaning it.
 		entry := *event.Entry
 		entry.MarkIncomplete()
