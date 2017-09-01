@@ -6,7 +6,6 @@ package upspin // import "upspin.io/upspin"
 
 import (
 	"crypto/elliptic"
-	"crypto/x509"
 	"errors"
 	"math/big"
 	"time"
@@ -210,6 +209,9 @@ type Packer interface {
 	// In case of error, Share skips processing for that reader or packdata.
 	// If packdata[i] is nil on return, it was skipped.
 	// Share trusts the caller to check the arguments are not malicious.
+	// To enable all Upspin users to decrypt the ciphertext, include
+	// AllReadersKey among the provided reader keys.
+	//
 	// TODO: It would be nice if DirServer provided a method to report
 	// which items need updates, so this could be automated.
 	Share(config Config, readers []PublicKey, packdata []*[]byte)
@@ -226,6 +228,11 @@ type Packer interface {
 	// that one over the second existing signature, and creates a new
 	// first signature using the key from factotum.
 	Countersign(oldKey PublicKey, f Factotum, d *DirEntry) error
+
+	// UnpackableByAll reports whether the packed data may be unpacked by
+	// all Upspin users. Access and Group files must have this property, as
+	// should any files for which access.AllUsers have the read permission.
+	UnpackableByAll(d *DirEntry) (bool, error)
 }
 
 const (
@@ -300,6 +307,10 @@ type KeyServer interface {
 
 // A PublicKey can be seen by anyone and is used for authenticating a user.
 type PublicKey string
+
+// AllUsersKey is a sentinel PublicKey value used to indicate that a
+// Packer.Share operation should make the data readable to anyone.
+var AllUsersKey = PublicKey("read: all")
 
 var (
 	// ErrFollowLink indicates that all or part of a path name has
@@ -524,6 +535,10 @@ type DirEntry struct {
 // sync manually because the flags package cannot import this package.
 const BlockSize = 1024 * 1024
 
+// MaxBlockSize is the maximum size permitted for a block. The limit
+// guarantees that 32-bit machines can process the data without problems.
+const MaxBlockSize = 1024 * 1024 * 1024
+
 // DirBlock describes a block of data representing a contiguous section of a file.
 // The block my be of any non-negative size, but in large files is usually
 // BlockSize long.
@@ -736,16 +751,8 @@ type Config interface {
 	// StoreEndpoint is the endpoint of the StoreServer in which to place new data items.
 	StoreEndpoint() Endpoint
 
-	// CacheEndpoint is the endpoint of the store and directory cache server.
-	CacheEndpoint() Endpoint
-
-	// CertPool returns the x509 certificate pool used to validate client TLS
-	// connections. If the returned pointer is nil then the default system root
-	// certificates should be used.
-	CertPool() *x509.CertPool
-
-	// Flags returns the configured command flags for the named command.
-	Flags(cmd string) map[string]string
+	// Value returns the value for the given configuration key.
+	Value(key string) string
 }
 
 // Dialer defines how to connect and authenticate to a server. Each
@@ -763,9 +770,6 @@ type Dialer interface {
 type Service interface {
 	// Endpoint returns the network endpoint of the server.
 	Endpoint() Endpoint
-
-	// Ping reports whether the Service is reachable.
-	Ping() bool
 
 	// Close closes the connection to the service and releases all resources used.
 	// A Service may not be re-used after close.
