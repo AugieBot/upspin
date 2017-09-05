@@ -226,8 +226,6 @@ func (e *Env) Exit() error {
 		check(e.Setup.Cleanup(e))
 	}
 
-	check(e.rmTmpDir())
-
 	if e.DirServer != nil {
 		e.DirServer.Close()
 	}
@@ -237,6 +235,8 @@ func (e *Env) Exit() error {
 	if e.KeyServer != nil {
 		e.KeyServer.Close()
 	}
+
+	check(e.rmTmpDir())
 
 	return firstErr
 }
@@ -301,10 +301,7 @@ func registerUserWithKeyServer(cfg upspin.Config, userName upspin.UserName) erro
 		Stores:    []upspin.Endpoint{cfg.StoreEndpoint()},
 		PublicKey: cfg.Factotum().PublicKey(),
 	}
-	if err := key.Put(user); err != nil {
-		return err
-	}
-	return nil
+	return key.Put(user)
 }
 
 func makeRootIfNotExist(cfg upspin.Config) error {
