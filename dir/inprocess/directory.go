@@ -12,7 +12,6 @@ package inprocess // import "upspin.io/dir/inprocess"
 // For the purposes of the Merkle tree, the reference is stored in entry.Blocks[0].Location.
 
 import (
-	"strings"
 	"sync"
 
 	"upspin.io/access"
@@ -45,10 +44,7 @@ func New(config upspin.Config) upspin.DirServer {
 
 // Used to store directory entries.
 // All directories are encoded with this packing.
-var (
-	dirPacking = upspin.EEPack
-	dirPacker  = pack.Lookup(dirPacking)
-)
+var dirPacking = upspin.EEPack
 
 // server implements the upspin.DirServer interface. It is a multiplexed
 // by user onto a database.
@@ -143,18 +139,6 @@ func (s *server) newDirEntry(name upspin.PathName, cleartext []byte, seq int64) 
 	return newDirEntry(s.db.dirConfig, dirPacking, name, cleartext, upspin.AttrDirectory, "", seq)
 }
 
-// dirBlock constructs an upspin.DirBlock with the appropriate fields.
-func dirBlock(config upspin.Config, ref upspin.Reference, offset int64, blob []byte) upspin.DirBlock {
-	return upspin.DirBlock{
-		Location: upspin.Location{
-			Endpoint:  config.StoreEndpoint(),
-			Reference: ref,
-		},
-		Offset: offset,
-		Size:   int64(len(blob)),
-	}
-}
-
 // makeRoot creates a new user root.
 // s.db is locked.
 func (s *server) makeRoot(parsed path.Parsed) (*upspin.DirEntry, error) {
@@ -176,7 +160,10 @@ func (s *server) makeRoot(parsed path.Parsed) (*upspin.DirEntry, error) {
 }
 
 // Put implements upspin.DirServer.Put.
-func (s *server) Put(entry *upspin.DirEntry) (*upspin.DirEntry, error) {
+func (s *server) Put(argEntry *upspin.DirEntry) (*upspin.DirEntry, error) {
+	// Copy the argument because we don't want to overwrite fields such as Sequence in caller.
+	entry := new(upspin.DirEntry)
+	*entry = *argEntry
 	const op = "dir/inprocess.Put"
 	if err := valid.DirEntry(entry); err != nil {
 		return nil, errors.E(op, err)
@@ -199,8 +186,18 @@ func (s *server) Put(entry *upspin.DirEntry) (*upspin.DirEntry, error) {
 			// A Group file may be in a subdirectory; it's only Access files we worry about.
 			return nil, errors.E(op, entry.Name, errors.Invalid, errors.Str("cannot create a directory named Access"))
 		}
-		if entry.Packing != upspin.EEIntegrityPack && !entry.IsDir() {
-			return nil, errors.E(op, entry.Name, errors.Str("Access or Group file must use integrity packing"))
+		if !entry.IsDir() {
+			packer := pack.Lookup(entry.Packing)
+			if packer == nil {
+				return nil, errors.E(op, entry.Name, errors.Errorf("unknown packing %d", entry.Packing))
+			}
+			ok, err := packer.UnpackableByAll(entry)
+			if err != nil {
+				return nil, errors.E(op, entry.Name, err)
+			}
+			if !ok {
+				return nil, errors.E(op, entry.Name, errors.Str("Access or Group files must be readable by access.AllUsers"))
+			}
 		}
 		if entry.IsLink() {
 			return nil, errors.E(op, entry.Name, errors.Str("cannot create a link named Access or Group"))
@@ -237,8 +234,12 @@ func (s *server) Put(entry *upspin.DirEntry) (*upspin.DirEntry, error) {
 	s.db.eventMgr.newEvent <- upspin.Event{
 		Entry: entry,
 	}
-	// Successful Put returns no entry.
-	return nil, nil
+	// Successful Put returns incomplete DirEntry holding only the sequence number.
+	retEntry := &upspin.DirEntry{
+		Attr:     upspin.AttrIncomplete,
+		Sequence: entry.Sequence,
+	}
+	return retEntry, nil
 }
 
 // canPut verifies that the name is permitted to be written.
@@ -392,7 +393,7 @@ func (s *server) WhichAccess(pathName upspin.PathName) (*upspin.DirEntry, error)
 	}
 	if errors.Match(err, notExist) {
 		// The parent must exist.
-		entry, err = s.lookup(op, parsed.Drop(1), true)
+		_, err = s.lookup(op, parsed.Drop(1), true)
 		if err != nil {
 			// Always say Private to avoid giving information away.
 			// We know it's not a link.
@@ -550,7 +551,9 @@ func (s *server) Lookup(pathName upspin.PathName) (*upspin.DirEntry, error) {
 		if !canAny {
 			return nil, s.errPerm(op, parsed)
 		}
-		entry.MarkIncomplete()
+		if !access.IsAccessControlFile(entry.SignedName) {
+			entry.MarkIncomplete()
+		}
 	}
 	return entry, nil
 }
@@ -605,10 +608,6 @@ func (s *server) Glob(pattern string) ([]*upspin.DirEntry, error) {
 	return entries, err
 }
 
-func isGlobPattern(elem string) bool {
-	return strings.ContainsAny(elem, `*?[]`)
-}
-
 // listDir implements serverutil.ListFunc.
 // dirName should always be a directory.
 func (s *server) listDir(dirName upspin.PathName) ([]*upspin.DirEntry, error) {
@@ -656,7 +655,9 @@ func (s *server) listDir(dirName upspin.PathName) ([]*upspin.DirEntry, error) {
 			return nil, errors.E(op, dir.Name, err)
 		}
 		if !canRead {
-			e.MarkIncomplete()
+			if !access.IsAccessControlFile(e.SignedName) {
+				e.MarkIncomplete()
+			}
 		}
 		results = append(results, &e)
 	}
@@ -780,7 +781,7 @@ Loop:
 var errSeq = errors.Str("sequence mismatch")
 
 // installEntry installs the new entry in the directory referenced by the dirEntry, appending or overwriting the
-// entry as required. It returns the entry updated directory and the blob itself.
+// entry as required. It returns the entry of the updated directory and the blob itself.
 func (s *server) installEntry(op string, dirName upspin.PathName, dirEntry *upspin.DirEntry, newEntry *upspin.DirEntry, deleting, dirOverwriteOK bool) (*upspin.DirEntry, []byte, error) {
 	dirData, err := s.readAll(dirEntry)
 	if err != nil {
@@ -822,13 +823,13 @@ func (s *server) installEntry(op string, dirName upspin.PathName, dirEntry *upsp
 		copy(dirData[start:], remaining)
 		dirData = dirData[:len(dirData)-length]
 		if !deleting {
-			// We want nextEntry's sequence (previous value+1) but everything else from newEntry.
+			// We want nextEntry's sequence but everything else from newEntry.
 			if newEntry.Sequence != upspin.SeqIgnore {
 				if newEntry.Sequence != nextEntry.Sequence {
 					return nil, nil, errors.E(op, newEntry.Name, errSeq)
 				}
 			}
-			newEntry.Sequence = upspin.SeqNext(nextEntry.Sequence)
+			newEntry.Sequence = nextEntry.Sequence
 		}
 		break
 	}
@@ -841,6 +842,8 @@ func (s *server) installEntry(op string, dirName upspin.PathName, dirEntry *upsp
 		// Add new entry to directory.
 		if newEntry.Sequence == upspin.SeqIgnore {
 			newEntry.Sequence = upspin.NewSequence()
+		} else {
+			newEntry.Sequence = upspin.SeqNext(newEntry.Sequence)
 		}
 		data, err := newEntry.Marshal()
 		if err != nil {
@@ -876,11 +879,6 @@ func (s *server) Endpoint() upspin.Endpoint {
 		Transport: upspin.InProcess,
 		NetAddr:   "", // Ignored.
 	}
-}
-
-// Ping implements upspin.DirServer.Ping.
-func (s *server) Ping() bool {
-	return true
 }
 
 // Close implements upspin.server.
