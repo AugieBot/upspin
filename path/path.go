@@ -27,11 +27,7 @@ type Parsed struct {
 
 // UnmarshalJSON is needed because Parsed has unexported fields.
 func (p *Parsed) UnmarshalJSON(data []byte) error {
-	err := json.Unmarshal(data, &p.path)
-	if err != nil {
-		return err
-	}
-	return nil
+	return json.Unmarshal(data, &p.path)
 }
 
 // MarshalJSON is needed because Parsed has unexported fields.
@@ -95,7 +91,6 @@ func (p Parsed) FilePath() string {
 // the trailing slash is optional. The name is 'cleaned' (see the Clean
 // function) to canonicalize it.
 func Parse(pathName upspin.PathName) (Parsed, error) {
-	const op = "path.Parse"
 	name := string(pathName)
 	// Pull off the user name.
 	var userName string
