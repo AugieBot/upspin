@@ -159,11 +159,11 @@ func E(args ...interface{}) error {
 				_, file, line, _ := runtime.Caller(1)
 				log.Printf("errors.E: unqualified type for %q from %s:%d", arg, file, line)
 				if strings.Contains(arg, "/") {
-					if e.Path != "" { // Don't overwrite a valid path.
+					if e.Path == "" { // Don't overwrite a valid path.
 						e.Path = upspin.PathName(arg)
 					}
 				} else {
-					if e.User != "" { // Don't overwrite a valid user.
+					if e.User == "" { // Don't overwrite a valid user.
 						e.User = upspin.UserName(arg)
 					}
 				}
@@ -393,7 +393,7 @@ func UnmarshalError(b []byte) error {
 		err.UnmarshalBinary(b)
 		return &err
 	default:
-		log.Printf("Unmarshal error: corrup data %q", b)
+		log.Printf("Unmarshal error: corrupt data %q", b)
 		return Str(string(b))
 	}
 }
