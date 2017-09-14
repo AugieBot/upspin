@@ -17,7 +17,7 @@ import (
 	"upspin.io/access"
 	"upspin.io/bind"
 	"upspin.io/config"
-	"upspin.io/dir/server/tree"
+	"upspin.io/dir/server/serverlog"
 	"upspin.io/errors"
 	"upspin.io/factotum"
 	"upspin.io/pack"
@@ -86,7 +86,7 @@ func TestMakeRoot(t *testing.T) {
 	}
 
 	// Ensure log for user has been deleted.
-	hasLog, err := tree.HasLog(userName, s.logDir)
+	hasLog, err := serverlog.HasLog(userName, s.logDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,13 +122,22 @@ func TestPut(t *testing.T) {
 		Sequence:   upspin.SeqNotExist,
 		Packing:    upspin.PlainPack,
 	}
-	_, err := s.Put(de)
+	entry, err := s.Put(de)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if entry == nil {
+		t.Fatal("nil entry")
+	}
+	if !entry.IsIncomplete() {
+		t.Fatal("non-incomplete entry")
 	}
 	de2, err := s.Lookup(de.Name)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if de2.Sequence != entry.Sequence {
+		t.Errorf("Lookup returned sequence %d; expected %d", de2.Sequence, entry.Sequence)
 	}
 	deExpected := *de
 	deExpected.Sequence = upspin.SeqBase | (de.Sequence ^ upspin.SeqVersion(de.Sequence))
@@ -157,7 +166,7 @@ func TestMakeDirectory(t *testing.T) {
 	deExpected := *de
 	deExpected.Writer = serverName
 	deExpected.Packing = upspin.EEPack
-	deExpected.Sequence = upspin.SeqBase
+	deExpected.Sequence = de2.Sequence
 	err = checkDirEntry("TestMakeDirectory", de2, &deExpected)
 	if err != nil {
 		t.Fatal(err)
@@ -244,7 +253,7 @@ func TestLink(t *testing.T) {
 
 	// Get a server for otherUser, who has no right to see the link.
 	sOther, userCtx := newDirServerForTesting(t, otherUser)
-	de2, err = sOther.Lookup(userName + "/mylink")
+	_, err = sOther.Lookup(userName + "/mylink")
 	if !errors.Match(errPrivate, err) {
 		t.Errorf("err = %v, want = %v", err, errPrivate)
 	}
@@ -332,6 +341,9 @@ func TestHasRight(t *testing.T) {
 		t.Fatal(err)
 	}
 	p, err := path.Parse(userName + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	checkAccess := func(right access.Right, want bool) error {
 		hasAccess, _, err := s.hasRight(right, p)
@@ -455,49 +467,49 @@ func TestGlob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := []upspin.PathName{
-		userName + "/Access",
-		userName + "/dir",
-		userName + "/file1.txt",
-		userName + "/mylink",
+	const incomplete = true
+	type expected struct {
+		name       upspin.PathName
+		incomplete bool
+	}
+	exp := []expected{
+		{userName + "/Access", !incomplete},   // available with any right.
+		{userName + "/dir", incomplete},       // marked incomplete (no read rights).
+		{userName + "/file1.txt", incomplete}, // marked incomplete (no read rights).
+		{userName + "/mylink", incomplete},    // links never have blocks nor metadata.
 	}
 	for _, e := range ents {
 		t.Logf("got: %q", e.Name)
 	}
 
-	if got, want := len(ents), len(expected); got != want {
-		t.Fatalf("len(ents) = %d, want = %d", got, want)
+	verify := func(ents []*upspin.DirEntry, exp []expected) {
+		for _, e := range ents {
+			t.Logf("got: %q", e.Name)
+		}
+		if got, want := len(ents), len(exp); got != want {
+			t.Fatalf("len(ents) = %d, want = %d", got, want)
+		}
+		for i, e := range ents {
+			if got, want := e.Name, exp[i].name; got != want {
+				t.Errorf("%d: e.Name = %q, want = %q", i, got, want)
+			}
+			// Verify whether entry is marked incomplete.
+			if got, want := e.IsIncomplete(), exp[i].incomplete; got != want {
+				t.Errorf("%s: incomplete = %v, want = %v", e.Name, got, want)
+			}
+		}
 	}
-	for i, e := range ents {
-		if got, want := e.Name, expected[i]; got != want {
-			t.Errorf("%d: e.Name = %q, want = %q", i, got, want)
-		}
-		// Verify that Blocks and Packdata are nil, since we don't have
-		// Read rights.
-		if len(e.Blocks) != 0 {
-			t.Errorf("len(e.Blocks) = %d, want = 0", len(e.Blocks))
-		}
-		if len(e.Packdata) != 0 {
-			t.Errorf("len(e.Packdata) = %d, want = 0", len(e.Packdata))
-		}
-	}
+	verify(ents, exp)
 
 	// Try globbing a specific file.
 	ents, err = s.Glob(userName + "/file1.txt")
-	for _, e := range ents {
-		t.Logf("got: %q", e.Name)
+	if err != nil {
+		t.Fatal(err)
 	}
-	expected = []upspin.PathName{
-		userName + "/file1.txt",
+	exp = []expected{
+		{userName + "/file1.txt", incomplete},
 	}
-	if got, want := len(ents), len(expected); got != want {
-		t.Fatalf("len(ents) = %d, want = %d", got, want)
-	}
-	for i, e := range ents {
-		if got, want := e.Name, expected[i]; got != want {
-			t.Errorf("%d: e.Name = %q, want = %q", i, got, want)
-		}
-	}
+	verify(ents, exp)
 
 	//
 	// Second subtest: globber has Read permissions and Glob is more complex.
@@ -529,47 +541,21 @@ func TestGlob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected = []upspin.PathName{
-		userName + "/dir/subdir",
-		userName + "/dir/subway",
+	exp = []expected{
+		{userName + "/dir/subdir", !incomplete},
+		{userName + "/dir/subway", !incomplete},
 	}
-	for _, e := range ents {
-		t.Logf("got: %q", e.Name)
-	}
-	if got, want := len(ents), len(expected); got != want {
-		t.Fatalf("len(ents) = %d, want = %d", got, want)
-	}
-	for i, e := range ents {
-		if got, want := e.Name, expected[i]; got != want {
-			t.Errorf("%d: e.Name = %q, want = %q", i, got, want)
-		}
-		// Since both dirs contain subdirs, verify that Blocks is not
-		// nil, because we have Read rights.
-		if len(e.Blocks) == 0 {
-			t.Errorf("len(e.Blocks) = %d, want > 0", len(e.Blocks))
-		}
-		// Packadata shouldn't be nil unless Packing is Plain.
-		if e.Packing != upspin.PlainPack && len(e.Packdata) == 0 {
-			t.Errorf("len(e.Packdata) = %d, want > 0", len(e.Packdata))
-		}
-	}
+	verify(ents, exp)
 
 	// Try globbing a specific directory not directly in the root.
 	ents, err = s.Glob(userName + "/dir/foo")
-	for _, e := range ents {
-		t.Logf("got: %q", e.Name)
+	if err != nil {
+		t.Fatal(err)
 	}
-	expected = []upspin.PathName{
-		userName + "/dir/foo",
+	exp = []expected{
+		{userName + "/dir/foo", !incomplete},
 	}
-	if got, want := len(ents), len(expected); got != want {
-		t.Fatalf("len(ents) = %d, want = %d", got, want)
-	}
-	for i, e := range ents {
-		if got, want := e.Name, expected[i]; got != want {
-			t.Errorf("%d: e.Name = %q, want = %q", i, got, want)
-		}
-	}
+	verify(ents, exp)
 
 	//
 	// Third subtest: More complex regex.
@@ -580,21 +566,11 @@ func TestGlob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected = []upspin.PathName{
-		userName + "/dir/subdir",
-		userName + "/dir/subway",
+	exp = []expected{
+		{userName + "/dir/subdir", !incomplete},
+		{userName + "/dir/subway", !incomplete},
 	}
-	for _, e := range ents {
-		t.Logf("got: %q", e.Name)
-	}
-	if got, want := len(ents), len(expected); got != want {
-		t.Fatalf("len(ents) = %d, want = %d", got, want)
-	}
-	for i, e := range ents {
-		if got, want := e.Name, expected[i]; got != want {
-			t.Errorf("%d: e.Name = %q, want = %q", i, got, want)
-		}
-	}
+	verify(ents, exp)
 
 	//
 	// Fourth subtest: A deep regex by directory owner, now matching a link
@@ -620,38 +596,21 @@ func TestGlob(t *testing.T) {
 	if err != upspin.ErrFollowLink {
 		t.Fatalf("err = %q, want = %q (ErrFollowLink)", err, upspin.ErrFollowLink)
 	}
-	expected = []upspin.PathName{
-		userName + "/dir/subdir/sub",
-		userName + "/dir/sublinkdir", // Causes ErrFollowLink above.
+	exp = []expected{
+		{userName + "/dir/subdir/sub", !incomplete},
+		{userName + "/dir/sublinkdir", !incomplete}, // Causes ErrFollowLink above.
 	}
-	for _, e := range ents {
-		t.Logf("got: %q", e.Name)
-	}
-	if got, want := len(ents), len(expected); got != want {
-		t.Fatalf("len(ents) = %d, want = %d", got, want)
-	}
-	for i, e := range ents {
-		if got, want := e.Name, expected[i]; got != want {
-			t.Errorf("%d: e.Name = %q, want = %q", i, got, want)
-		}
-	}
+	verify(ents, exp)
 
 	// Glob the link itself.
 	ents, err = sOwner.Glob(userName + "/dir/sublinkdir")
-	expected = []upspin.PathName{
-		userName + "/dir/sublinkdir",
+	if err != upspin.ErrFollowLink {
+		t.Fatalf("Glob returned error %v, want ErrFollowLink", err)
 	}
-	for _, e := range ents {
-		t.Logf("got: %q", e.Name)
+	exp = []expected{
+		{userName + "/dir/sublinkdir", !incomplete},
 	}
-	if got, want := len(ents), len(expected); got != want {
-		t.Fatalf("len(ents) = %d, want = %d", got, want)
-	}
-	for i, e := range ents {
-		if got, want := e.Name, expected[i]; got != want {
-			t.Errorf("%d: e.Name = %q, want = %q", i, got, want)
-		}
-	}
+	verify(ents, exp)
 
 	//
 	// Fifth subtest: globber can't list part of the path; only the first
@@ -669,20 +628,10 @@ func TestGlob(t *testing.T) {
 	if err != upspin.ErrFollowLink {
 		t.Fatalf("err = %q, want = %q (ErrFollowLink)", err, upspin.ErrFollowLink)
 	}
-	expected = []upspin.PathName{
-		userName + "/mylink", // Causes ErrFollowLink above.
+	exp = []expected{
+		{userName + "/mylink", incomplete}, // Causes ErrFollowLink above.
 	}
-	for _, e := range ents {
-		t.Logf("got: %q", e.Name)
-	}
-	if got, want := len(ents), len(expected); got != want {
-		t.Fatalf("len(ents) = %d, want = %d", got, want)
-	}
-	for i, e := range ents {
-		if got, want := e.Name, expected[i]; got != want {
-			t.Errorf("%d: e.Name = %q, want = %q", i, got, want)
-		}
-	}
+	verify(ents, exp)
 
 	// Test syntax error.
 	_, err = s.Glob(userName + "/[]")
@@ -875,6 +824,69 @@ func TestPermissionDenied(t *testing.T) {
 	}
 }
 
+func TestAccessAndGroupFilesNotIncomplete(t *testing.T) {
+	const userAccess = userName + "/Access"
+	s, userCtx := newDirServerForTesting(t, userName)
+	// Access file permits List rights for otherUser.
+	_, err := putAccessOrGroupFile(t, s, userCtx, userAccess, "l:"+otherUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sOther, _ := newDirServerForTesting(t, otherUser)
+
+	entry, err := sOther.Lookup(userAccess)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.IsIncomplete() {
+		t.Fatal("Got incomplete entry, expected blocks")
+	}
+}
+
+func TestAccessAndGroupFilesNotIncompleteFromWatch(t *testing.T) {
+	const userAccess = userName + "/Access"
+	s, userCtx := newDirServerForTesting(t, userName)
+	// Access file permits List rights for otherUser.
+	_, err := putAccessOrGroupFile(t, s, userCtx, userAccess, "l:"+otherUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sOther, _ := newDirServerForTesting(t, otherUser)
+
+	done := make(chan struct{})
+	defer close(done)
+	events, err := sOther.Watch(userName+"/", -1, done)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, exp := range []struct {
+		name       upspin.PathName
+		incomplete bool
+	}{
+		{userName + "/", true},
+		{userName + "/Access", false},
+	} {
+		var event upspin.Event
+		select {
+		case event = <-events:
+			// Ok
+		case <-time.After(time.Minute):
+			t.Errorf("Timed out waiting for event")
+		}
+		entry := event.Entry
+
+		if entry.SignedName != exp.name {
+			t.Fatalf("got %s, want = %s", entry.SignedName, exp.name)
+		}
+		if entry.IsIncomplete() && !exp.incomplete {
+			t.Fatalf("Got incomplete entry (%s), expected blocks", event.Entry.Name)
+		} else if !entry.IsIncomplete() && exp.incomplete {
+			t.Fatalf("Got complete entry (%s), expected incomplete", event.Entry.Name)
+		}
+	}
+}
+
 func TestOverwriteFileWithWrongSequence(t *testing.T) {
 	s, userCtx := newDirServerForTesting(t, userName)
 	_, err := putAccessOrGroupFile(t, s, userCtx, userName+"/Access", "*:"+userName)
@@ -951,11 +963,16 @@ func makeDirectory(s *server, name upspin.PathName) (*upspin.DirEntry, error) {
 		Attr:       upspin.AttrDirectory,
 		// Mimic what the client does -- it does not include any other field.
 	}
-	return s.Put(entry)
+	e, err := s.Put(entry)
+	if err != nil {
+		return e, err
+	}
+	entry.Sequence = e.Sequence
+	return entry, nil
 }
 
 func putAccessOrGroupFile(t testing.TB, s *server, userCtx upspin.Config, name upspin.PathName, contents string) (*upspin.DirEntry, error) {
-	if !access.IsAccessFile(name) && !access.IsGroupFile(name) {
+	if !access.IsAccessControlFile(name) {
 		t.Fatalf("%s not an access file", name)
 	}
 	packer := pack.Lookup(upspin.EEIntegrityPack)
