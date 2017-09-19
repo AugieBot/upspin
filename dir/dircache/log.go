@@ -73,7 +73,7 @@ const (
 	// obsoleteReq marks an LRU entry as no longer necessarily
 	// matching what is in the directory server. Whenever the
 	// watcher gets an error saying that the log cannot be
-	// watched at its current order, we mark all entries obsolete.
+	// watched at its current sequence, we mark all entries obsolete.
 	//
 	// obsoleteReq entries are never written to log files.
 	obsoleteReq
@@ -110,8 +110,8 @@ type clogEntry struct {
 	// For directories, the Access file that pertains.
 	access upspin.PathName
 
-	// The watch order.
-	order int64
+	// The watch sequence number.
+	sequence int64
 }
 
 // clog represents the replayable log of DirEntry changes.
@@ -162,7 +162,6 @@ const LRUMax = 10000
 // - maxDisk is an approximate limit on disk space for log files
 // - userToDirServer is a map from user names to directory endpoints, maintained by the server
 func openLog(cfg upspin.Config, dir string, maxDisk int64) (*clog, error) {
-	const op = "rpc/dircache.openLog"
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
@@ -257,7 +256,6 @@ func (l *clog) rotateLog() {
 // were most recently interested in. The watcher should eventually
 // replace them with trusted information.
 func (l *clog) wipeLog(user upspin.UserName) {
-	const op = "rpc/dircache.wipeLog"
 	l.globalLock.Lock()
 	defer l.globalLock.Unlock()
 
@@ -417,7 +415,6 @@ func (l *clog) readLogFile(fn string) error {
 		switch e.request {
 		case versionReq:
 			log.Info.Printf("%s: version other than first record", op)
-			break
 		case globReq:
 			// Since we first log all the contents of a directory before the glob,
 			// we need to first add all entries to a manufactured glob entry. Once
@@ -532,6 +529,8 @@ func (l *clog) lookupGlob(pattern upspin.PathName) ([]*upspin.DirEntry, error, b
 
 // complete returns true if (1) this was the result of a '*' glob and if
 // all its children are still valid in the LRU.
+//
+// Called with the glob entry locked.
 func (l *clog) complete(e *clogEntry) bool {
 	if !e.complete {
 		return false
@@ -554,39 +553,47 @@ func (l *clog) complete(e *clogEntry) bool {
 	return true
 }
 
+// whichAcess returns the applicable Access file to name if one is known.
 func (l *clog) whichAccess(name upspin.PathName) (*upspin.DirEntry, bool) {
 	l.globalLock.RLock()
 	defer l.globalLock.RUnlock()
 
-	// Do we have a cached entry for name that refers to a known Access file?
-	var afn upspin.PathName
-	plock := l.pathLocks.lock(name)
-	e := l.getFromLRU(lruKey{name: name})
-	if e != nil && e.error != nil {
-		afn = e.access
-	}
-	plock.Unlock()
-	if afn == unknownAccessFile {
-		// Do we have a cached entry for name's directory that refers to a known Access file?
-		dirName := path.DropPath(name, 1)
+	// The name has already been parsed getting here.
+	p, _ := path.Parse(name)
+
+	// The access member is only set in glob (directory) entries. Walk the cached glob
+	// entries to the root looking for the pertinent Access file.
+	afn := noAccessFile
+	for pd := p.Drop(1); ; pd = pd.Drop(1) {
+		dirName := pd.Path()
 		glock := l.globLocks.lock(dirName)
-		e = l.getFromLRU(lruKey{name: dirName, glob: true})
-		if e != nil && e.error != nil {
-			afn = e.access
-		}
-		glock.Unlock()
-		if afn == unknownAccessFile {
+		e := l.getFromLRU(lruKey{name: dirName, glob: true})
+
+		// If at any point in the walk, we can't answer the
+		// question, give up.
+		if e == nil || e.error != nil || e.access == unknownAccessFile {
+			glock.Unlock()
 			return nil, false
+		}
+		afn = e.access
+		glock.Unlock()
+
+		// If we've found an Access file, we're done.
+		if afn != noAccessFile {
+			break
+		}
+
+		// If we've walked to the root with no Access file, there is none.
+		if pd.IsRoot() {
+			// We walked the whole path with no access file.
+			return nil, true
 		}
 	}
 
-	// Is the Access file's entry cached?
-	if afn == noAccessFile {
-		return nil, true
-	}
-	plock = l.pathLocks.lock(afn)
+	// We have an Access file name. See if we have the Access file DirEntry.
+	plock := l.pathLocks.lock(afn)
 	defer plock.Unlock()
-	e = l.getFromLRU(lruKey{name: afn})
+	e := l.getFromLRU(lruKey{name: afn, glob: false})
 	if e == nil || e.de == nil || e.error != nil {
 		return nil, false
 	}
@@ -594,10 +601,10 @@ func (l *clog) whichAccess(name upspin.PathName) (*upspin.DirEntry, bool) {
 }
 
 func (l *clog) logRequest(op request, name upspin.PathName, err error, de *upspin.DirEntry) {
-	l.logRequestWithOrder(op, name, err, de, 0)
+	l.logRequestWithSequence(op, name, err, de, 0)
 }
 
-func (l *clog) logRequestWithOrder(op request, name upspin.PathName, err error, de *upspin.DirEntry, order int64) {
+func (l *clog) logRequestWithSequence(op request, name upspin.PathName, err error, de *upspin.DirEntry, sequence int64) {
 	if !cacheableError(err) {
 		return
 	}
@@ -606,13 +613,14 @@ func (l *clog) logRequestWithOrder(op request, name upspin.PathName, err error, 
 	defer l.globalLock.RUnlock()
 
 	e := &clogEntry{
-		name:    name,
-		request: op,
-		error:   err,
-		de:      de,
-		order:   order,
+		name:     name,
+		request:  op,
+		error:    err,
+		de:       de,
+		sequence: sequence,
 	}
-	l.append(e)
+	l.appendToLogFile(e)
+	l.updateLRU(e)
 
 	// Optimization: when creating a directory, fake a complete globReq entry since
 	// we know that the directory is empty and don't have to ask the server.
@@ -624,7 +632,8 @@ func (l *clog) logRequestWithOrder(op request, name upspin.PathName, err error, 
 			children: make(map[string]bool),
 			complete: true,
 		}
-		l.append(e)
+		l.appendToLogFile(e)
+		l.updateLRU(e)
 	}
 }
 
@@ -637,7 +646,7 @@ func cacheableGlob(p upspin.PathName) (upspin.PathName, bool) {
 
 	// This test also rejects globs with escaped glob characters, i.e., real glob
 	// characters in file names.
-	if strings.IndexAny(string(pp), "*?[") >= 0 {
+	if strings.ContainsAny(string(pp), "*?[") {
 		return p, false
 	}
 	return pp, true
@@ -674,7 +683,6 @@ func (l *clog) logGlobRequest(pattern upspin.PathName, err error, entries []*ups
 			}
 		}
 	}
-	glock.Unlock()
 
 	// The deleted files may have been recreated while we were doing this. Just forget
 	// what we know about them.
@@ -691,17 +699,9 @@ func (l *clog) logGlobRequest(pattern upspin.PathName, err error, entries []*ups
 		children: children,
 		complete: true,
 	}
-	l.append(e)
-}
-
-// append appends a clogEntry to the end of the clog and replaces existing in the LRU.
-func (l *clog) append(e *clogEntry) error {
-	const op = "rpc/dircache.append"
-
-	l.updateLRU(e)
 	l.appendToLogFile(e)
-
-	return nil
+	glock.Unlock()
+	l.updateLRU(e)
 }
 
 // updateLRU adds the entry to the in core LRU version of the clog. We don't remember errors
@@ -720,18 +720,6 @@ func (l *clog) updateLRU(e *clogEntry) {
 		if !errors.Match(notExist, e.error) {
 			log.Debug.Printf("updateLRU %s error %s", e.name, e.error)
 			return
-		}
-		// Recursively remove from everywhere possible.
-		if e.request == globReq {
-			for k := range e.children {
-				ae := &clogEntry{
-					request: globReq,
-					name:    path.Join(e.name, k),
-					error:   e.error,
-					de:      e.de,
-				}
-				l.updateLRU(ae)
-			}
 		}
 		l.removeFromLRU(e, true)
 		l.removeFromLRU(e, false)
@@ -771,19 +759,29 @@ func (l *clog) updateLRU(e *clogEntry) {
 			l.addAccess(ae)
 		}
 
-		// Add it to the specific entry.
+		// Add it to the specific parent directory's entry.
 		dirName := path.DropPath(e.name, 1)
 		glock := l.globLocks.lock(dirName)
 		defer glock.Unlock()
+		newVal := noAccessFile
+		if e.de != nil {
+			newVal = e.de.Name
+		}
 		ge := l.getFromLRU(lruKey{name: dirName, glob: true})
-		if ge != nil {
-			newVal := noAccessFile
-			if e.de != nil {
-				newVal = e.de.Name
+		if ge == nil {
+			// No directory entry, add one.
+			ge = &clogEntry{
+				request:  globReq,
+				name:     dirName,
+				children: make(map[string]bool),
+				complete: false,
+				access:   newVal,
 			}
-			if ge.access != newVal {
-				ge.access = newVal
-			}
+			l.addToLRU(ge)
+			l.addToGlob(ge)
+		} else {
+			// Update the current entry.
+			ge.access = newVal
 		}
 	case obsoleteReq:
 		// These never get logged. They are just markers that the file
@@ -791,7 +789,6 @@ func (l *clog) updateLRU(e *clogEntry) {
 	default:
 		log.Printf("unknown request type: %s", e)
 	}
-	return
 }
 
 // addToLRU adds an entry to the LRU.
@@ -1022,7 +1019,7 @@ var badVersion = errors.E(errors.Invalid, errors.Errorf("bad log file version"))
 
 // A marshalled entry is of the form:
 //   request-type: byte
-//   order: varint
+//   sequence: varint
 //   error: len + marshalled upspin.Error
 //   direntry: len + marshalled upspin.DirEntry
 //   if direntry == nil {
@@ -1047,9 +1044,9 @@ func (e *clogEntry) marshal() ([]byte, error) {
 	}
 	b := []byte{byte(e.request)}
 
-	// order
+	// sequence
 	var tmp [16]byte
-	n := binary.PutVarint(tmp[:], e.order)
+	n := binary.PutVarint(tmp[:], e.sequence)
 	b = append(b, tmp[:n]...)
 
 	// error
@@ -1087,9 +1084,9 @@ func (e *clogEntry) unmarshal(b []byte) (err error) {
 	}
 	b = b[1:]
 
-	// order
+	// sequence
 	var n int
-	e.order, n = binary.Varint(b)
+	e.sequence, n = binary.Varint(b)
 	if n == 0 {
 		return tooShort
 	}
@@ -1152,10 +1149,10 @@ func (e *clogEntry) read(l *clog, rd *bufio.Reader) error {
 		return err
 	}
 
-	// If order is set, update the order in the proxied directories.
-	if e.order != 0 {
-		l.proxied.setOrder(e.name, e.order)
-		e.order = 0
+	// If sequence is set, update the sequence in the proxied directories.
+	if e.sequence != 0 {
+		l.proxied.setSequence(e.name, e.sequence)
+		e.sequence = 0
 	}
 	return nil
 }
@@ -1279,11 +1276,11 @@ func (e *clogEntry) String() string {
 		rv = reqName[e.request]
 	}
 	rv += fmt.Sprintf(" %s ", e.name)
-	if e.order != 0 {
-		rv += fmt.Sprintf(" order<%d>", e.order)
+	if e.sequence != 0 {
+		rv += fmt.Sprintf(" sequence<%d>", e.sequence)
 	}
 	if e.error != nil {
-		rv += fmt.Sprintf(" error<%s>", e.error)
+		rv += fmt.Sprintf(" sequence<%s>", e.sequence)
 	}
 	if e.de != nil {
 		dtype := "file"
