@@ -9,9 +9,11 @@ import (
 	"os"
 	"reflect"
 	"testing"
+	"time"
 
 	"upspin.io/bind"
 	"upspin.io/config"
+	"upspin.io/dir/server/serverlog"
 	"upspin.io/errors"
 	"upspin.io/factotum"
 	"upspin.io/path"
@@ -63,14 +65,18 @@ func TestPutNodes(t *testing.T) {
 	if got, want := log.LastOffset(), int64(totBytes); got < want {
 		t.Fatalf("LastIndex = %d, want > %d", got, want)
 	}
-	entry, next, err := log.ReadAt(int64(0))
+	lrd, err := log.NewReader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, next, err := lrd.ReadAt(int64(0))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(&entry.Entry, dir2) {
 		t.Errorf("dir2 = %v, want %v", entry.Entry, dir2)
 	}
-	entry, _, err = log.ReadAt(next)
+	entry, _, err = lrd.ReadAt(next)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,6 +116,9 @@ func TestPutNodes(t *testing.T) {
 	}
 
 	newRoot, _, err := tree.Lookup(mkpath(t, userName+"/"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if newRoot.Time <= root.Time {
 		t.Fatalf("Time moved backwards: got %d, want > %d", newRoot.Time, root.Time)
 	}
@@ -193,14 +202,14 @@ func TestPutNodes(t *testing.T) {
 		t.Fatalf("cfg.Log.LastIndex() = %d, want %d", log.LastOffset(), want)
 	}
 	// Verify logged entry is the deletion of a file.
-	entry, _, err = log.ReadAt(last)
+	entry, _, err = lrd.ReadAt(last)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got, want := entry.Entry.Name, upspin.PathName(userName+"/dir/img.jpg"); got != want {
 		t.Errorf("entries[0].Name = %s, want = %s", got, want)
 	}
-	if got, want := entry.Op, Delete; got != want {
+	if got, want := entry.Op, serverlog.Delete; got != want {
 		t.Errorf("entries[0].Op = %v, want = %v", got, want)
 	}
 }
@@ -754,6 +763,14 @@ func TestPutDirSameTreeNonRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Try to PutDir again, it should fail with an "exists" error.
+	_, err = tree.PutDir(mkpath(t, userName+"/snapshot/new"), entry)
+	if err == nil {
+		t.Fatal("PutDir of existing target: expected error, got nil")
+	} else if !errors.Match(errors.E(errors.Exist), err) {
+		t.Fatalf("PutDir of existing target: expected 'exists' error, got %v", err)
+	}
+
 	// Create a new tree (simulate a crash).
 	tree, err = New(config, log, logIndex)
 	if err != nil {
@@ -899,6 +916,95 @@ func TestPutDirOtherTreeRoot(t *testing.T) {
 	}
 }
 
+func TestPutDirLog(t *testing.T) {
+	config, log, logIndex := newConfigForTesting(t, userName)
+	tree, err := New(config, log, logIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Build a simple tree.
+	buildTree(t, tree, config)
+
+	dstDir := mkpath(t, userName+"/snapshot/new")
+
+	// Look up "/orig" and put it to dstDir ("/snapshot/new").
+	entry, _, err := tree.Lookup(mkpath(t, userName+"/orig"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = tree.PutDir(dstDir, entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Find a log entry for "/snapshot/new".
+	r, err := log.NewReader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var offset, last int64 = 0, r.LastOffset()
+	for offset < last {
+		le, next, err := r.ReadAt(offset)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if le.Entry.Name == dstDir.Path() {
+			// Found.
+			return
+		}
+		offset = next
+	}
+	t.Fatalf("could not find log entry for %q", dstDir)
+
+}
+
+func TestPutDirWatch(t *testing.T) {
+	config, log, logIndex := newConfigForTesting(t, userName)
+	tree, err := New(config, log, logIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Build a simple tree.
+	buildTree(t, tree, config)
+
+	// The directory to create with PutDir.
+	dstDir := mkpath(t, userName+"/snapshot/new")
+
+	// Watch the destination directory.
+	done := make(chan struct{})
+	defer close(done)
+	events, err := tree.Watch(dstDir, 0, done)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Look up "/orig" and put it to dstDir ("/snapshot/new").
+	entry, _, err := tree.Lookup(mkpath(t, userName+"/orig"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = tree.PutDir(dstDir, entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for an Event for the creation of dstDir.
+	select {
+	case <-time.After(5 * time.Second):
+		t.Error("timed out waiting for event")
+	case e := <-events:
+		if e.Error != nil {
+			t.Fatal(err)
+		}
+		if e.Entry == nil {
+			t.Fatal("got Event with nil Entry")
+		}
+		if got, want := e.Entry.Name, dstDir.Path(); got != want {
+			t.Errorf("got Event with Name %q, want %q", got, want)
+		}
+	}
+}
+
 func TestFlushNewTree(t *testing.T) {
 	config, log, logIndex := newConfigForTesting(t, userName)
 	tree, err := New(config, log, logIndex)
@@ -906,7 +1012,7 @@ func TestFlushNewTree(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = tree.Flush()
-	expectedErr := errors.E(errors.NotExist, errors.E(upspin.UserName(userName)))
+	expectedErr := errors.E(errors.NotExist, upspin.UserName(userName))
 	if !errors.Match(expectedErr, err) {
 		t.Fatalf("err = %s, want = %s", err, expectedErr)
 	}
@@ -934,8 +1040,7 @@ func TestCorruptTreeAndRecover(t *testing.T) {
 	}
 
 	// Write some garbage to the log.
-	data := "Some garbage"
-	_, err = log.file.Write([]byte(data))
+	_, err = log.Write([]byte("Some garbage"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1004,6 +1109,9 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		panic(err)
 	}
+
+	// Make the logs rotate frequently.
+	serverlog.MaxLogSize = 100
 
 	code := m.Run()
 
@@ -1086,7 +1194,7 @@ func newDirEntry(name upspin.PathName, isDir bool, config upspin.Config) (path.P
 
 // newConfigForTesting creates the necessary items to instantiate a Tree for
 // testing.
-func newConfigForTesting(t *testing.T, userName upspin.UserName) (upspin.Config, *Log, *LogIndex) {
+func newConfigForTesting(t *testing.T, userName upspin.UserName) (upspin.Config, *serverlog.Writer, *serverlog.Index) {
 	factotum, err := factotum.NewFromDir(testutil.Repo("key", "testdata", "test"))
 	if err != nil {
 		t.Fatal(err)
@@ -1134,7 +1242,7 @@ func newConfigForTesting(t *testing.T, userName upspin.UserName) (upspin.Config,
 	if err != nil {
 		t.Fatal(err)
 	}
-	log, logIndex, err := NewLogs(userName, tmpDir)
+	log, logIndex, err := serverlog.New(userName, tmpDir)
 	if err != nil {
 		t.Fatal(err)
 	}
