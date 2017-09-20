@@ -98,8 +98,6 @@ type writebackQueue struct {
 }
 
 func newWritebackQueue(sc *storeCache) *writebackQueue {
-	const op = "store/storecache.newWritebackQueue"
-
 	wbq := &writebackQueue{
 		sc:           sc,
 		byEndpoint:   make(map[upspin.Endpoint]*endpointQueue),
@@ -160,13 +158,6 @@ func (wbq *writebackQueue) enqueueWritebackFile(path string) bool {
 		flushChans: nil,
 	}
 	return true
-}
-
-func (wbq *writebackQueue) close() {
-	close(wbq.die)
-	for i := 0; i < writers+1; i++ {
-		<-wbq.terminated
-	}
 }
 
 // scheduler puts requests into the ready queue for the writers to work on.

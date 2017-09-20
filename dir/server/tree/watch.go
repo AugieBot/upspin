@@ -5,8 +5,8 @@
 package tree
 
 // TODOs:
-// - The watcher "tails" the log, starting from a given order number. It is
-//   done in a goroutine because the order can be very far from current state
+// - The watcher "tails" the log, starting from a given sequence number. It is
+//   done in a goroutine because the sequence can be very far from the current state
 //   and we don't want to block the caller until all such state is sent on the
 //   Event channel. However, once the watcher has caught up with the current
 //   state of the Tree, there's no longer a need for a goroutine or for reading
@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"upspin.io/dir/server/serverlog"
 	"upspin.io/errors"
 	"upspin.io/log"
 	"upspin.io/path"
@@ -55,101 +56,114 @@ type watcher struct {
 	// goroutine to look for work at the end of the log.
 	hasWork chan bool
 
-	// log is a read-only cloned instance of the Tree's log that keeps track
-	// of this watcher's progress.
-	log *Log
+	// log is a reader instance of the Tree's log that keeps track of this
+	// watcher's progress.
+	log *serverlog.Reader
 
 	// closed indicates whether the watcher is closed (1) or open (0).
 	// It must be loaded and stored atomically.
 	closed int32
+
+	// shutdown is closed by Tree.Close to signal that the watcher should
+	// exit. It is never closed by the watcher itself.
+	shutdown chan struct{}
+
+	// doneFunc must be called by this watcher before it exits its watch
+	// loop. It decrements the owning tree's watchers wait group.
+	doneFunc func()
 }
 
 // Watch implements upspin.DirServer.Watch.
-func (t *Tree) Watch(p path.Parsed, order int64, done <-chan struct{}) (<-chan *upspin.Event, error) {
-	const op = "dir/server/tree.Watch"
-
+func (t *Tree) Watch(p path.Parsed, sequence int64, done <-chan struct{}) (<-chan *upspin.Event, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
+	// First, ensure the tree is not shutting down.
+	select {
+	case <-t.shutdown:
+		return nil, errors.Str("can't start Watch; tree shutting down")
+	default:
+	}
 
 	// Watch can watch non-existent files, but not non-existent roots.
 	// Therefore, we ensure the root exists before we proceed.
 	err := t.loadRoot()
 	if err != nil {
-		return nil, errors.E(op, err)
+		return nil, err
 	}
 
 	// Clone the logs so we can keep reading it while the current tree
 	// continues to be updated (we're about to unlock this tree).
-	cLog, err := t.log.Clone()
-	if errors.Match(errors.E(errors.NotExist), err) {
-		return nil, errors.E(op, errors.NotExist, errors.Str("no root for user"))
-	}
+	cLog, err := t.log.NewReader()
 	if err != nil {
-		return nil, errors.E(op, err)
+		return nil, err
 	}
 
 	// Create a watcher, but do not attach it to any node yet.
 	// TODO: limit number of watchers on any given node/tree?
-	ch := make(chan *upspin.Event)
 	w := &watcher{
-		path:    p,
-		events:  ch,
-		done:    done,
-		hasWork: make(chan bool, 1),
-		log:     cLog,
-		closed:  0,
+		path:     p,
+		events:   make(chan *upspin.Event),
+		done:     done,
+		hasWork:  make(chan bool, 1),
+		log:      cLog,
+		closed:   0,
+		shutdown: t.shutdown,
+		doneFunc: t.watchers.Done,
 	}
 
-	if order == upspin.WatchCurrent {
+	if sequence == upspin.WatchCurrent {
 		// Send the current state first. We must flush the tree so we
 		// know our logs are current (or we need to recover the tree
 		// from the logs).
 		err := t.flush()
 		if err != nil {
-			return nil, errors.E(op, err)
+			return nil, err
 		}
 
 		// Make a copy of the tree so we have an immutable tree in
 		// memory, at a fixed log position.
 		cIndex, err := t.logIndex.Clone()
-		if errors.Match(errors.E(errors.NotExist), err) {
-			return nil, errors.E(op, errors.NotExist, errors.Str("no root for user"))
-		}
 		if err != nil {
-			return nil, errors.E(op, err)
+			return nil, err
 		}
 		offset := t.log.LastOffset()
 		clone := &Tree{
 			user:     t.user,
 			config:   t.config,
 			packer:   t.packer,
-			log:      cLog,
+			log:      nil, // Cloned tree is read-only.
 			logIndex: cIndex,
+			shutdown: make(chan struct{}),
+			// there are no watchers on the clone.
 		}
+
 		// Start sending the current state of the cloned tree and setup
 		// the watcher for this tree once the current state is sent.
+		t.watchers.Add(1)
 		go w.sendCurrentAndWatch(clone, t, p, offset)
 	} else {
-		if order == upspin.WatchNew {
+		if sequence == upspin.WatchNew {
 			// We must flush the tree so we know our logs are current (or we
 			// need to recover the tree from the logs).
 			err := t.flush()
 			if err != nil {
-				return nil, errors.E(op, err)
+				return nil, err
 			}
 
-			// Set order to the current offset
-			order = t.log.LastOffset()
+			// Set sequence to the current offset. TODO
+			sequence = t.log.LastOffset()
 		}
 
 		// Set up the notification hook.
 		err = t.addWatcher(p, w)
 		if err != nil {
-			return nil, errors.E(op, err)
+			return nil, err
 		}
 
 		// Start the watcher.
-		go w.watch(order)
+		t.watchers.Add(1)
+		go w.watch(sequence)
 	}
 
 	return w.events, nil
@@ -167,16 +181,16 @@ func (t *Tree) addWatcher(p path.Parsed, w *watcher) error {
 	}
 	// Add watcher to node, or to an ancestor.
 	n.watchers = append(n.watchers, w)
+
 	return nil
 }
 
 // sendCurrentAndWatch takes an original tree and its clone and sends the state
 // of the clone starting from the subtree rooted at p. The offset refers to the
-// last log offset saved by the original tree.
+// last log offset saved by the original tree. When sendCurrentAndWatch returns,
+// the watcher and the cloned tree are closed.
 // It must run in a goroutine. Errors are logged.
 func (w *watcher) sendCurrentAndWatch(clone, orig *Tree, p path.Parsed, offset int64) {
-	const op = "dir/server/tree.sendCurrentAndWatch"
-
 	defer clone.Close()
 
 	n, _, err := clone.loadPath(p)
@@ -189,8 +203,8 @@ func (w *watcher) sendCurrentAndWatch(clone, orig *Tree, p path.Parsed, offset i
 	// events channel.
 	if err == nil {
 		fn := func(n *node, level int) error {
-			logEntry := &LogEntry{
-				Op:    Put,
+			logEntry := &serverlog.Entry{
+				Op:    serverlog.Put,
 				Entry: n.entry,
 			}
 			err := w.sendEvent(logEntry, offset)
@@ -222,7 +236,8 @@ func (w *watcher) sendCurrentAndWatch(clone, orig *Tree, p path.Parsed, offset i
 // sendEvent sends a single logEntry read from the log at offset position
 // to the event channel. If the channel blocks for longer than watcherTimeout,
 // the operation fails and the watcher is invalidated (marked for deletion).
-func (w *watcher) sendEvent(logEntry *LogEntry, offset int64) error {
+// TODO: offset should be sequence.
+func (w *watcher) sendEvent(logEntry *serverlog.Entry, offset int64) error {
 	var event *upspin.Event
 	// Strip block information for directories. We avoid an extra copy
 	// if it's not a directory.
@@ -230,26 +245,29 @@ func (w *watcher) sendEvent(logEntry *LogEntry, offset int64) error {
 		entry := logEntry.Entry
 		entry.MarkIncomplete()
 		event = &upspin.Event{
-			Order:  offset,
-			Delete: logEntry.Op == Delete,
-			Entry:  &entry, // already a copy.
+			Sequence: offset, // TODO
+			Delete:   logEntry.Op == serverlog.Delete,
+			Entry:    &entry, // already a copy.
 		}
 	} else {
 		event = &upspin.Event{
-			Order:  offset,
-			Delete: logEntry.Op == Delete,
-			Entry:  &logEntry.Entry, // already a copy.
+			Sequence: offset, // TODO
+			Delete:   logEntry.Op == serverlog.Delete,
+			Entry:    &logEntry.Entry, // already a copy.
 		}
 	}
+	timer := time.NewTimer(watcherTimeout)
+	defer timer.Stop()
 	select {
-	case w.events <- event:
-		// Event was sent.
-		return nil
+	case <-w.shutdown:
+		return errClosed
 	case <-w.done:
 		// Client is done receiving events.
 		return errClosed
-	case <-time.After(watcherTimeout):
-		// TODO: time.After leaks. Use NewTimer.
+	case w.events <- event:
+		// Event was sent.
+		return nil
+	case <-timer.C:
 		// Oops. Client didn't read fast enough.
 		return errTimeout
 	}
@@ -265,7 +283,7 @@ func (w *watcher) sendError(err error) {
 	case <-time.After(3 * watcherTimeout):
 		// Can't send another error since we timed out again. Log an
 		// error and close the watcher.
-		log.Error.Printf("dir/server/tree: timed out sending error: %v", err)
+		log.Error.Printf("dir/server/tree.sendError: %s", errTimeout)
 	}
 }
 
@@ -274,25 +292,27 @@ func (w *watcher) sendError(err error) {
 // given offset until it reaches the end of the log. It returns the next offset
 // to read.
 func (w *watcher) sendEventFromLog(offset int64) (int64, error) {
-	const op = "dir/server/tree.sendEventFromLog"
 	curr := offset
 	for {
-		// Is the receiver still interested in reading events?
+		// Is the receiver still interested in reading events and the
+		// tree still open for business?
 		select {
 		case <-w.done:
+			return 0, errClosed
+		case <-w.shutdown:
 			return 0, errClosed
 		default:
 		}
 
 		logEntry, next, err := w.log.ReadAt(curr)
 		if err != nil {
-			return next, errors.E(op, errors.Invalid, errors.Errorf("cannot read log at order %d: %v", curr, err))
+			return next, errors.E(errors.Invalid, errors.Errorf("cannot read log at sequence %d: %v", curr, err))
 		}
 		if next == curr {
 			return curr, nil
 		}
 		curr = next
-		path := logEntry.Entry.SignedName
+		path := logEntry.Entry.Name
 		if !isPrefixPath(path, w.path) {
 			// Not a log of interest.
 			continue
@@ -315,6 +335,7 @@ func (w *watcher) watch(offset int64) {
 		offset, err = w.sendEventFromLog(offset)
 		if err != nil {
 			if err != errTimeout && err != errClosed {
+				log.Error.Printf("watch: sending error to client: %s", err)
 				w.sendError(err)
 			}
 			return
@@ -323,6 +344,9 @@ func (w *watcher) watch(offset int64) {
 		case <-w.done:
 			// Done channel was closed. Close watcher and quit this
 			// goroutine.
+			return
+		case <-w.shutdown:
+			// Tree has closed, nothing else to do.
 			return
 		case <-w.hasWork:
 			// Wake up and work from where we left off.
@@ -340,6 +364,7 @@ func (w *watcher) isClosed() bool {
 func (w *watcher) close() {
 	atomic.StoreInt32(&w.closed, 1)
 	close(w.events)
+	w.doneFunc()
 }
 
 // removeDeadWatchers removes all watchers on a node that have closed their done
