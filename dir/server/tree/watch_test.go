@@ -19,8 +19,8 @@ const (
 )
 
 func TestWatchStart(t *testing.T) {
-	config, log, logIndex := newConfigForTesting(t, userName)
-	tree, err := New(config, log, logIndex)
+	config, user := newConfigForTesting(t, userName)
+	tree, err := New(config, user)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,8 +125,8 @@ func TestWatchStart(t *testing.T) {
 }
 
 func TestWatchFromMiddle(t *testing.T) {
-	config, log, logIndex := newConfigForTesting(t, userName)
-	tree, err := New(config, log, logIndex)
+	config, user := newConfigForTesting(t, userName)
+	tree, err := New(config, user)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,11 +139,14 @@ func TestWatchFromMiddle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Watch for events that happened from a specific log order and on,
+	// Watch for events that happened from a specific sequence onwards,
 	// for a subdirectory. The magic number below (175) is the log offset
 	// right after "mkdir /orig/sub2/".
+	// TODO: To compute the right magic number, print return value from
+	// logOffsetsFor in ../serverlog/log.go.
+	// TODO: Kill this magic when the parameter is sequence number.
 	done := make(chan struct{})
-	ch, err := tree.Watch(mkpath(t, userName+"/orig/sub1"), 175, done)
+	ch, err := tree.Watch(mkpath(t, userName+"/orig/sub1"), 115, done)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,8 +177,8 @@ func TestWatchFromMiddle(t *testing.T) {
 }
 
 func TestWatchCurrent(t *testing.T) {
-	config, log, logIndex := newConfigForTesting(t, userName)
-	tree, err := New(config, log, logIndex)
+	config, user := newConfigForTesting(t, userName)
+	tree, err := New(config, user)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,8 +232,8 @@ func TestWatchCurrent(t *testing.T) {
 }
 
 func TestWatchNew(t *testing.T) {
-	config, log, logIndex := newConfigForTesting(t, userName)
-	tree, err := New(config, log, logIndex)
+	config, user := newConfigForTesting(t, userName)
+	tree, err := New(config, user)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,8 +283,8 @@ func TestWatchNew(t *testing.T) {
 }
 
 func TestWatchNonExistingNode(t *testing.T) {
-	config, log, logIndex := newConfigForTesting(t, userName)
-	tree, err := New(config, log, logIndex)
+	config, user := newConfigForTesting(t, userName)
+	tree, err := New(config, user)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,8 +362,8 @@ func TestWatchNonExistingNode(t *testing.T) {
 }
 
 func TestCannotWatchNonExistentRoot(t *testing.T) {
-	config, log, logIndex := newConfigForTesting(t, userName)
-	tree, err := New(config, log, logIndex)
+	config, user := newConfigForTesting(t, userName)
+	tree, err := New(config, user)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -451,6 +454,43 @@ func TestMoveDownWatchers(t *testing.T) {
 		if moved := len(test.node.watchers) == 1; moved != test.moved {
 			t.Errorf("#%d: moved = %v, want %v", i, moved, test.moved)
 		}
+	}
+}
+
+func TestClosingTreeTerminatesWatcher(t *testing.T) {
+	config, user := newConfigForTesting(t, userName)
+	tree, err := New(config, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	buildTree(t, tree, config)
+
+	// Get a watcher at the root
+	done := make(chan struct{})
+	ch, err := tree.Watch(mkpath(t, userName+"/"), upspin.WatchNew, done)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Find the watcher internally.
+	if len(tree.root.watchers) != 1 {
+		t.Fatalf("Expected exactly one watcher, got %d", len(tree.root.watchers))
+	}
+	w := tree.root.watchers[0]
+
+	tree.Close()
+
+	// Wait for watcher to close itself.
+	select {
+	case <-ch:
+		// Ok
+	case <-time.After(time.Minute):
+		// Don't wait forever or test will abort without a helpful error message.
+		t.Error("Watcher did not close fast enough")
+	}
+	if !w.isClosed() {
+		t.Fatal("Watcher did not close")
 	}
 }
 
