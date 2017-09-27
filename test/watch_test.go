@@ -19,6 +19,7 @@ import (
 // there is an ErrNotSupported error, returns false. It returns true
 // if there was no error; otherwise it fatals.
 func watchSupported(t *testing.T, r *testenv.Runner) bool {
+	t.Helper()
 	supported, err := watchNotSupportedError(t, r)
 	if err != nil {
 		t.Fatal(err)
@@ -36,6 +37,22 @@ func watchNotSupportedError(t *testing.T, r *testenv.Runner) (bool, error) {
 		return false, nil
 	}
 	return true, err
+}
+
+func watchEventsSameSequence(t *testing.T, r *testenv.Runner) {
+	t.Helper()
+	for i, event := range r.Events {
+		if event.Error != nil {
+			continue
+		}
+		entry := event.Entry
+		if entry == nil {
+			t.Fatalf("nil entry in event %d", i)
+		}
+		if event.Sequence != entry.Sequence {
+			t.Errorf("mismatched sequence at event %d: Entry %d; Event %d", i, entry.Sequence, event.Sequence)
+		}
+	}
 }
 
 func testWatchCurrent(t *testing.T, r *testenv.Runner) {
@@ -66,6 +83,8 @@ func testWatchCurrent(t *testing.T, r *testenv.Runner) {
 		t.Fatal(r.Diag())
 	}
 
+	watchEventsSameSequence(t, r)
+
 	// Put an Access file; watch it appear on the channel.
 	r.Put(access, accessContent)
 	r.GetNEvents(2)
@@ -95,7 +114,7 @@ func testWatchCurrent(t *testing.T, r *testenv.Runner) {
 	if !r.GotEvent(base, !hasBlocks) {
 		t.Fatal(r.Diag())
 	}
-	if !r.GotEvent(access, !hasBlocks) {
+	if !r.GotEvent(access, hasBlocks) {
 		t.Fatal(r.Diag())
 	}
 	if !r.GotEvent(file, !hasBlocks) {
@@ -105,6 +124,7 @@ func testWatchCurrent(t *testing.T, r *testenv.Runner) {
 	if r.GetNEvents(1) {
 		t.Fatalf("Channel had more events")
 	}
+	watchEventsSameSequence(t, r)
 }
 
 // Test some error conditions.
@@ -123,7 +143,7 @@ func testWatchErrors(t *testing.T, r *testenv.Runner) {
 		t.Fatal(r.Diag())
 	}
 
-	r.DirWatch(base, 777)
+	r.DirWatch(base, upspin.WatchCurrent)
 	if !watchSupported(t, r) {
 		return
 	}
@@ -134,9 +154,9 @@ func testWatchErrors(t *testing.T, r *testenv.Runner) {
 		t.Fatalf("expected Watch error for bad file name %q", badFile)
 	}
 
-	// 777 is an implausible order number, at least in this test.
+	// 777777 is an implausible sequence number, at least in this test.
 	// TODO: Find a better way to test this.
-	r.DirWatch(base, 777)
+	r.DirWatch(base, 777777)
 	if r.Failed() {
 		t.Fatal(r.Diag())
 	}
@@ -179,6 +199,7 @@ func testWatchNonExistentFile(t *testing.T, r *testenv.Runner) {
 	if !r.GotEvent(file, hasBlocks) {
 		t.Fatal(r.Diag())
 	}
+	watchEventsSameSequence(t, r)
 }
 
 func testWatchNonExistentDir(t *testing.T, r *testenv.Runner) {
@@ -217,6 +238,7 @@ func testWatchNonExistentDir(t *testing.T, r *testenv.Runner) {
 	if !r.GotEvent(file, hasBlocks) {
 		t.Fatal(r.Diag())
 	}
+	watchEventsSameSequence(t, r)
 }
 
 func testWatchForbiddenFile(t *testing.T, r *testenv.Runner) {
@@ -262,6 +284,7 @@ func testWatchForbiddenFile(t *testing.T, r *testenv.Runner) {
 	if !r.GotEvent(file, hasBlocks) {
 		t.Fatal(r.Diag())
 	}
+	watchEventsSameSequence(t, r)
 }
 
 func testWatchSubtree(t *testing.T, r *testenv.Runner) {
@@ -298,6 +321,7 @@ func testWatchSubtree(t *testing.T, r *testenv.Runner) {
 	if !r.GotEvent(dirFile, hasBlocks) {
 		t.Fatal(r.Diag())
 	}
+	watchEventsSameSequence(t, r)
 }
 
 func testWatchNonExistentRoot(t *testing.T, r *testenv.Runner) {
