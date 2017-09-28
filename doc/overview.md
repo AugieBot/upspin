@@ -111,7 +111,7 @@ suffix).
 Primary users can therefore make changes to entries on the key server for their
 name with a suffix.
 For example, `ann@example.com` may change the keys and the store and directory
-endpoints for`ann+camera@example.com`.
+endpoints for `ann+camera@example.com`.
 The converse, however, is not allowed: `ann+camera@example.com` cannot make
 changes to `ann@example.com`.
 
@@ -243,7 +243,7 @@ these services.
 For example, to read the file `ann@example.com/file`, the operation proceeds
 like this:
 
-*   Extract the the user name of its owner, which is always the beginning of
+*   Extract the user name of its owner, which is always the beginning of
 the Upspin name: `ann@example.com`.
 *   Look up `ann@example.com` in the key server at `key.upspin.io` to find the
 network address of her directory server.
