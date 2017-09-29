@@ -47,23 +47,24 @@ instructions below.
 
 ## Install the Upspin commands
 
-Upspin is written in Go, so the first step is to install the Go tool chain.
-You will need Go version 1.8 or later.
-You can get it from
-[https://golang.org/doc/install](https://golang.org/doc/install).
+Download an archive of the Upspin command-line tools from [the download
+page](/dl/), and extract it to a directory that's in your system `PATH`.
 
-Once you have Go installed, Upspin can be fetched by running, in a terminal,
-the command
+The archive includes the `upspin` command-line tool (to create, access, share,
+and administer data stored in Upspin), the `cacheserver` daemon (a cache for
+remote Upspin data), and, on macOS and Linux systems, the `upspinfs` program (a
+[FUSE](https://github.com/libfuse/libfuse) filesystem, to mount the Upspin file
+system in your local file tree).
 
+> If your operating system is not listed on the download page, you can obtain
+> the binaries by installing Upspin from source.
+> First [install Go](https://golang.org/doc/install) and then use `go get` to
+> fetch Upspin and its dependencies and build them:
+> ```
+$ go get upspin.io/cmd/...
 ```
-$ go get -u upspin.io/...
-```
-
-This will install all the libraries, plus tools such as the `upspin` command
-that provides a command-line interface to create, access, share, and administer
-data stored in Upspin.
-If you are on a Unix system, it will also install the `upspinfs` program, which
-uses FUSE to connect the Upspin name space to your local file tree.
+> This will install the Upspin commands to `$GOPATH/bin`, which you should add
+> to your system `PATH` if you haven't already.
 
 ## Generating keys and registering your identity
 
@@ -73,12 +74,37 @@ The public key is registered with the public key server and is available to
 everyone, while the private key is kept in secret by the user, such as on a
 local workstation or other private device.
 
+**Note: As part of the signup process,
+the system will create a secret key for you.
+It is vital that you do not lose or share this key or its "secret seed"
+(which is equivalent to the key itself).
+If you lose your key and its secret seed
+you will lose access to this Upspin identity,
+including all the data you have stored and even the ability
+to use your registered user name.
+There is no way to recover a lost key.
+The high security that Upspin offers would be compromised if
+there were an account recovery mechanism.**
+
+**Read the rest of this section carefully before proceeding.**
+
 To register your details with the key server takes two steps.
 
-First, the `upspin signup` command generates a key pair, saves it locally, and
-sends the user details and the public key to the key server.
-It also creates a local copy of the information called a "config" file that
-it stores in a local directory, typically `$HOME/upspin`.
+The first step in registration is to run an `upspin signup` command,
+which generates a key pair
+(one secret key, one public key), saves the keys locally, and
+sends the your details, including your public key to the key server.
+The public key is be published to the shared
+Upspin key server, but the secret key
+is stored only on your local computer.
+
+The locations provided as the `server`, `dir`, and `store` parameters when
+registering an identity are recorded in the key server.
+Other users can then look up your name in the key server to learn the locations
+of your directory and store servers.
+The registration process also creates a local copy of the information
+called a "config" file that it stores in a local directory, typically
+`$HOME/upspin`.
 Config files are discussed in detail in [Upspin configuration](/doc/config.md).
 You should read that document to see how to set up your Upspin environment,
 including things like local caches.
@@ -87,6 +113,13 @@ The second step is to receive an email message from the key server and to click
 the confirmation link that it contains.
 Visiting that link proves to the key server that you control the email address
 that you are registering and completes the signup process.
+From here on, the email address serves as your Upspin user name.
+However, after this account verification step Upspin will never use it as an actual
+email address again.
+At this point you could even cancel the email account, if you chose to do so,
+without affecting your Upspin user name.
+In fact, even if the email account is later hijacked, the
+attacker will not be able to get access to your Upspin account.
 
 You may use your regular email address or an
 Upspin-specific one; either way is fine.
@@ -139,8 +172,17 @@ please read it for further instructions.
 
 ---
 
-The output is self-explanatory.
-Its key points are that it has written a config file for you, created your
+**In that output when you run that command
+is a string that you can use to recreate the secret key
+should you lose the key or wish to install it on a new computer.
+This "secret seed" serves as a human-readable version of the key.
+(The computer-readable version is just a very long number.)
+Write down this secret seed (the one you receive, not the
+one in the example), keep it somewhere safe and do not lose it.
+It is literally your key to Upspin.**
+
+The rest of the output is self-explanatory.
+Its main points are that it has written a config file for you, created your
 keys, and output the instructions to recover your keys if you lose them one day.
 Finally it prints the mail to send to tell the Upspin key server about you.
 Please read it carefully.
@@ -154,13 +196,19 @@ requests it.
 (Your public key is needed for securing and sharing Upspin files, and it's safe
 to share.)
 
-**Pay attention to the text in the output about remembering your "secret seed".
-It provides a way to regenerate your keys if you lose them.**
+**Again, make sure to write down your "secret seed" and do not lose it.**
 
 _Note: If used interactively with a shell that keeps a command history,
 using `keygen` with the `-secretseed` option may cause the secret to be saved in the history file.
 If so, the history file should be cleared after running `keygen`._
 
+If one day you change the location of your directory and store servers, you must
+update the values stored in the key server.
+One easy way to do this is to update the values in `$HOME/config` and run:
+
+```
+$ upspin user | upspin user -put
+```
 
 ## Creating your Upspin directory
 
@@ -229,10 +277,45 @@ cache server that improves performance. The cache server is particularly
 important, and the setup instructions are in the [Upspin configuration](/doc/config.md)
 document.
 
-For details about `upspinfs`, run
+## Browsing Upspin Files on Linux and macOS
+
+Upspin includes a tool called `upspinfs` that creates a virtual filesystem
+where you can access the Upspin name space as a regular mounted file system.
+
+Here is an example of its use.
+
+Make a directory in which to mount the Upspin name space:
 
 ```
-$ go doc upspinfs
+$ mkdir $HOME/up
 ```
 
-TODO: There should be more about `upspinfs`.
+Then run the `upspinfs` command giving that directory as its sole argument:
+
+```
+$ upspinfs $HOME/up
+```
+
+Now you have access to the full Upspin name space:
+
+```
+$ ls $HOME/up/you@gmail.com
+```
+
+The `upspinfs` command will exit when the file system is unmounted.
+
+If you encounter an error when you run `upspinfs` the second time, such as:
+
+```
+mount helper error: fusermount: failed to open mountpoint for reading: Transport endpoint is not connected
+fuse.Mount failed: fusermount: exit status 1
+```
+
+just unmount the directory and try again.
+
+To learn more about `upspinfs`, run
+
+```
+$ go doc upspin.io/cmd/upspinfs
+```
+TODO: Talk about `cacheserver`.
