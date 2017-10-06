@@ -95,7 +95,7 @@ func testWatchCurrent(t *testing.T, r *testenv.Runner) {
 	if !r.GotEvent(base, !hasBlocks) {
 		t.Fatal(r.Diag())
 	}
-	if !r.GotEvent(access, !hasBlocks) {
+	if !r.GotEvent(access, hasBlocks) {
 		t.Fatal(r.Diag())
 	}
 	if !r.GotEvent(file, !hasBlocks) {
@@ -307,7 +307,8 @@ func testWatchNonExistentRoot(t *testing.T, r *testenv.Runner) {
 	if !supported {
 		return
 	}
-	if !errors.Match(errNotExist, err) {
+	// TODO(adg): match against errNotExist when issue #475 is resolved.
+	if !errors.Match(errors.E(errors.IO), err) {
 		t.Fatalf("Expected %v, got %v", errNotExist, err)
 	}
 }
