@@ -20,6 +20,7 @@ import (
 	"upspin.io/flags"
 	"upspin.io/log"
 	"upspin.io/rpc/local"
+	"upspin.io/version"
 
 	_ "upspin.io/pack/ee"
 	_ "upspin.io/pack/eeintegrity"
@@ -37,7 +38,12 @@ func usage() {
 
 func main() {
 	flag.Usage = usage
-	flags.Parse(flags.Server, "cachedir")
+	flags.Parse(flags.Server, "cachedir", "prudent", "version")
+
+	if flags.Version {
+		fmt.Print(version.Version())
+		return
+	}
 
 	if flag.NArg() != 1 {
 		usage()
@@ -52,6 +58,7 @@ func main() {
 
 	// Set any flags contained in the config.
 	if err := config.SetFlagValues(cfg, cmdName); err != nil {
+		log.Printf("%T", err)
 		log.Fatalf("%s: %s", cmdName, err)
 	}
 
