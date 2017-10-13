@@ -77,6 +77,9 @@ func (s *server) Lookup(name upspin.PathName) (*upspin.DirEntry, error) {
 	}
 
 	if de, err, ok := s.clog.lookup(name); ok {
+		if err == nil && de != nil && de.Attr == upspin.AttrLink {
+			err = upspin.ErrFollowLink
+		}
 		return de, err
 	}
 
@@ -124,7 +127,7 @@ func (s *server) Put(entry *upspin.DirEntry) (*upspin.DirEntry, error) {
 
 	// Since the directory server needs to read the Access/Group file
 	// we need to ensure that it is flushed from any cache before the Put.
-	if s.flushBlock != nil && (access.IsAccessFile(entry.Name) || access.IsGroupFile(entry.Name)) {
+	if s.flushBlock != nil && access.IsAccessControlFile(entry.Name) {
 		for _, b := range entry.Blocks {
 			s.flushBlock(b.Location)
 		}
@@ -132,6 +135,9 @@ func (s *server) Put(entry *upspin.DirEntry) (*upspin.DirEntry, error) {
 	de, err := dir.Put(entry)
 	if err == nil {
 		// If the put worked, remember it.
+		if de != nil {
+			entry.Sequence = de.Sequence
+		}
 		s.clog.logRequest(putReq, name, err, entry)
 	}
 
@@ -176,7 +182,7 @@ func (s *server) WhichAccess(name upspin.PathName) (*upspin.DirEntry, error) {
 }
 
 // Watch implements upspin.DirServer.
-func (s *server) Watch(name upspin.PathName, order int64, done <-chan struct{}) (<-chan upspin.Event, error) {
+func (s *server) Watch(name upspin.PathName, sequence int64, done <-chan struct{}) (<-chan upspin.Event, error) {
 	op := logf("Watch %q", name)
 
 	name = path.Clean(name)
@@ -185,12 +191,11 @@ func (s *server) Watch(name upspin.PathName, order int64, done <-chan struct{}) 
 		op.log(err)
 		return nil, err
 	}
-	return dir.Watch(name, order, done)
+	return dir.Watch(name, sequence, done)
 }
 
 func (s *server) Endpoint() upspin.Endpoint { return s.authority }
 func (s *server) Close()                    {}
-func (s *server) Ping() bool                { return true }
 
 func logf(format string, args ...interface{}) operation {
 	s := fmt.Sprintf(format, args...)
