@@ -12,7 +12,6 @@ package inprocess // import "upspin.io/dir/inprocess"
 // For the purposes of the Merkle tree, the reference is stored in entry.Blocks[0].Location.
 
 import (
-	"strings"
 	"sync"
 
 	"upspin.io/access"
@@ -45,10 +44,7 @@ func New(config upspin.Config) upspin.DirServer {
 
 // Used to store directory entries.
 // All directories are encoded with this packing.
-var (
-	dirPacking = upspin.EEPack
-	dirPacker  = pack.Lookup(dirPacking)
-)
+var dirPacking = upspin.EEPack
 
 // server implements the upspin.DirServer interface. It is a multiplexed
 // by user onto a database.
@@ -143,18 +139,6 @@ func (s *server) newDirEntry(name upspin.PathName, cleartext []byte, seq int64) 
 	return newDirEntry(s.db.dirConfig, dirPacking, name, cleartext, upspin.AttrDirectory, "", seq)
 }
 
-// dirBlock constructs an upspin.DirBlock with the appropriate fields.
-func dirBlock(config upspin.Config, ref upspin.Reference, offset int64, blob []byte) upspin.DirBlock {
-	return upspin.DirBlock{
-		Location: upspin.Location{
-			Endpoint:  config.StoreEndpoint(),
-			Reference: ref,
-		},
-		Offset: offset,
-		Size:   int64(len(blob)),
-	}
-}
-
 // makeRoot creates a new user root.
 // s.db is locked.
 func (s *server) makeRoot(parsed path.Parsed) (*upspin.DirEntry, error) {
@@ -199,8 +183,18 @@ func (s *server) Put(entry *upspin.DirEntry) (*upspin.DirEntry, error) {
 			// A Group file may be in a subdirectory; it's only Access files we worry about.
 			return nil, errors.E(op, entry.Name, errors.Invalid, errors.Str("cannot create a directory named Access"))
 		}
-		if entry.Packing != upspin.EEIntegrityPack && !entry.IsDir() {
-			return nil, errors.E(op, entry.Name, errors.Str("Access or Group file must use integrity packing"))
+		if !entry.IsDir() {
+			packer := pack.Lookup(entry.Packing)
+			if packer == nil {
+				return nil, errors.E(op, entry.Name, errors.Errorf("unknown packing %d", entry.Packing))
+			}
+			ok, err := packer.UnpackableByAll(entry)
+			if err != nil {
+				return nil, errors.E(op, entry.Name, err)
+			}
+			if !ok {
+				return nil, errors.E(op, entry.Name, errors.Str("Access or Group files must be readable by access.AllUsers"))
+			}
 		}
 		if entry.IsLink() {
 			return nil, errors.E(op, entry.Name, errors.Str("cannot create a link named Access or Group"))
@@ -392,7 +386,7 @@ func (s *server) WhichAccess(pathName upspin.PathName) (*upspin.DirEntry, error)
 	}
 	if errors.Match(err, notExist) {
 		// The parent must exist.
-		entry, err = s.lookup(op, parsed.Drop(1), true)
+		_, err = s.lookup(op, parsed.Drop(1), true)
 		if err != nil {
 			// Always say Private to avoid giving information away.
 			// We know it's not a link.
@@ -550,7 +544,9 @@ func (s *server) Lookup(pathName upspin.PathName) (*upspin.DirEntry, error) {
 		if !canAny {
 			return nil, s.errPerm(op, parsed)
 		}
-		entry.MarkIncomplete()
+		if !access.IsAccessControlFile(entry.SignedName) {
+			entry.MarkIncomplete()
+		}
 	}
 	return entry, nil
 }
@@ -605,10 +601,6 @@ func (s *server) Glob(pattern string) ([]*upspin.DirEntry, error) {
 	return entries, err
 }
 
-func isGlobPattern(elem string) bool {
-	return strings.ContainsAny(elem, `*?[]`)
-}
-
 // listDir implements serverutil.ListFunc.
 // dirName should always be a directory.
 func (s *server) listDir(dirName upspin.PathName) ([]*upspin.DirEntry, error) {
@@ -621,15 +613,9 @@ func (s *server) listDir(dirName upspin.PathName) ([]*upspin.DirEntry, error) {
 	}
 
 	// Fetch the directory's DirEntry.
-	dir, err := s.lookup(op, parsed, true)
-	if err == upspin.ErrFollowLink {
-		return []*upspin.DirEntry{dir}, err
-	}
-	if err != nil {
-		return nil, err
-	}
-	if !dir.IsDir() {
-		return nil, errors.E(op, dir.Name, errors.NotDir)
+	dir, listErr := s.lookup(op, parsed, true)
+	if listErr == upspin.ErrFollowLink {
+		return []*upspin.DirEntry{dir}, listErr
 	}
 
 	// Check that we have list rights for the directory.
@@ -640,6 +626,12 @@ func (s *server) listDir(dirName upspin.PathName) ([]*upspin.DirEntry, error) {
 	}
 	if !canList {
 		return nil, errors.E(op, dirName, errors.Private)
+	}
+	if listErr != nil {
+		return nil, listErr
+	}
+	if !dir.IsDir() {
+		return nil, errors.E(op, dir.Name, errors.NotDir)
 	}
 
 	// Fetch the directory's contents.
@@ -656,7 +648,9 @@ func (s *server) listDir(dirName upspin.PathName) ([]*upspin.DirEntry, error) {
 			return nil, errors.E(op, dir.Name, err)
 		}
 		if !canRead {
-			e.MarkIncomplete()
+			if !access.IsAccessControlFile(e.SignedName) {
+				e.MarkIncomplete()
+			}
 		}
 		results = append(results, &e)
 	}
@@ -876,11 +870,6 @@ func (s *server) Endpoint() upspin.Endpoint {
 		Transport: upspin.InProcess,
 		NetAddr:   "", // Ignored.
 	}
-}
-
-// Ping implements upspin.DirServer.Ping.
-func (s *server) Ping() bool {
-	return true
 }
 
 // Close implements upspin.server.

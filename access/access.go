@@ -505,7 +505,7 @@ func IsAccessFile(pathName upspin.PathName) bool {
 		return false
 	}
 	// Must end "/Access".
-	return parsed.NElem() >= 1 && parsed.Elem(parsed.NElem()-1) == "Access"
+	return parsed.NElem() >= 1 && parsed.Elem(parsed.NElem()-1) == AccessFile
 }
 
 // IsGroupFile reports whether the pathName contains a directory in the root named Group, which is special.
@@ -516,6 +516,25 @@ func IsGroupFile(pathName upspin.PathName) bool {
 	}
 	// Need "a@b.c/Group/file", but file can't be Access.
 	return parsed.NElem() >= 2 && parsed.Elem(0) == GroupDir && parsed.Elem(parsed.NElem()-1) != AccessFile
+}
+
+// IsAccessControlFile reports whether the pathName represents a file used for
+// access control. At the moment that means either an Access or a Group file.
+func IsAccessControlFile(pathName upspin.PathName) bool {
+	parsed, err := path.Parse(pathName)
+	if err != nil {
+		return false
+	}
+	nElem := parsed.NElem()
+	// To be an Access file, must end "/Access".
+	if nElem >= 1 && parsed.Elem(nElem-1) == AccessFile {
+		return true
+	}
+	// To be a Group file, need "a@b.c/Group/file". Don't worry about Access file; that's already done.
+	if nElem >= 2 && parsed.Elem(0) == GroupDir {
+		return true
+	}
+	return false
 }
 
 // AddGroup installs a group with the specified name and textual contents,
@@ -537,6 +556,7 @@ func AddGroup(pathName upspin.PathName, contents []byte) error {
 }
 
 // RemoveGroup undoes the installation of a group added by AddGroup.
+// It returns an error if the path is bad or the group is not present.
 func RemoveGroup(pathName upspin.PathName) error {
 	const op = "access.RemoveGroup"
 	parsed, err := path.Parse(pathName)
@@ -622,7 +642,7 @@ func (a *Access) canNoGroupLoad(requester upspin.UserName, right Right, pathName
 	}
 	// If the file is an Access or Group file, the owner has full rights always; no one else
 	// can write it.
-	if IsAccessFile(pathName) || IsGroupFile(pathName) {
+	if IsAccessControlFile(pathName) {
 		switch right {
 		case Write, Create, Delete:
 			return isOwner, nil, nil
@@ -737,10 +757,7 @@ func (a *Access) Can(requester upspin.UserName, right Right, pathName upspin.Pat
 // needs to resolve the answer, it returns a list of the group files it needs to have read for it.
 // The caller should fetch these and report them with the AddGroup method, then retry.
 // TODO: use this in Can.
-func (a *Access) expandGroups(toExpand []upspin.PathName) ([]upspin.UserName, []upspin.PathName) {
-	var missingGroups []upspin.PathName
-	var userNames []upspin.UserName
-Outer:
+func (a *Access) expandGroups(toExpand []upspin.PathName) (userNames []upspin.UserName, missingGroups []upspin.PathName) {
 	for i := 0; i < len(toExpand); i++ { // not range since list may grow
 		group := toExpand[i]
 		mu.RLock()
@@ -749,33 +766,38 @@ Outer:
 		if found {
 			for _, p := range usersFromGroup {
 				if p.IsRoot() {
+					// Dups are okay here, unique sorting is done by caller when no more missingGroups are found.
 					userNames = append(userNames, p.User())
 				} else {
 					// This means there are nested Groups.
 					// Add it to the list to expand if not already there.
-					newGroupToExpand := p.Path()
-					for _, te := range toExpand {
-						if te == newGroupToExpand {
-							continue Outer
-						}
-					}
-					toExpand = append(toExpand, newGroupToExpand)
+					toExpand = appendUnique(toExpand, p.Path())
 				}
 			}
 		} else {
 			// Add to missingGroups if not already there.
-			for _, mg := range missingGroups {
-				if string(group) == string(mg) {
-					continue Outer
-				}
-			}
-			missingGroups = append(missingGroups, group)
+			// (This could be done via a sorted list but is not.  Expect the list to remain short.)
+			missingGroups = appendUnique(missingGroups, group)
 		}
 	}
-	if len(missingGroups) > 0 {
-		return userNames, missingGroups
+	return
+}
+
+// appendUnique returns slice, with elem appended unless elem is already a member.
+func appendUnique(slice []upspin.PathName, elem upspin.PathName) []upspin.PathName {
+	if contains(slice, elem) {
+		return slice
 	}
-	return userNames, nil
+	return append(slice, elem)
+}
+
+func contains(haystack []upspin.PathName, needle upspin.PathName) bool {
+	for _, hay := range haystack {
+		if hay == needle {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Access) getListFor(right Right) ([]path.Parsed, error) {
