@@ -15,16 +15,6 @@ func create(name upspin.PathName) upspin.File {
 	return Writable(&dummyClient{}, name)
 }
 
-func setupFileIO(fileName upspin.PathName, max int, t *testing.T) (upspin.File, []byte) {
-	f := create(fileName)
-	// Create a data set with each byte equal to its offset.
-	data := make([]byte, max)
-	for i := range data {
-		data[i] = uint8(i)
-	}
-	return f, data
-}
-
 const (
 	dummyData = "This is some dummy data."
 )
@@ -58,7 +48,6 @@ func TestFileOverflow(t *testing.T) {
 	defer func() { maxInt = int64(^uint(0) >> 1) }()
 	const (
 		user     = "overflow@google.com"
-		root     = user + "/"
 		fileName = user + "/" + "file"
 	)
 	// Write.
@@ -72,7 +61,7 @@ func TestFileOverflow(t *testing.T) {
 	if n != int(maxInt) {
 		t.Fatalf("write file: expected %d got %d", maxInt, n)
 	}
-	n, err = f.Write(make([]byte, maxInt))
+	_, err = f.Write(make([]byte, maxInt))
 	if err == nil {
 		t.Fatal("write file: expected overflow")
 	}
@@ -94,7 +83,7 @@ func TestFileOverflow(t *testing.T) {
 	if n64 != maxInt {
 		t.Fatalf("seek file: expected %d got %d", maxInt, n64)
 	}
-	n64, err = f.Seek(maxInt+1, 0)
+	_, err = f.Seek(maxInt+1, 0)
 	if err == nil {
 		t.Fatal("seek past file: expected error")
 	}
@@ -108,13 +97,11 @@ func TestFileOverflow(t *testing.T) {
 	if n64 != maxInt {
 		t.Fatalf("seek filex: expected %d got %d", maxInt, n64)
 	}
-	n64, err = f.Seek(maxInt+1, 0)
+	_, err = f.Seek(maxInt+1, 0)
 	if err == nil {
 		t.Fatal("seek maxint+1 filex: expected error")
 	}
 }
-
-var loc0 upspin.Location
 
 type dummyClient struct {
 	putData []byte
@@ -158,5 +145,8 @@ func (d *dummyClient) DirServer(name upspin.PathName) (upspin.DirServer, error) 
 	return nil, nil
 }
 func (d *dummyClient) Rename(oldName, newName upspin.PathName) error {
+	return nil
+}
+func (d *dummyClient) SetTime(name upspin.PathName, t upspin.Time) error {
 	return nil
 }
