@@ -826,6 +826,10 @@ func testGlobErrors(t *testing.T, r *testenv.Runner) {
 	if !r.Match(errPrivate) {
 		t.Fatal(r.Diag())
 	}
+	r.Glob(base + "/nonexistent/*")
+	if !r.Match(errPrivate) {
+		t.Fatal(r.Diag())
+	}
 	r.Glob(base + "/*/*")
 	if !r.Match(errPrivate) {
 		t.Fatal(r.Diag())
@@ -1051,6 +1055,13 @@ func testGlobLinkErrors(t *testing.T, r *testenv.Runner) {
 		t.Fatalf("entry 1 == %q, want %q", e1.Name, dir3file)
 	} else if len(e1.Blocks) > 0 {
 		t.Fatalf("entry 1 (%q) has %d blocks, want 0", e1.Name, len(e1.Blocks))
+	}
+
+	// Test that a Glob through a link works.
+	r.As(readerName)
+	r.Glob(dir2link + "/*")
+	if !r.GotEntries(true, dir2access, dir2file) {
+		t.Fatal(r.Diag())
 	}
 }
 
