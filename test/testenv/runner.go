@@ -11,7 +11,9 @@ import (
 	"strings"
 	"time"
 
+	"upspin.io/access"
 	"upspin.io/client"
+	"upspin.io/config"
 	"upspin.io/errors"
 	"upspin.io/upspin"
 )
@@ -44,6 +46,7 @@ type Runner struct {
 	Events []upspin.Event
 
 	user    upspin.UserName
+	configs map[upspin.UserName]upspin.Config
 	clients map[upspin.UserName]upspin.Client
 	events  map[upspin.UserName]<-chan upspin.Event
 
@@ -55,6 +58,7 @@ type Runner struct {
 
 func NewRunner() *Runner {
 	return &Runner{
+		configs: make(map[upspin.UserName]upspin.Config),
 		clients: make(map[upspin.UserName]upspin.Client),
 		events:  make(map[upspin.UserName]<-chan upspin.Event),
 	}
@@ -75,6 +79,7 @@ func (r *Runner) AddUser(cfg upspin.Config) {
 	if r.err != nil {
 		return
 	}
+	r.configs[cfg.UserName()] = cfg
 	r.clients[cfg.UserName()] = client.New(cfg)
 }
 
@@ -90,6 +95,15 @@ func (r *Runner) As(u upspin.UserName) {
 		return
 	}
 	r.user = u
+}
+
+// Config returns the Config for the current user.
+func (r *Runner) Config() upspin.Config {
+	cfg := r.configs[r.user]
+	if cfg == nil {
+		return config.New()
+	}
+	return cfg
 }
 
 // Get performs a Get request as the user
@@ -298,7 +312,8 @@ func (r *Runner) GotEntryWithSequenceVersion(p upspin.PathName, seq int64) bool 
 
 // GotEntries reports whether the names of the Entries match the provided
 // list (in order). It also checks that the presence of block data in
-// those entries matches the boolean.
+// those entries matches the boolean, except it tolerates Access and Group files
+// having blocks even if wantBlockData is false.
 // If not, it notes the discrepancy as the last error state.
 func (r *Runner) GotEntries(wantBlockData bool, ps ...upspin.PathName) bool {
 	if r.Failed() {
@@ -328,8 +343,12 @@ func (r *Runner) GotEntries(wantBlockData bool, ps ...upspin.PathName) bool {
 		if nBlocks > 0 == wantBlockData || r.Entries[i].IsLink() {
 			continue
 		}
+		if nBlocks > 0 && !wantBlockData && access.IsAccessControlFile(r.Entries[i].Name) {
+			// Access and Group file can have blocks in case the reader has any right.
+			continue
+		}
 		if wantBlockData {
-			r.lastErr = errors.Errorf("got entry %q with 0 blocks, want some", got)
+			r.lastErr = errors.Errorf("got entry %q with %d blocks, want some", got, nBlocks)
 		} else {
 			r.lastErr = errors.Errorf("got entry %q with %d blocks, want none", got, nBlocks)
 		}
