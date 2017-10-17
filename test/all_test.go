@@ -23,7 +23,9 @@ import (
 func TestClientFile(t *testing.T) {
 	for _, p := range []upspin.Packing{upspin.PlainPack, upspin.EEIntegrityPack, upspin.EEPack} {
 		t.Run(fmt.Sprintf("packing=%v", p), func(t *testing.T) {
-			testFileSequentialAccess(t, newEnv(t, p))
+			env := newEnv(t, p)
+			defer env.Exit()
+			testFileSequentialAccess(t, env)
 		})
 	}
 }
@@ -113,13 +115,17 @@ func testFileSequentialAccess(t *testing.T, env *testenv.Env) {
 }
 
 func testSequenceNumbers(t *testing.T, r *testenv.Runner) {
+	r.As(ownerName)
+	if r.Config().Value("cache") != "" {
+		t.Skip("skipping sequence number test with cacheserver")
+	}
+
 	const (
 		base   = ownerName + "/sequencenumbers"
 		dir    = base + "/dir"
 		subdir = dir + "/subdir"
 		file   = dir + "/file"
 	)
-	r.As(ownerName)
 	r.MakeDirectory(base)
 	r.DirLookup(base)
 	seq := int64(upspin.SeqBase)
