@@ -41,6 +41,7 @@ var (
 
 	setupTemplate = testenv.Setup{
 		OwnerName: ownerName,
+		UpBox:     true,
 		Cleanup:   cleanup,
 	}
 	readerConfig upspin.Config
@@ -250,6 +251,44 @@ func testDelete(t *testing.T, r *testenv.Runner) {
 	}
 }
 
+// testMetacharacters checks that we can handle files whose names
+// contain Glob metacharacters.
+func testMetacharacters(t *testing.T, r *testenv.Runner) {
+	const (
+		dir            = ownerName + "/foo[*]bar"
+		subDir         = dir + "/inner?"
+		subDirFile     = subDir + "/file[]"
+		subDirFilePath = ownerName + "/foo???bar/in*/file??"
+		contents       = "some text"
+	)
+	r.As(ownerName)
+	r.MakeDirectory(dir)
+	r.MakeDirectory(subDir)
+	r.Put(subDirFile, contents)
+	if r.Failed() {
+		t.Fatal(r.Diag())
+	}
+	r.Get(subDirFile)
+	if r.Failed() {
+		t.Fatal(r.Diag())
+	}
+	if r.Data != contents {
+		t.Errorf("Expected contents %q, got %q", contents, r.Data)
+	}
+
+	// Use Glob to access file a different way to verify it's as we expect.
+	r.Glob(subDirFilePath)
+	checkDirEntry(t, r.Entries[0], subDirFile, hasLocation, len(contents))
+
+	// Now clean up.
+	r.Delete(subDirFile)
+	r.Delete(subDir)
+	r.Delete(dir)
+	if r.Failed() {
+		t.Fatal(r.Diag())
+	}
+}
+
 func testRootDeletion(t *testing.T, r *testenv.Runner) {
 	r.As(readerName)
 
@@ -303,6 +342,7 @@ var integrationTests = []struct {
 	{"ReadAccess", testReadAccess},
 	{"GroupAccess", testGroupAccess},
 	{"WriteReadAllAccessFile", testWriteReadAllAccessFile},
+	{"Metacharacters", testMetacharacters},
 
 	{"Watch", testWatchCurrent},
 	{"WatchErrors", testWatchErrors},
@@ -311,6 +351,7 @@ var integrationTests = []struct {
 	{"WatchForbiddenFile", testWatchForbiddenFile},
 	{"WatchSubtree", testWatchSubtree},
 	{"WatchNonExistentRoot", testWatchNonExistentRoot},
+
 	{"CopyEntries", testCopyEntries},
 	{"Snapshot", testSnapshot},
 	{"DeleteErrors", testDeleteErrors},
@@ -330,6 +371,7 @@ error: cannot find keys for remote test users.
 
 These tests are designed to be run against the test.upspin.io cluster,
 which is only accessible by the Upspin core team at Google.
+See upspin.io/key/testdata/remote/README for details.
 
 Run the test suite with -short to skip these tests.
 `
@@ -346,15 +388,18 @@ func testSelectedOnePacking(t *testing.T, setup testenv.Setup) {
 	}
 
 	if err := cleanup(env); err != nil {
+		env.Exit()
 		t.Fatal(err)
 	}
 
 	readerConfig, err = env.NewUser(readerName)
 	if err != nil {
+		env.Exit()
 		t.Fatal(err)
 	}
 	snapshotConfig, err := env.NewUser(snapshotUser)
 	if err != nil {
+		env.Exit()
 		t.Fatal(err)
 	}
 
@@ -380,25 +425,27 @@ func testSelectedOnePacking(t *testing.T, setup testenv.Setup) {
 var integrationTestKinds = []string{"inprocess", "server", "remote"}
 
 func TestIntegration(t *testing.T) {
+	type testConfig struct {
+		packing upspin.Packing
+		always  bool // Always run this, even with -short or kind=="remote".
+	}
+	testConfigs := []testConfig{
+		{upspin.PlainPack, false},
+		{upspin.EEIntegrityPack, false},
+		{upspin.EEPack, true},
+	}
 	for _, kind := range integrationTestKinds {
 		t.Run(fmt.Sprintf("kind=%v", kind), func(t *testing.T) {
-			if testing.Short() && kind == "remote" {
-				t.Skip("skipping network-based tests while -test.short specified")
-			}
 			setup := setupTemplate
 			setup.Kind = kind
-			for _, p := range []struct {
-				packing  upspin.Packing
-				remoteOK bool
-			}{
-				{upspin.PlainPack, false},
-				{upspin.EEIntegrityPack, false},
-				{upspin.EEPack, true}, // Only run this test against remote.
-			} {
-				setup.Packing = p.packing
-				t.Run(fmt.Sprintf("packing=%v", p.packing), func(t *testing.T) {
-					if kind == "remote" && !p.remoteOK {
-						t.Skip("skipping test against remote")
+			for _, config := range testConfigs {
+				setup.Packing = config.packing
+				t.Run(fmt.Sprintf("packing=%v", config.packing), func(t *testing.T) {
+					if testing.Short() && (kind == "remote" || !config.always) {
+						t.Skip("skipping remote or extra test with -test.short")
+					}
+					if kind == "remote" && !config.always {
+						t.Skip("skipping extra remote test")
 					}
 					testSelectedOnePacking(t, setup)
 				})
