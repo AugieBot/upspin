@@ -136,9 +136,9 @@ func (s *server) Watch(session rpc.Session, reqBytes []byte, done <-chan struct{
 	if err != nil {
 		return nil, err
 	}
-	op := logf("Watch %q order %d", req.Name, req.Order)
+	op := logf("Watch %q sequence %d", req.Name, req.Sequence)
 
-	events, err := dir.Watch(upspin.PathName(req.Name), req.Order, done)
+	events, err := dir.Watch(upspin.PathName(req.Name), req.Sequence, done)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +195,7 @@ func (op operation) log(err error) {
 }
 
 func (op operation) logf(format string, args ...interface{}) {
-	log.Printf("%s: "+format, append([]interface{}{op}, args...)...)
+	log.Debug.Printf("%s: "+format, append([]interface{}{op}, args...)...)
 }
 
 // entryError performs the common operation of converting a directory entry
