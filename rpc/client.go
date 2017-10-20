@@ -19,7 +19,6 @@ import (
 
 	"upspin.io/bind"
 	"upspin.io/errors"
-	"upspin.io/log"
 	"upspin.io/rpc/local"
 	"upspin.io/upspin"
 
@@ -29,7 +28,6 @@ import (
 // Client is a partial upspin.Service that uses HTTP as a transport
 // and implements authentication using out-of-band headers.
 type Client interface {
-	Ping() bool
 	Close()
 
 	// Invoke calls the given RPC method ("Server/Method") with the
@@ -109,7 +107,11 @@ func NewClient(cfg upspin.Config, netAddr upspin.NetAddr, security SecurityLevel
 		}
 		c.baseURL = "http://" + string(netAddr)
 	case Secure:
-		tlsConfig = &tls.Config{RootCAs: cfg.CertPool()}
+		certPool, err := certPoolFromConfig(cfg)
+		if err != nil {
+			return nil, errors.E(op, errors.Invalid, err)
+		}
+		tlsConfig = &tls.Config{RootCAs: certPool}
 		c.baseURL = "https://" + string(netAddr)
 	default:
 		return nil, errors.E(op, errors.Invalid, errors.Errorf("invalid security level to NewClient: %v", security))
@@ -149,7 +151,6 @@ func (c *httpClient) makeAuthenticatedRequest(op, method string, req pb.Message)
 		// Otherwise prepare an auth request.
 		authMsg, err := signUser(c.config, clientAuthMagic, serverAddr(c))
 		if err != nil {
-			log.Error.Printf("%s: signUser: %s using key %s", op, err, c.config.Factotum().PublicKey())
 			return nil, false, errors.E(op, err)
 		}
 		header.Set(authRequestHeader, strings.Join(authMsg, ","))
@@ -181,7 +182,6 @@ func (c *httpClient) makeRequest(op, method string, req pb.Message, header http.
 	if err != nil {
 		return nil, errors.E(op, errors.IO, err)
 	}
-	c.setLastActivity()
 	return resp, nil
 }
 
@@ -216,6 +216,9 @@ func (c *httpClient) Invoke(method string, req, resp pb.Message, stream Response
 		if httpResp.StatusCode != http.StatusOK {
 			msg, _ := ioutil.ReadAll(httpResp.Body)
 			httpResp.Body.Close()
+			if httpResp.Header.Get("Content-type") == "application/octet-stream" {
+				return errors.E(op, errors.UnmarshalError(msg))
+			}
 			// TODO(edpin,adg): unmarshal and check as it's more robust.
 			if bytes.Contains(msg, []byte(errUnauthenticated.Error())) {
 				// If the server restarted it will have forgotten about
@@ -385,32 +388,15 @@ func (c *httpClient) isProxy() bool {
 }
 
 // Stubs for unused methods.
-func (c *httpClient) Ping() bool { return true }
-func (c *httpClient) Close()     {}
+func (c *httpClient) Close() {}
 
 // clientAuth tracks the auth token and its freshness.
 type clientAuth struct {
 	config upspin.Config
 
-	mu              sync.Mutex // protects the fields below.
-	token           string
-	lastRefresh     time.Time
-	lastNetActivity time.Time // last known time of some network activity.
-}
-
-// lastActivity reports the time of the last known network activity.
-func (ca *clientAuth) lastActivity() time.Time {
-	ca.mu.Lock()
-	defer ca.mu.Unlock()
-	return ca.lastNetActivity
-}
-
-// setLastActivity records the current time as that of the last known network activity.
-// It is used to prevent unnecessarily frequent pings.
-func (ca *clientAuth) setLastActivity() {
-	ca.mu.Lock()
-	ca.lastNetActivity = time.Now()
-	ca.mu.Unlock()
+	mu          sync.Mutex // protects the fields below.
+	token       string
+	lastRefresh time.Time
 }
 
 // invalidateSession forgets the authentication token.
@@ -471,10 +457,5 @@ func (ca *clientAuth) verifyServerUser(msg []string) error {
 	}
 
 	// Validate signature.
-	err = verifyUser(key.PublicKey, msg, serverAuthMagic, "[localproxy]", time.Now())
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return verifyUser(key.PublicKey, msg, serverAuthMagic, "[localproxy]", time.Now())
 }

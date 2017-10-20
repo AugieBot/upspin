@@ -16,13 +16,11 @@ import (
 	"time"
 
 	pb "github.com/golang/protobuf/proto"
-	gContext "golang.org/x/net/context"
 
 	"upspin.io/errors"
 	"upspin.io/factotum"
 	"upspin.io/log"
 	"upspin.io/upspin"
-	"upspin.io/upspin/proto"
 	"upspin.io/valid"
 )
 
@@ -190,7 +188,7 @@ func (s *serverImpl) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func sendResponse(w http.ResponseWriter, resp pb.Message, err error) {
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		sendError(w, err)
 		return
 	}
 	payload, err := pb.Marshal(resp)
@@ -202,11 +200,22 @@ func sendResponse(w http.ResponseWriter, resp pb.Message, err error) {
 	w.Write(payload)
 }
 
+func sendError(w http.ResponseWriter, err error) {
+	if _, ok := err.(*errors.Error); !ok {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	h := w.Header()
+	h.Set("Content-type", "application/octet-stream")
+	w.WriteHeader(http.StatusInternalServerError)
+	w.Write(errors.MarshalError(err))
+}
+
 func serveStream(s Stream, sess Session, w http.ResponseWriter, body []byte) {
 	done := make(chan struct{})
 	msgs, err := s(sess, body, done)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		sendError(w, err)
 		return
 	}
 
@@ -294,11 +303,6 @@ func (s *serverImpl) SessionForRequest(w http.ResponseWriter, r *http.Request) (
 	return s.handleSessionRequest(w, authRequest, proxyRequest, r.Host)
 }
 
-// Ping implements Pinger.
-func (s *serverImpl) Ping(gContext gContext.Context, req *proto.PingRequest) (*proto.PingResponse, error) {
-	return &proto.PingResponse{PingSequence: req.PingSequence}, nil
-}
-
 func (s *serverImpl) validateToken(authToken string) (Session, error) {
 	if len(authToken) < authTokenEntropyLen {
 		return nil, errors.E(errors.Invalid, errors.Str("invalid auth token"))
@@ -339,8 +343,8 @@ func (s *serverImpl) handleSessionRequest(w http.ResponseWriter, authRequest []s
 	// set the signed host to that endpoint.
 	ep := &upspin.Endpoint{}
 	if len(proxyRequest) == 1 {
-		if user != s.config.UserName() {
-			return nil, errors.E(errors.Permission, "client and proxy user must match")
+		if pUser := s.config.UserName(); user != pUser {
+			return nil, errors.E(errors.Permission, errors.Errorf("client %q and proxy %q users mismatched", user, pUser))
 		}
 		ep, err = upspin.ParseEndpoint(proxyRequest[0])
 		if err != nil {
@@ -426,7 +430,7 @@ func signUser(cfg upspin.Config, magic, host string) ([]string, error) {
 	}
 	f := cfg.Factotum()
 	if f == nil {
-		return nil, errors.Str("no factotum available")
+		return nil, errors.E(cfg.UserName(), errors.Str("no factotum available"))
 	}
 
 	user := string(cfg.UserName())
