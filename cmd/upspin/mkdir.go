@@ -4,21 +4,46 @@
 
 package main
 
-import "flag"
+import (
+	"flag"
+
+	"upspin.io/errors"
+	"upspin.io/path"
+	"upspin.io/upspin"
+)
 
 func (s *State) mkdir(args ...string) {
 	const help = `
 Mkdir creates Upspin directories.
+
+The -glob flag can be set to false to have mkdir skip Glob processing,
+treating its arguments as literal text even if they contain special
+characters. (Leading @ signs are always expanded.)
 `
 	fs := flag.NewFlagSet("mkdir", flag.ExitOnError)
-	s.ParseFlags(fs, args, help, "mkdir directory...")
+	parent := fs.Bool("p", false, "Make all parent directories.")
+	glob := globFlag(fs)
+	s.ParseFlags(fs, args, help, "mkdir [-p] directory...")
 	if fs.NArg() == 0 {
 		usageAndExit(fs)
 	}
-	for _, name := range s.GlobAllUpspinPath(fs.Args()) {
-		_, err := s.Client.MakeDirectory(name)
-		if err != nil {
-			s.Exit(err)
-		}
+	for _, name := range s.expandUpspin(fs.Args(), *glob) {
+		s.doMkdir(name, *parent)
+	}
+}
+
+func (s *State) doMkdir(name upspin.PathName, parent bool) {
+	p, err := path.Parse(name)
+	if err != nil {
+		s.Exit(err)
+	}
+	_, err = s.Client.MakeDirectory(name)
+	if parent && p.NElem() > 0 && errors.Match(errors.E(errors.NotExist), err) {
+		s.doMkdir(p.Drop(1).Path(), true)
+		s.doMkdir(name, false)
+		return
+	}
+	if err != nil {
+		s.Exit(err)
 	}
 }

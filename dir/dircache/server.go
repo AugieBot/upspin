@@ -76,7 +76,13 @@ func (s *server) Lookup(name upspin.PathName) (*upspin.DirEntry, error) {
 		return nil, err
 	}
 
+	s.clog.globalLock.RLock()
+	defer s.clog.globalLock.RUnlock()
+
 	if de, err, ok := s.clog.lookup(name); ok {
+		if err == nil && de != nil && de.Attr == upspin.AttrLink {
+			err = upspin.ErrFollowLink
+		}
 		return de, err
 	}
 
@@ -96,6 +102,9 @@ func (s *server) Glob(pattern string) ([]*upspin.DirEntry, error) {
 		op.log(err)
 		return nil, err
 	}
+
+	s.clog.globalLock.RLock()
+	defer s.clog.globalLock.RUnlock()
 
 	if entries, err, ok := s.clog.lookupGlob(name); ok {
 		return entries, err
@@ -124,15 +133,28 @@ func (s *server) Put(entry *upspin.DirEntry) (*upspin.DirEntry, error) {
 
 	// Since the directory server needs to read the Access/Group file
 	// we need to ensure that it is flushed from any cache before the Put.
-	if s.flushBlock != nil && (access.IsAccessFile(entry.Name) || access.IsGroupFile(entry.Name)) {
+	if s.flushBlock != nil && access.IsAccessControlFile(entry.Name) {
 		for _, b := range entry.Blocks {
 			s.flushBlock(b.Location)
 		}
 	}
+
+	s.clog.globalLock.Lock()
+	defer s.clog.globalLock.Unlock()
+
 	de, err := dir.Put(entry)
 	if err == nil {
 		// If the put worked, remember it.
+		if de != nil {
+			entry.Sequence = de.Sequence
+		}
 		s.clog.logRequest(putReq, name, err, entry)
+
+		// If this was a Put of the root, retry the watch.
+		parsed, perr := path.Parse(entry.Name)
+		if perr == nil && parsed.IsRoot() {
+			s.clog.retryWatch(parsed)
+		}
 	}
 
 	return de, err
@@ -148,6 +170,9 @@ func (s *server) Delete(name upspin.PathName) (*upspin.DirEntry, error) {
 		op.log(err)
 		return nil, err
 	}
+
+	s.clog.globalLock.Lock()
+	defer s.clog.globalLock.Unlock()
 
 	de, err := dir.Delete(name)
 	s.clog.logRequest(deleteReq, name, err, de)
@@ -166,8 +191,11 @@ func (s *server) WhichAccess(name upspin.PathName) (*upspin.DirEntry, error) {
 		return nil, err
 	}
 
-	if de, ok := s.clog.whichAccess(name); ok {
-		return de, nil
+	s.clog.globalLock.RLock()
+	defer s.clog.globalLock.RUnlock()
+
+	if de, err, ok := s.clog.whichAccess(name); ok {
+		return de, err
 	}
 	de, err := dir.WhichAccess(name)
 	s.clog.logRequest(whichAccessReq, name, err, de)
@@ -176,7 +204,7 @@ func (s *server) WhichAccess(name upspin.PathName) (*upspin.DirEntry, error) {
 }
 
 // Watch implements upspin.DirServer.
-func (s *server) Watch(name upspin.PathName, order int64, done <-chan struct{}) (<-chan upspin.Event, error) {
+func (s *server) Watch(name upspin.PathName, sequence int64, done <-chan struct{}) (<-chan upspin.Event, error) {
 	op := logf("Watch %q", name)
 
 	name = path.Clean(name)
@@ -185,12 +213,11 @@ func (s *server) Watch(name upspin.PathName, order int64, done <-chan struct{}) 
 		op.log(err)
 		return nil, err
 	}
-	return dir.Watch(name, order, done)
+	return dir.Watch(name, sequence, done)
 }
 
 func (s *server) Endpoint() upspin.Endpoint { return s.authority }
 func (s *server) Close()                    {}
-func (s *server) Ping() bool                { return true }
 
 func logf(format string, args ...interface{}) operation {
 	s := fmt.Sprintf(format, args...)
