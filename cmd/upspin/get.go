@@ -6,20 +6,22 @@ package main
 
 import (
 	"flag"
-	"os"
-
-	"upspin.io/subcmd"
 )
 
 func (s *State) get(args ...string) {
 	const help = `
 Get writes to standard output the contents identified by the Upspin path.
+
+The -glob flag can be set to false to have get skip Glob processing,
+treating its argument as literal text even if it contains special
+characters. (A leading @ sign is always expanded.)
 `
 	fs := flag.NewFlagSet("get", flag.ExitOnError)
 	outFile := fs.String("out", "", "output file (default standard output)")
+	glob := globFlag(fs)
 	s.ParseFlags(fs, args, help, "get [-out=outputfile] path")
 
-	names := s.GlobAllUpspinPath(fs.Args())
+	names := s.expandUpspin(fs.Args(), *glob)
 	if len(names) != 1 {
 		usageAndExit(fs)
 	}
@@ -28,16 +30,5 @@ Get writes to standard output the contents identified by the Upspin path.
 	if err != nil {
 		s.Exit(err)
 	}
-	// Write to outfile or to stdout if none set
-	var output *os.File
-	if *outFile == "" {
-		output = os.Stdout
-	} else {
-		output = s.CreateLocal(subcmd.Tilde(*outFile))
-		defer output.Close()
-	}
-	_, err = output.Write(data)
-	if err != nil {
-		s.Exitf("Copying to output failed: %v", err)
-	}
+	s.writeOut(*outFile, data)
 }

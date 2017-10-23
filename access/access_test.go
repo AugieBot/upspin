@@ -350,8 +350,6 @@ func TestHasAccessWithGroups(t *testing.T) {
 	groups = make(map[upspin.PathName][]path.Parsed) // Forget any existing groups in the cache.
 
 	const (
-		owner = upspin.UserName("me@here.com")
-
 		// This access file defines readers and writers but no other rights.
 		accessText = "r: reader@r.com, reader@foo.bar, family\n" +
 			"w: writer@foo.bar\n" +
@@ -359,10 +357,6 @@ func TestHasAccessWithGroups(t *testing.T) {
 
 		// This access file mentions a group that does not exist.
 		missingGroupAccessText = "r: aMissingGroup, family\n"
-
-		// This is a simple group for a family.
-		groupName = upspin.PathName("me@here.com/Group/family")
-		groupText = "# My family\n sister@me.com, brother@me.com\n"
 
 		missingGroupName = upspin.PathName("me@here.com/Group/aMissingGroup")
 	)
@@ -417,6 +411,9 @@ func TestHasAccessWithGroups(t *testing.T) {
 	}
 	// Sister can't read anymore and family group is needed.
 	ok, missingGroups, err := a.canNoGroupLoad("sister@me.com", Read, "me@here.com/foo/bar")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if ok {
 		t.Errorf("Expected no permission")
 	}
@@ -730,6 +727,8 @@ func TestUsersNoGroupLoad(t *testing.T) {
 	}
 	groupsExpected = []string{"bob@foo.com/Group/grandparents"}
 	expectEqual(t, groupsExpected, listFromPathName(groupsNeeded))
+	expectedWriters = []string{"bob@foo.com", "sis@foo.com", "uncle@foo.com"}
+	expectEqual(t, expectedWriters, listFromUserName(writersList))
 	// Add grandparents and for good measure, add the family again.
 	err = AddGroup("bob@foo.com/Group/grandparents", []byte("grandpamoe@antifoo.com family"))
 	if err != nil {
@@ -738,6 +737,9 @@ func TestUsersNoGroupLoad(t *testing.T) {
 	writersList, groupsNeeded, err = acc.usersNoGroupLoad(Write)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if groupsNeeded != nil {
+		t.Fatalf("Round 3: Expected no groups to be needed, got %v", groupsNeeded)
 	}
 	expectedWriters = []string{"bob@foo.com", "sis@foo.com", "uncle@foo.com", "grandpamoe@antifoo.com"}
 	expectEqual(t, expectedWriters, listFromUserName(writersList))
@@ -852,6 +854,42 @@ func TestIsGroupFile(t *testing.T) {
 	}
 }
 
+func TestIsAccessControlFile(t *testing.T) {
+	tests := []struct {
+		name            upspin.PathName
+		isAccessControl bool
+	}{
+		{"a@b.com/Access", true},
+		{"a@b.com/foo/bar/Access", true},
+		{"a@b.com/NotAccess", false},
+		{"a@b.com/Group/Access", true},
+		{"a@b.com//Access/", true},     // Extra slashes don't matter.
+		{"a@b.com//Access/foo", false}, //Access must not be a directory.
+		{"/Access/foo", false},         // No user.
+		{"a@b.com/Group/foo", true},
+		{"a@b.com/Group/foo/bar", true},
+		{"a@b.com/Group/Access", true},
+		{"a@b.com/Group/Access/bar", true},
+		{"a@b.com/Group/foo/Access", true},
+		{"a@b.com//Group/", false},   // No file.
+		{"a@b.com//Group/foo", true}, // Extra slashes don't matter.
+		{"a@b.com/foo/Group", false}, // Group directory must be in root.
+		{"/Group/foo", false},        // No user.
+	}
+	for _, test := range tests {
+		isAccessControl := IsAccessControlFile(test.name)
+		if isAccessControl == test.isAccessControl {
+			continue
+		}
+		if isAccessControl {
+			t.Errorf("%q is not an access control file; IsAccessControlFile says it is", test.name)
+		}
+		if !isAccessControl {
+			t.Errorf("%q is an access control file file; IsAccessControlFile says not", test.name)
+		}
+	}
+}
+
 // match requires the two slices to be equivalent, assuming no duplicates.
 // The print of the path (ignoring the final / for a user name) must match the string.
 // The lists are sorted, because Access.Parse sorts them.
@@ -870,14 +908,6 @@ func match(t *testing.T, want []path.Parsed, expect []string) {
 			t.Errorf("User %s not found in at position %d in list", compare, i)
 			t.Errorf("expect: %q; got %q", expect, want)
 		}
-	}
-}
-
-// expectState checks whether the results of IsAccessFile match with expectations and if not it fails the test.
-func expectState(t *testing.T, expectIsFile bool, pathName upspin.PathName) {
-	isFile := IsAccessFile(pathName)
-	if expectIsFile != isFile {
-		t.Fatalf("Expected %v, got %v", expectIsFile, isFile)
 	}
 }
 
