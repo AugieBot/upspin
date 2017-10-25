@@ -7,6 +7,7 @@ package test
 import (
 	"crypto/rand"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -43,6 +44,11 @@ func testSnapshot(t *testing.T, r *testenv.Runner) {
 	// Take the snapshot.
 	r.As(snapshotUser)
 	r.MakeDirectory(snapshotDir)
+	if err := r.Err(); err != nil && !errors.Match(errors.E(errors.Exist), err) {
+		// It's OK for the snapshot directory to exist already,
+		// as it won't be deleted after previous test runs.
+		t.Fatal(err)
+	}
 	r.Put(snapshotControlFile, "")
 	if r.Failed() {
 		t.Fatal(r.Diag())
@@ -53,8 +59,7 @@ func testSnapshot(t *testing.T, r *testenv.Runner) {
 	r.Get(snapshotControlFile)
 	if !r.Failed() {
 		if r.Data == "" {
-			t.Log("Snapshotting not supported.")
-			return
+			t.Skip("Snapshotting not supported.")
 		}
 		t.Fatalf("Non-empty snapshot control file: %q.", r.Data)
 	}
@@ -68,38 +73,32 @@ func testSnapshot(t *testing.T, r *testenv.Runner) {
 	if r.Failed() {
 		t.Fatal(r.Diag())
 	}
-	// There could be many entries, since snapshots are for the root. Keep
-	// looking until we find what we want.
-	var found upspin.PathName
-	for {
+	// We need should see two entries: the top directory
+	// with the date, and the subdirectory with the time.
+	var snapshot upspin.PathName
+	for i := 0; i < 2; i++ {
 		// We use GetNEvents because we don't have a fixed name to use
-		// with r.GotEvent(name). We need two entries, the top directory
-		// with the date and the sub directory with the time.
-		if !r.GetNEvents(2) {
+		// with r.GotEvent(name).
+		if !r.GetNEvents(1) {
 			t.Fatal(r.Diag())
 		}
-		entry := r.Events[1].Entry
-
-		// Check  entry contents and name.
-		file := path.Join(entry.Name, "snapshot-test", "dir", "file")
-		r.Get(file)
-		if r.Failed() {
-			t.Fatal(r.Diag())
+		entry := r.Events[0].Entry
+		if !strings.Contains(string(entry.Name), ":") {
+			// This is not the snapshot directory.
+			continue
 		}
-		if r.Data == data {
-			found = file
-			break
-		}
+		snapshot = entry.Name
 	}
 	close(done)
-	if found == "" {
+	if snapshot == "" {
 		t.Fatalf("Unable to find a snapshot in %s", snapPattern)
 	}
+	fileInSnapshot := path.Join(snapshot, "snapshot-test", "dir", "file")
 
 	// Ensure no one else can read this snapshotted file, even with a
 	// permissive Access file.
 	r.As(readerName)
-	r.DirLookup(found)
+	r.DirLookup(fileInSnapshot)
 	if !r.Match(errors.E(errors.Private)) {
 		t.Fatal(r.Diag())
 	}
@@ -107,19 +106,19 @@ func testSnapshot(t *testing.T, r *testenv.Runner) {
 	// WhichAccess for a snapshotted name returns nothing, even if the
 	// Access file exists in the path, which is the case here.
 	r.As(ownerName)
-	r.DirWhichAccess(found)
+	r.DirWhichAccess(fileInSnapshot)
 	if !r.GotNilEntry() {
 		t.Fatal(r.Diag())
 	}
 
 	// No one can delete snapshots.
-	r.Delete(found)
+	r.Delete(fileInSnapshot)
 	if !r.Match(errors.E(errors.Permission)) {
 		t.Fatal(r.Diag())
 	}
 
 	// No one can overwrite a snapshot.
-	r.Put(found, "yo")
+	r.Put(fileInSnapshot, "yo")
 	if !r.Match(errors.E(errors.Permission)) {
 		t.Fatal(r.Diag())
 	}
