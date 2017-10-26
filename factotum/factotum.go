@@ -48,6 +48,9 @@ func KeyHash(p upspin.PublicKey) []byte {
 	return keyHash[:]
 }
 
+// AllUsersKeyHash is the hash of upspin.AllUsersKey.
+var AllUsersKeyHash = KeyHash(upspin.AllUsersKey)
+
 // NewFromDir returns a new Factotum providing all needed private key operations,
 // loading keys from a directory containing *.upspinkey files.
 // Our desired end state is that Factotum is implemented on each platform by the
@@ -69,7 +72,7 @@ func NewFromDir(dir string) (upspin.Factotum, error) {
 
 	// Read older key pairs.
 	s2, err := readFile(op, dir, "secret2.upspinkey")
-	if err != nil && !errors.Match(errors.E(errors.NotExist), err) {
+	if err != nil && !errors.Is(errors.NotExist, err) {
 		return nil, err
 	}
 	s2 = stripCR(s2)
@@ -292,7 +295,7 @@ func (f factotum) PublicKey() upspin.PublicKey {
 // PublicKeyFromHash returns the user's public key with matching keyHash.
 func (f factotum) PublicKeyFromHash(keyHash []byte) (upspin.PublicKey, error) {
 	const op = "factotum.PublicKeyFromHash"
-	if keyHash == nil || len(keyHash) == 0 {
+	if len(keyHash) == 0 {
 		return "", errors.E(op, errors.Invalid, errors.Errorf("invalid keyHash"))
 	}
 	var h keyHashArray

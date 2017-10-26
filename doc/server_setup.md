@@ -1,11 +1,34 @@
 # Setting up upspinserver
 
-## Introduction
+## The easy way
 
-This document describes how to create an Upspin installation by deploying
+The [Upspin tools](/dl/) include a program called `upspin-ui` that automates
+the deployment of an `upspinserver` to Google Cloud Platform.
+If you wish to deploy to GCP, try using `upspin-ui` instead of following this
+guide.
+See the [signup document](signup.md) for more information.
+
+## Conventions
+Throughout this document, we will mark commands to be run on your
+local machine with the shell prompt `local$` and commands to be
+run on your server with `server%`.
+
+For example:
+
+```
+local$ upspin signup -server=upspin.example.com you@gmail.com
+```
+and
+```
+server% sudo systemctl stop upspinserver.service
+```
+
+## Introduction
+This document describes the process for creating an Upspin installation by deploying
 an `upspinserver`, a combined Upspin Store and Directory server, to
 a Linux-based machine.
-The installation will use the central Upspin Key server (`key.upspin.io`) for
+
+The installation will use the central Upspin key server (`key.upspin.io`) for
 authentication, which permits inter-operation with other Upspin servers.
 
 There are multiple versions of `upspinserver`, each depending on where the
@@ -19,12 +42,12 @@ for the Google Cloud Platform.
 
 The process follows these steps:
 
-- sign up for an Upspin user account, registering your public key with the
-  central server `key.upspin.io`,
-- configure a domain name and create an Upspin user for the server,
-- if necessary, set up the cloud storage service,
-- deploy the `upspinserver` to a Linux-based server,
-- configure the `upspinserver`.
+- [sign up](#signup) for an Upspin user account
+- [configure](#domain) a domain name and create an Upspin user for the server,
+- if necessary, [set up the cloud](#cloud
+) storage service,
+- [deploy](#deploy) the `upspinserver` to a Linux-based server,
+- [configure](#configure) the `upspinserver`.
 
 Each of these steps (besides deployment) has a corresponding `upspin`
 subcommand to assist you with the process.
@@ -48,27 +71,18 @@ To deploy an `upspinserver` you need to decide on values for:
 - The host name of the server on which `upspinserver` will run.
   (We will use `upspin.example.com` in this document.)
 
-## Sign up for an Upspin account
+## Sign up for an Upspin account {#signup}
 
-Run `upspin signup`, passing your chosen host name as its `-server` argument
+To register your public key with the the central key server run `upspin signup`,
+passing your chosen host name as its `-server` argument
 and your chosen Upspin user name as its final argument.
 Then follow the onscreen instructions.
-
-Throughout this document, we will mark commands to be run on your
-local machine with the shell prompt `local$` and commands to be
-run on your server with `server%`.
-
-For example:
-
-```
-local$ upspin signup -server=upspin.example.com you@gmail.com
-```
 
 The [Signing up a new user](/doc/signup.md) document describes this process in
 detail.
 If you change your mind about the host name, you can update with `upspin user -put`.
 
-## Set up your domain
+## Set up your domain {#domain}
 
 Upspin servers also run as Upspin users, with all the rights and requirements
 that demands, and so they need usernames and key pairs registered with the
@@ -95,7 +109,7 @@ Domain configuration and keys for the user
 were generated and placed under the directory:
 	/home/you/upspin/deploy/example.com
 If you lose the keys you can re-create them by running this command
-	upspin keygen -where /home/you/upspin/deploy/example.com -secretseed zapal-zuhiv-visop-gagil.dadij-lnjul-takiv-fomin
+	upspin keygen -secretseed zapal-zuhiv-visop-gagil.dadij-lnjul-takiv-fomin /home/you/upspin/deploy/example.com
 Write this command down and store it in a secure, private place.
 Do not share your private key or this command with anyone.
 
@@ -174,22 +188,22 @@ TODO upspin-setupstorage stuff
 **If you choose to store your Upspin data on the your server's local disk then
 in the event of a disk failure all your Upspin data will be lost.**
 
-### Specific instructions for cloud services
+### Specific instructions for cloud services {#cloud}
 
 + [Google Cloud Services](/doc/server_setup_gcp.md)
 + [Amazon Web Services](/doc/server_setup_aws.md)
 
-## Set up a server and deploy the `upspinserver` binary
+## Set up a server and deploy the `upspinserver` binary {#deploy}
 
 Now provision a server and deploy the `upspinserver` binary to it.
 
 ### Provision a server
 
-You can run an `upspinserver` on any server, including Linux, MacOS, Windows,
+You can run an `upspinserver` on any server, including Linux, macOS, Windows,
 and [more](https://golang.org/doc/install#requirements), as long as it has a
 publicly-accessible IP address and can run Go programs.
 
-> Note that Upspin has been mostly developed under Linux and MacOS.
+> Note that Upspin has been mostly developed under Linux and macOS.
 > You may encounter issues running it on other platforms.
 
 For a personal Upspin installation, a server with 1 CPU core, 2GB of memory,
@@ -202,7 +216,7 @@ VM by visiting the Compute section of the
 > If you're unfamiliar with Google Cloud's virtual machines, here are some sane
 > defaults: choose the `n1-standard-1` machine type, select the Ubuntu 16.04
 > boot disk image, check "Allow HTTPS traffic", and under "Networking" make
-> sure the the "External IP" is a reserved static address (rather than
+> sure the "External IP" is a reserved static address (rather than
 > ephemeral).
 
 Once provisioned, make a note of the server's IP address.
@@ -228,9 +242,18 @@ guides:
 
 ## Test connectivity
 
-Using your web browser, navigate to the URL of your `upspinserver`
-(`https://upspin.example.com/`).
-You should see the text:
+At this point, you should have an `upspinserver` running on your server in
+"setup mode", which means that it is ready to be configured by the `upspin
+setupserver` command.
+This state is indicated by a log message printed on startup:
+
+```
+Configuration file not found. Running in setup mode.
+```
+
+Test that the `upspinserver` is accessible from the outside by making an HTTP
+request to it. Using your web browser, navigate to the URL of your
+`upspinserver` (`https://upspin.example.com/`). You should see the text:
 
 ```
 Unconfigured Upspin Server
@@ -239,7 +262,7 @@ Unconfigured Upspin Server
 If the page fails to load, check the `upspinserver` logs for clues.
 
 
-## Configure `upspinserver`
+## Configure `upspinserver` {#configure}
 
 On your workstation, run `upspin setupserver` to send your server keys and
 configuration to the `upspinserver` instance:
