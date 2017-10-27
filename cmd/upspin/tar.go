@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"os"
 	"strings"
 
 	"flag"
@@ -30,7 +29,7 @@ import (
 func (s *State) tar(args ...string) {
 	const help = `
 Tar archives an Upspin tree into a local tar file, or with the
--extract flag, unpacks a a local tar file into an Upspin tree.
+-extract flag, unpacks a local tar file into an Upspin tree.
 
 When extracting, the -match and -replace flags cause the extracted
 file to have any prefix that matches be replaced by substitute text.
@@ -56,6 +55,9 @@ always be in Upspin.
 // archiver implements archiving and unarchiving to/from Upspin tree and a local
 // file system.
 type archiver struct {
+	// state holds the current upspin state.
+	state *State
+
 	// client is the Upspin client to use for read or write.
 	client upspin.Client
 
@@ -101,6 +103,7 @@ func (s *State) untarCommand(fs *flag.FlagSet) {
 
 func (s *State) newArchiver(verbose bool) (*archiver, error) {
 	return &archiver{
+		state:   s,
 		client:  s.Client,
 		verbose: verbose,
 	}, nil
@@ -137,7 +140,7 @@ func (a *archiver) doArchive(pathName upspin.PathName, tw *tar.Writer, dst io.Wr
 			ModTime: e.Time.Go(),
 		}
 		if a.verbose {
-			fmt.Fprintf(os.Stderr, "Archiving %q\n", e.Name)
+			fmt.Fprintf(a.state.Stderr, "Archiving %q\n", e.Name)
 		}
 		switch {
 		case e.IsDir():
@@ -215,13 +218,13 @@ func (a *archiver) unarchive(src io.ReadCloser) error {
 		}
 
 		if a.verbose {
-			fmt.Fprintf(os.Stderr, "Extracting %q into %q\n", hdr.Name, name)
+			fmt.Fprintf(a.state.Stderr, "Extracting %q into %q\n", hdr.Name, name)
 		}
 
 		switch hdr.Typeflag {
 		case tar.TypeDir:
 			_, err = a.client.MakeDirectory(name)
-			if err != nil && !errors.Match(errors.E(errors.Exist), err) {
+			if err != nil && !errors.Is(errors.Exist, err) {
 				return err
 			}
 		case tar.TypeSymlink:
