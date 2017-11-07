@@ -242,11 +242,31 @@ func (ei ei) ReaderHashes(packdata []byte) (readers [][]byte, err error) {
 func (ei ei) Share(cfg upspin.Config, readers []upspin.PublicKey, packdata []*[]byte) {
 }
 
-// Name implements upspin.Packer.
+// Name implements upspin.Name.
 func (ei ei) Name(cfg upspin.Config, d *upspin.DirEntry, newName upspin.PathName) error {
-	const op = "pack/eeintegrity.Name"
-	if d.IsDir() {
-		return errors.E(op, d.Name, errors.IsDir, "cannot rename directory")
+	const op = "pack/plain.Name"
+	return ei.updateDirEntry(op, cfg, d, newName, d.Time)
+}
+
+// SetTime implements upspin.SetTime.
+func (ei ei) SetTime(cfg upspin.Config, d *upspin.DirEntry, t upspin.Time) error {
+	const op = "pack/plain.SetTime"
+	return ei.updateDirEntry(op, cfg, d, d.Name, t)
+}
+
+func (ei ei) updateDirEntry(op string, cfg upspin.Config, d *upspin.DirEntry, newName upspin.PathName, newTime upspin.Time) error {
+	parsed, err := path.Parse(d.Name)
+	if err != nil {
+		return errors.E(op, err)
+	}
+	parsedNew, err := path.Parse(newName)
+	if err != nil {
+		return errors.E(op, err)
+	}
+	newName = parsedNew.Path()
+
+	if d.IsDir() && !parsed.Equal(parsedNew) {
+		return errors.E(op, d.Name, errors.IsDir, errors.Str("cannot rename directory"))
 	}
 	if err := pack.CheckPacking(ei, d); err != nil {
 		return errors.E(op, errors.Invalid, d.Name, err)
@@ -256,10 +276,6 @@ func (ei ei) Name(cfg upspin.Config, d *upspin.DirEntry, newName upspin.PathName
 	sig, sig2, cipherSum, err := pdUnmarshal(d.Packdata)
 	if err != nil {
 		return errors.E(op, errors.Invalid, d.Name, err)
-	}
-
-	if _, err := path.Parse(d.Name); err != nil {
-		return errors.E(op, err)
 	}
 
 	// The writer has a well-known public key.
@@ -281,14 +297,10 @@ func (ei ei) Name(cfg upspin.Config, d *upspin.DirEntry, newName upspin.PathName
 		return errors.E(op, d.Name, errVerify)
 	}
 
-	parsedNew, err := path.Parse(newName)
-	if err != nil {
-		return errors.E(op, err)
-	}
-	newName = parsedNew.Path()
-
 	// Compute new signature, using the new name.
+	d.Writer = cfg.UserName()
 	d.SignedName = newName
+	d.Time = newTime
 	vhash = f.DirEntryHash(d.SignedName, d.Link, d.Attr, d.Packing, d.Time, dkey, cipherSum)
 	sig, err = f.FileSign(vhash)
 	if err != nil {
@@ -309,7 +321,7 @@ func (ei ei) Name(cfg upspin.Config, d *upspin.DirEntry, newName upspin.PathName
 func (ei ei) Countersign(oldKey upspin.PublicKey, f upspin.Factotum, d *upspin.DirEntry) error {
 	const op = "pack/eeintegrity.Countersign"
 	if d.IsDir() {
-		return errors.E(op, d.Name, errors.IsDir, "cannot sign directory")
+		return errors.E(op, d.Name, errors.IsDir, errors.Str("cannot sign directory"))
 	}
 
 	// Get ECDSA form of old key.
@@ -328,16 +340,21 @@ func (ei ei) Countersign(oldKey upspin.PublicKey, f upspin.Factotum, d *upspin.D
 	dkey := make([]byte, aesKeyLen)
 	vhash := f.DirEntryHash(d.SignedName, d.Link, d.Attr, d.Packing, d.Time, dkey, cipherSum)
 	if !ecdsa.Verify(oldPubKey, vhash, sig.R, sig.S) {
-		return errors.E(op, d.Name, errVerify, "unable to verify existing signature")
+		return errors.E(op, d.Name, errVerify, errors.Str("unable to verify existing signature"))
 	}
 
 	// Sign with newKey.
 	sig1, err := f.FileSign(vhash)
 	if err != nil {
-		return errors.E(op, d.Name, errVerify, "unable to make new signature")
+		return errors.E(op, d.Name, errVerify, errors.Str("unable to make new signature"))
 	}
 	pdMarshal(&d.Packdata, sig1, sig, cipherSum)
 	return nil
+}
+
+func (ei ei) UnpackableByAll(d *upspin.DirEntry) (bool, error) {
+	// Content is not encrypted, so anyone can read it.
+	return true, nil
 }
 
 func pdMarshal(dst *[]byte, sig, sig2 upspin.Signature, cipherSum []byte) error {

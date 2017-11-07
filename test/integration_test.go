@@ -41,6 +41,8 @@ var (
 
 	setupTemplate = testenv.Setup{
 		OwnerName: ownerName,
+		UpBox:     true,
+		Cache:     true,
 		Cleanup:   cleanup,
 	}
 	readerConfig upspin.Config
@@ -250,6 +252,44 @@ func testDelete(t *testing.T, r *testenv.Runner) {
 	}
 }
 
+// testMetacharacters checks that we can handle files whose names
+// contain Glob metacharacters.
+func testMetacharacters(t *testing.T, r *testenv.Runner) {
+	const (
+		dir            = ownerName + "/foo[*]bar"
+		subDir         = dir + "/inner?"
+		subDirFile     = subDir + "/file[]"
+		subDirFilePath = ownerName + "/foo???bar/in*/file??"
+		contents       = "some text"
+	)
+	r.As(ownerName)
+	r.MakeDirectory(dir)
+	r.MakeDirectory(subDir)
+	r.Put(subDirFile, contents)
+	if r.Failed() {
+		t.Fatal(r.Diag())
+	}
+	r.Get(subDirFile)
+	if r.Failed() {
+		t.Fatal(r.Diag())
+	}
+	if r.Data != contents {
+		t.Errorf("Expected contents %q, got %q", contents, r.Data)
+	}
+
+	// Use Glob to access file a different way to verify it's as we expect.
+	r.Glob(subDirFilePath)
+	checkDirEntry(t, r.Entries[0], subDirFile, hasLocation, len(contents))
+
+	// Now clean up.
+	r.Delete(subDirFile)
+	r.Delete(subDir)
+	r.Delete(dir)
+	if r.Failed() {
+		t.Fatal(r.Diag())
+	}
+}
+
 func testRootDeletion(t *testing.T, r *testenv.Runner) {
 	r.As(readerName)
 
@@ -303,6 +343,7 @@ var integrationTests = []struct {
 	{"ReadAccess", testReadAccess},
 	{"GroupAccess", testGroupAccess},
 	{"WriteReadAllAccessFile", testWriteReadAllAccessFile},
+	{"Metacharacters", testMetacharacters},
 
 	{"Watch", testWatchCurrent},
 	{"WatchErrors", testWatchErrors},
@@ -311,6 +352,7 @@ var integrationTests = []struct {
 	{"WatchForbiddenFile", testWatchForbiddenFile},
 	{"WatchSubtree", testWatchSubtree},
 	{"WatchNonExistentRoot", testWatchNonExistentRoot},
+
 	{"CopyEntries", testCopyEntries},
 	{"Snapshot", testSnapshot},
 	{"DeleteErrors", testDeleteErrors},
@@ -330,6 +372,7 @@ error: cannot find keys for remote test users.
 
 These tests are designed to be run against the test.upspin.io cluster,
 which is only accessible by the Upspin core team at Google.
+See upspin.io/key/testdata/remote/README for details.
 
 Run the test suite with -short to skip these tests.
 `
@@ -338,7 +381,7 @@ func testSelectedOnePacking(t *testing.T, setup testenv.Setup) {
 	usercache.ResetGlobal()
 
 	env, err := testenv.New(&setup)
-	if errors.Match(errors.E(errors.NotExist), err) && setup.Kind == "remote" {
+	if errors.Is(errors.NotExist, err) && setup.Kind == "remote" {
 		t.Fatal(remoteTestMessage)
 	}
 	if err != nil {
@@ -346,15 +389,18 @@ func testSelectedOnePacking(t *testing.T, setup testenv.Setup) {
 	}
 
 	if err := cleanup(env); err != nil {
+		env.Exit()
 		t.Fatal(err)
 	}
 
 	readerConfig, err = env.NewUser(readerName)
 	if err != nil {
+		env.Exit()
 		t.Fatal(err)
 	}
 	snapshotConfig, err := env.NewUser(snapshotUser)
 	if err != nil {
+		env.Exit()
 		t.Fatal(err)
 	}
 
@@ -377,32 +423,42 @@ func testSelectedOnePacking(t *testing.T, setup testenv.Setup) {
 	}
 }
 
-var integrationTestKinds = []string{"inprocess", "server", "remote"}
-
 func TestIntegration(t *testing.T) {
-	for _, kind := range integrationTestKinds {
-		t.Run(fmt.Sprintf("kind=%v", kind), func(t *testing.T) {
-			if testing.Short() && kind == "remote" {
-				t.Skip("skipping network-based tests while -test.short specified")
+	type testConfig struct {
+		kind    string // "inprocess", "server", or "remote".
+		packing upspin.Packing
+		cache   bool // Run a cacheserver for ownerName.
+		always  bool // Always run this test, even with -test.short.
+	}
+	const noCache, cache = false, true
+	testConfigs := []testConfig{
+		{"inprocess", upspin.PlainPack, noCache, false},
+		{"inprocess", upspin.EEIntegrityPack, noCache, false},
+		{"inprocess", upspin.EEPack, noCache, true},
+
+		{"server", upspin.PlainPack, noCache, false},
+		{"server", upspin.EEIntegrityPack, noCache, false},
+		{"server", upspin.EEPack, noCache, true},
+
+		{"inprocess", upspin.EEPack, cache, true},
+		{"server", upspin.EEPack, cache, true},
+
+		{"remote", upspin.EEPack, noCache, false},
+	}
+	for _, config := range testConfigs {
+		setup := setupTemplate
+		setup.Kind = config.kind
+		setup.Packing = config.packing
+		setup.Cache = config.cache
+		if config.kind == "remote" {
+			setup.UpBox = false
+		}
+		name := fmt.Sprintf("kind=%v/packing=%v/cache=%t", config.kind, config.packing, config.cache)
+		t.Run(name, func(t *testing.T) {
+			if testing.Short() && !config.always {
+				t.Skip("skipping because -test.short is set")
 			}
-			setup := setupTemplate
-			setup.Kind = kind
-			for _, p := range []struct {
-				packing  upspin.Packing
-				remoteOK bool
-			}{
-				{upspin.PlainPack, false},
-				{upspin.EEIntegrityPack, false},
-				{upspin.EEPack, true}, // Only run this test against remote.
-			} {
-				setup.Packing = p.packing
-				t.Run(fmt.Sprintf("packing=%v", p.packing), func(t *testing.T) {
-					if kind == "remote" && !p.remoteOK {
-						t.Skip("skipping test against remote")
-					}
-					testSelectedOnePacking(t, setup)
-				})
-			}
+			testSelectedOnePacking(t, setup)
 		})
 	}
 }
@@ -449,7 +505,7 @@ func cleanup(env *testenv.Env) error {
 // provided DirServer, first deleting path/Access and then path/*.
 func deleteAll(dir upspin.DirServer, path upspin.PathName) error {
 	if _, err := dir.Delete(path + "/Access"); err != nil {
-		if !errors.Match(errNotExist, err) {
+		if !errors.Is(errors.NotExist, err) {
 			return err
 		}
 	}
