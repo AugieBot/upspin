@@ -19,9 +19,6 @@ import (
 	"upspin.io/upspin/proto"
 )
 
-// requireAuthentication specifies whether the connection demands TLS.
-const requireAuthentication = true
-
 // dialConfig contains the destination and authenticated user of the dial.
 type dialConfig struct {
 	endpoint upspin.Endpoint
@@ -30,7 +27,7 @@ type dialConfig struct {
 
 // remote implements upspin.DirServer.
 type remote struct {
-	rpc.Client // For sessions, Ping, and Close.
+	rpc.Client // For sessions and Close.
 	cfg        dialConfig
 }
 
@@ -112,11 +109,11 @@ func (r *remote) invoke(op *operation, method string, req pb.Message) (*upspin.D
 }
 
 // Watch implements upspin.DirServer.
-func (r *remote) Watch(name upspin.PathName, order int64, done <-chan struct{}) (<-chan upspin.Event, error) {
-	op := r.opf("Watch", "%q order %d", name, order)
+func (r *remote) Watch(name upspin.PathName, sequence int64, done <-chan struct{}) (<-chan upspin.Event, error) {
+	op := r.opf("Watch", "%q sequence %d", name, sequence)
 	req := &proto.DirWatchRequest{
-		Name:  string(name),
-		Order: order,
+		Name:     string(name),
+		Sequence: sequence,
 	}
 
 	stream := make(eventStream)
@@ -178,19 +175,20 @@ func (r *remote) Endpoint() upspin.Endpoint {
 	return r.cfg.endpoint
 }
 
-func dialCache(op *operation, config upspin.Config, proxyFor upspin.Endpoint) upspin.Service {
+func dialCache(config upspin.Config, proxyFor upspin.Endpoint) (upspin.Service, error) {
 	// Are we using a cache?
-	ce := config.CacheEndpoint()
-	if ce.Transport == upspin.Unassigned {
-		return nil
+	ce, err := rpc.CacheEndpoint(config)
+	if err != nil {
+		return nil, err
+	}
+	if ce == nil {
+		return nil, nil
 	}
 
 	// Call the cache. The cache is local so don't bother with TLS.
 	authClient, err := rpc.NewClient(config, ce.NetAddr, rpc.NoSecurity, proxyFor)
 	if err != nil {
-		// On error dial direct.
-		op.error(errors.IO, err)
-		return nil
+		return nil, err
 	}
 
 	return &remote{
@@ -199,7 +197,7 @@ func dialCache(op *operation, config upspin.Config, proxyFor upspin.Endpoint) up
 			endpoint: proxyFor,
 			userName: config.UserName(),
 		},
-	}
+	}, nil
 }
 
 // Dial implements upspin.Service.
@@ -211,7 +209,9 @@ func (r *remote) Dial(config upspin.Config, e upspin.Endpoint) (upspin.Service, 
 	}
 
 	// First try a cache
-	if svc := dialCache(op, config, e); svc != nil {
+	if svc, err := dialCache(config, e); err != nil {
+		return nil, op.error(err)
+	} else if svc != nil {
 		return svc, nil
 	}
 
@@ -252,7 +252,7 @@ func unmarshalError(b []byte) error {
 
 func (r *remote) opf(method string, format string, args ...interface{}) *operation {
 	ep := r.cfg.endpoint.String()
-	s := fmt.Sprintf("dir/remote.%s(%q)", method, ep)
+	s := fmt.Sprintf("->%q dir.%s", ep, method)
 	op := &operation{s, fmt.Sprintf(format, args...)}
 	log.Debug.Print(op)
 	return op
@@ -269,10 +269,6 @@ func (op *operation) String() string {
 
 func (op *operation) logErr(err error) {
 	log.Error.Printf("%s: %s", op, err)
-}
-
-func (op *operation) logf(format string, args ...interface{}) {
-	log.Printf("%s: "+format, append([]interface{}{op.op}, args...)...)
 }
 
 func (op *operation) error(args ...interface{}) error {
