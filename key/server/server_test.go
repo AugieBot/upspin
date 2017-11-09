@@ -425,7 +425,7 @@ func TestIsDomainAdminPutOther(t *testing.T) {
 		return nil, errors.Str("no host found")
 	}
 	// New server for domainAdmin.
-	u, mockGCP = newKeyServerWithMocking(domainAdmin, domainAdmin, adminJSON)
+	u, _ = newKeyServerWithMocking(domainAdmin, domainAdmin, adminJSON)
 	u.lookupTXT = lookupTXT
 	// adminUser will now Put a new user record for otherDude.
 	user = &upspin.User{
@@ -433,7 +433,7 @@ func TestIsDomainAdminPutOther(t *testing.T) {
 		PublicKey: upspin.PublicKey("adminUser can Put this"),
 	}
 	err = u.Put(user)
-	if !errors.Match(errors.E(errors.Permission), err) {
+	if !errors.Is(errors.Permission, err) {
 		t.Fatalf("Expected Permission Denied, got %s", err)
 	}
 }

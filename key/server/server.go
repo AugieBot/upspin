@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"math/big"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -26,44 +25,31 @@ import (
 	"upspin.io/valid"
 )
 
-// New initializes an instance of the key service.
-// Required configuration options are:
-//   gcpBucketName=<BUCKET_NAME>
-// Optional configuration options are:
-//   defaultACL=<ACL>, as defined in storage.Storage (e.g. "projectPrivate")
-//   cacheSize=<number>
+const cacheSize = 10000
+
+// New initializes an instance of the KeyServer
+// that stores its data in the given Storage implementation.
 func New(options ...string) (upspin.KeyServer, error) {
 	const op = "key/server.New"
 
-	cacheSize := 10000
-
-	// All options are for the Storage layer.
-	var storageOpts []storage.DialOpts
-	for _, o := range options {
-		vals := strings.Split(o, "=")
-		if len(vals) != 2 {
-			return nil, errors.E(op, "config options must be in the format 'key=value'")
+	var backend string
+	var dialOpts []storage.DialOpts
+	for _, option := range options {
+		const prefix = "backend="
+		if strings.HasPrefix(option, prefix) {
+			backend = option[len(prefix):]
+			continue
 		}
-		k, v := vals[0], vals[1]
-		switch k {
-		case "cacheSize":
-			cacheSize, err := strconv.ParseInt(v, 10, 32)
-			if err != nil {
-				return nil, errors.E(op, errors.Invalid, errors.Errorf("invalid cache size %q: %s", v, err))
-			}
-			if cacheSize < 1 {
-				return nil, errors.E(op, errors.Invalid, errors.Errorf("%s: cache size too small: %d", k, cacheSize))
-			}
-		default:
-			storageOpts = append(storageOpts, storage.WithOptions(o))
-		}
+		// Pass other options to the storage backend.
+		dialOpts = append(dialOpts, storage.WithOptions(option))
 	}
-
-	s, err := storage.Dial("GCS", storageOpts...)
+	if backend == "" {
+		return nil, errors.E(op, errors.Invalid, "storage 'backend' option is missing")
+	}
+	s, err := storage.Dial(backend, dialOpts...)
 	if err != nil {
 		return nil, errors.E(op, err)
 	}
-	log.Debug.Printf("Configured GCP user: %v", options)
 	return &server{
 		storage:   s,
 		refCount:  &refCount{count: 1},
@@ -144,7 +130,7 @@ func (s *server) lookup(op string, name upspin.UserName, span *metric.Span) (*us
 	sp.End()
 	if err != nil {
 		// Not found: add to negative cache.
-		if errors.Match(errors.E(errors.NotExist), err) {
+		if errors.Is(errors.NotExist, err) {
 			s.negCache.Add(name, true)
 		}
 		return nil, err
@@ -175,7 +161,7 @@ func (s *server) Put(u *upspin.User) error {
 
 	entry, err := s.lookup(op, u.Name, span)
 	switch {
-	case errors.Match(errors.E(errors.NotExist), err):
+	case errors.Is(errors.NotExist, err):
 		// OK; adding new user.
 		newUser = true
 	case err != nil:
@@ -373,11 +359,6 @@ func (s *server) Dial(cfg upspin.Config, e upspin.Endpoint) (upspin.Service, err
 	svc := *s
 	svc.user = cfg.UserName()
 	return &svc, nil
-}
-
-// Ping implements upspin.Service.
-func (s *server) Ping() bool {
-	return true
 }
 
 // Close implements upspin.Service.
