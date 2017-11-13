@@ -137,9 +137,7 @@ This discussion is about a data-encrypting method, or in Upspin terminology, a p
 that is called **ee**.
 It uses NIST elliptic curves for end-to-end encryption, and is the default.
 There are other packings available, notably **eeintegrity**
-which is useful when one is willing to store signed cleartext
-in order to make the content available to everyone, not just to an
-explicit list of readers.
+which is useful when one is willing to store signed cleartext.
 
 The directory server needs to store its hierarchy of directory entries
 somewhere.
@@ -168,7 +166,7 @@ report to us and the public if you ever find a mismatch.
 Compare the key.upspin.io/log hash you see with what your friend sees,
 and report any discrepancy.
 Watch for your own key in the log and report if there's ever a change, even
-momentary, that you did not iniitate yourself.
+momentary, that you did not initiate yourself.
 You'll be giving the rest of our users herd immunity.
 
 As far as Upspin is concerned, a user is an email address, authenticated by an
@@ -332,7 +330,7 @@ compromised or is malicious or is compelled under legal process or
 simply has bugs.
 
 Besides observing metadata, a bad directory server can cause harm
-by returning an incorrrect Access file to the client.
+by returning an incorrect Access file to the client.
 Access files are signed by the owner, but replay is possible;
 this might yield a stale list of readers or other permissions.
 (Similarly, the directory server could serve a stale signed DirEntry.)
