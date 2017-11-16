@@ -19,10 +19,7 @@ func TestRateCounter(t *testing.T) {
 	}()
 
 	tick := make(chan time.Time)
-	rc, err := newRateCounter(3, time.Second, tick)
-	if err != nil {
-		t.Fatal(err)
-	}
+	rc := newRateCounter(3, time.Second, tick)
 
 	for _, c := range []struct {
 		add  int64
@@ -43,7 +40,7 @@ func TestRateCounter(t *testing.T) {
 	}
 
 	rc.Add(12)
-	if rc.String() != "4 ops/s" {
+	if rc.String() != `"4 ops/s"` {
 		t.Errorf("got = %s", rc)
 	}
 }
