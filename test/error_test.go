@@ -809,11 +809,21 @@ func testGlobErrors(t *testing.T, r *testenv.Runner) {
 		t.Fatal(r.Diag())
 	}
 
-	// Owner should be able to glob them all.
+	// Owner should be able to glob the root.
 	r.Glob(base + "/*")
-	if !r.GotEntries(true, dir, baseFile) {
-		t.Fatal(r.Diag())
+	// Check that we got the root entries, but ignore whether there are
+	// blocks in them because there may or may not be depending on whether
+	// a cache is in use.
+	if len(r.Entries) != 2 {
+		t.Fatalf("got %d entries, want 2", len(r.Entries))
 	}
+	if got := r.Entries[0].Name; got != dir {
+		t.Fatalf("got entry %q, want %q", got, dir)
+	}
+	if got := r.Entries[1].Name; got != baseFile {
+		t.Fatalf("got entry %q, want %q", got, baseFile)
+	}
+	// Owner should be able to glob the directory.
 	r.Glob(base + "/*/*")
 	if !r.GotEntries(true, dirFile) {
 		t.Fatal(r.Diag())
@@ -823,6 +833,10 @@ func testGlobErrors(t *testing.T, r *testenv.Runner) {
 	// because they can't see the base of the glob.
 	r.As(readerName)
 	r.Glob(base + "/*")
+	if !r.Match(errPrivate) {
+		t.Fatal(r.Diag())
+	}
+	r.Glob(base + "/nonexistent/*")
 	if !r.Match(errPrivate) {
 		t.Fatal(r.Diag())
 	}
@@ -1051,6 +1065,13 @@ func testGlobLinkErrors(t *testing.T, r *testenv.Runner) {
 		t.Fatalf("entry 1 == %q, want %q", e1.Name, dir3file)
 	} else if len(e1.Blocks) > 0 {
 		t.Fatalf("entry 1 (%q) has %d blocks, want 0", e1.Name, len(e1.Blocks))
+	}
+
+	// Test that a Glob through a link works.
+	r.As(readerName)
+	r.Glob(dir2link + "/*")
+	if !r.GotEntries(true, dir2access, dir2file) {
+		t.Fatal(r.Diag())
 	}
 }
 
