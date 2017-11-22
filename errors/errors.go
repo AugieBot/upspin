@@ -73,7 +73,7 @@ const (
 	Exist                     // Item already exists.
 	NotExist                  // Item does not exist.
 	IsDir                     // Item is a directory.
-	NotDir                    // Item is not a directory..
+	NotDir                    // Item is not a directory.
 	NotEmpty                  // Directory not empty.
 	Private                   // Information withheld.
 	Internal                  // Internal error or inconsistency.
@@ -159,11 +159,11 @@ func E(args ...interface{}) error {
 				_, file, line, _ := runtime.Caller(1)
 				log.Printf("errors.E: unqualified type for %q from %s:%d", arg, file, line)
 				if strings.Contains(arg, "/") {
-					if e.Path != "" { // Don't overwrite a valid path.
+					if e.Path == "" { // Don't overwrite a valid path.
 						e.Path = upspin.PathName(arg)
 					}
 				} else {
-					if e.User != "" { // Don't overwrite a valid user.
+					if e.User == "" { // Don't overwrite a valid user.
 						e.User = upspin.UserName(arg)
 					}
 				}
@@ -393,7 +393,7 @@ func UnmarshalError(b []byte) error {
 		err.UnmarshalBinary(b)
 		return &err
 	default:
-		log.Printf("Unmarshal error: corrup data %q", b)
+		log.Printf("Unmarshal error: corrupt data %q", b)
 		return Str(string(b))
 	}
 }
@@ -465,4 +465,20 @@ func Match(err1, err2 error) bool {
 		}
 	}
 	return true
+}
+
+// Is reports whether err is an *Error of the given Kind.
+// If err is nil then Is returns false.
+func Is(kind Kind, err error) bool {
+	e, ok := err.(*Error)
+	if !ok {
+		return false
+	}
+	if e.Kind != Other {
+		return e.Kind == kind
+	}
+	if e.Err != nil {
+		return Is(kind, e.Err)
+	}
+	return false
 }
