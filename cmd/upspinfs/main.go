@@ -20,6 +20,7 @@ import (
 	"upspin.io/flags"
 	"upspin.io/log"
 	"upspin.io/rpc/local"
+	"upspin.io/version"
 
 	_ "upspin.io/pack/ee"
 	_ "upspin.io/pack/eeintegrity"
@@ -37,7 +38,12 @@ func usage() {
 
 func main() {
 	flag.Usage = usage
-	flags.Parse(flags.Server, "cachedir")
+	flags.Parse(flags.Server, "cachedir", "prudent", "version")
+
+	if flags.Version {
+		fmt.Print(version.Version())
+		return
+	}
 
 	if flag.NArg() != 1 {
 		usage()
@@ -65,7 +71,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("can't determine absolute path to mount point %s: %s", flag.Arg(0), err)
 	}
-	done := do(cfg, mountpoint, flags.CacheDir)
+	done := do(cfg, mountpoint, filepath.Join(flags.CacheDir, string(cfg.UserName())))
 
 	// Serve expvar data.
 	ln, err := local.Listen("tcp", local.LocalName(cfg, cmdName))
