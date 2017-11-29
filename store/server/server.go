@@ -45,7 +45,9 @@ func New(options ...string) (upspin.StoreServer, error) {
 		// Pass other options to the storage backend.
 		dialOpts = append(dialOpts, storage.WithOptions(option))
 	}
-
+	if backend == "" {
+		return nil, errors.E(op, errors.Invalid, errors.Str(`storage "backend" option is missing`))
+	}
 	s, err := storage.Dial(backend, dialOpts...)
 	if err != nil {
 		return nil, errors.E(op, err)
@@ -139,11 +141,6 @@ func (s *server) Dial(config upspin.Config, e upspin.Endpoint) (upspin.Service, 
 	defer s.mu.Unlock()
 	s.refCount++
 	return s, nil
-}
-
-// Ping implements upspin.Service.
-func (s *server) Ping() bool {
-	return true
 }
 
 // Close implements upspin.Service.
