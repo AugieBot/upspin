@@ -26,7 +26,7 @@ import (
 // permissions. It will only start polling the store permissions after the
 // ready channel is closed.
 func WrapStore(cfg upspin.Config, ready <-chan struct{}, store upspin.StoreServer) upspin.StoreServer {
-	const op = "serverutil/perm.WrapStore"
+	const op errors.Op = "serverutil/perm.WrapStore"
 	p := newPerm(op, cfg, ready, cfg.UserName(), nil, nil, noop, retry, nil)
 	return p.WrapStore(store)
 }
@@ -49,29 +49,39 @@ type storeWrapper struct {
 	perm *Perm
 }
 
+// Get implements upspin.StoreServer.
+func (s *storeWrapper) Get(ref upspin.Reference) ([]byte, *upspin.Refdata, []upspin.Location, error) {
+	const op errors.Op = "store/perm.Get"
+
+	if ref == upspin.ListRefsMetadata && !s.perm.IsWriter(s.user) {
+		return nil, nil, nil, errors.E(op, s.user, errors.Permission, "user not authorized")
+	}
+	return s.StoreServer.Get(ref)
+}
+
 // Put implements upspin.StoreServer.
 func (s *storeWrapper) Put(data []byte) (*upspin.Refdata, error) {
-	const op = "store/perm.Put"
+	const op errors.Op = "store/perm.Put"
 
 	if !s.perm.IsWriter(s.user) {
-		return nil, errors.E(op, s.user, errors.Permission, errors.Errorf("user not authorized"))
+		return nil, errors.E(op, s.user, errors.Permission, "user not authorized")
 	}
 	return s.StoreServer.Put(data)
 }
 
 // Delete implements upspin.StoreServer.
 func (s *storeWrapper) Delete(ref upspin.Reference) error {
-	const op = "store/perm.Delete"
+	const op errors.Op = "store/perm.Delete"
 
 	if s.perm.targetUser != s.user {
-		return errors.E(op, s.user, errors.Permission, errors.Errorf("user not authorized"))
+		return errors.E(op, s.user, errors.Permission, "user not authorized")
 	}
 	return s.StoreServer.Delete(ref)
 }
 
 // Dial implements upspin.Service.
 func (s *storeWrapper) Dial(cfg upspin.Config, e upspin.Endpoint) (upspin.Service, error) {
-	const op = "store/perm.Dial"
+	const op errors.Op = "store/perm.Dial"
 	service, err := s.StoreServer.Dial(cfg, e)
 	if err != nil {
 		return nil, errors.E(op, err)
