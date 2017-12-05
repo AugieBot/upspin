@@ -17,6 +17,7 @@ import (
 	yaml "gopkg.in/yaml.v2"
 
 	"upspin.io/config"
+	"upspin.io/key/keygen"
 	"upspin.io/subcmd"
 	"upspin.io/upspin"
 )
@@ -103,7 +104,7 @@ If any state exists at the given location (-where) then the command aborts.
 		os.Remove(dirFile)
 		s.user("-put", "-in", storeFile)
 		os.Remove(storeFile)
-		fmt.Fprintf(os.Stderr, "Successfully put %q and %q to the key server.\n", dirUser, storeUser)
+		fmt.Fprintf(s.Stderr, "Successfully put %q and %q to the key server.\n", dirUser, storeUser)
 		return
 	}
 
@@ -114,19 +115,21 @@ If any state exists at the given location (-where) then the command aborts.
 
 	// Generate keys for the dirserver and the storeserver.
 	var noProquint string
+	dirCurve := *curveName
 	dirPublic, dirPrivate, dirProquint, err := s.createKeys(*curveName, noProquint)
 	if err != nil {
 		s.Exit(err)
 	}
+	storeCurve := *curveName
 	storePublic, storePrivate, storeProquint, err := s.createKeys(*curveName, noProquint)
 	if err != nil {
 		s.Exit(err)
 	}
-	err = s.writeKeys(dirServerPath, dirPublic, dirPrivate)
+	err = keygen.SaveKeys(dirServerPath, false, dirPublic, dirPrivate, dirProquint)
 	if err != nil {
 		s.Exit(err)
 	}
-	err = s.writeKeys(storeServerPath, storePublic, storePrivate)
+	err = keygen.SaveKeys(storeServerPath, false, storePublic, storePrivate, storeProquint)
 	if err != nil {
 		s.Exit(err)
 	}
@@ -175,7 +178,7 @@ If any state exists at the given location (-where) then the command aborts.
 		s.Exit(err)
 	}
 
-	err = setupDomainTemplate.Execute(os.Stdout, setupDomainData{
+	err = setupDomainTemplate.Execute(s.Stdout, setupDomainData{
 		Dir:       baseDir,
 		Where:     where,
 		Domain:    *domain,
@@ -183,6 +186,8 @@ If any state exists at the given location (-where) then the command aborts.
 		UserName:  s.Config.UserName(),
 		Signature: fmt.Sprintf("%x-%x", sig.R, sig.S),
 
+		DirCurve:        dirCurve,
+		StoreCurve:      storeCurve,
 		DirProquint:     dirProquint,
 		StoreProquint:   storeProquint,
 		DirServerPath:   dirServerPath,
@@ -201,12 +206,15 @@ type setupDomainData struct {
 	Signature  string
 
 	// Used by setupDomain.
+	DirCurve        string
+	StoreCurve      string
 	DirProquint     string
 	StoreProquint   string
 	DirServerPath   string
 	StoreServerPath string
 
 	// Used by setupHost.
+	Curve    string
 	Proquint string
 }
 
@@ -217,8 +225,8 @@ Keys and config files for the users
 were generated and placed under the directory:
 	{{.Dir}}
 If you lose the keys you can re-create them by running these commands
-	upspin keygen -where {{.DirServerPath}} -secretseed {{.DirProquint}}
-	upspin keygen -where {{.StoreServerPath}} -secretseed {{.StoreProquint}}
+	upspin keygen -curve {{.DirCurve}} -secretseed {{.DirProquint}} {{.DirServerPath}}
+	upspin keygen -curve {{.StoreCurve}} -secretseed {{.StoreProquint}} {{.StoreServerPath}}
 Write them down and store them in a secure, private place.
 Do not share your private keys or these commands with anyone.
 
@@ -274,7 +282,7 @@ func (s *State) setuphost(where, domain, curve, proquint string) {
 	if err != nil {
 		s.Exit(err)
 	}
-	err = s.writeKeys(cfgPath, pub, pri)
+	err = keygen.SaveKeys(cfgPath, false, pub, pri, proquint)
 	if err != nil {
 		s.Exit(err)
 	}
@@ -292,13 +300,14 @@ func (s *State) setuphost(where, domain, curve, proquint string) {
 		User: upspin.UserName("upspin@" + domain),
 	})
 
-	err = setupHostTemplate.Execute(os.Stdout, setupDomainData{
+	err = setupHostTemplate.Execute(s.Stdout, setupDomainData{
 		Dir:       cfgPath,
 		Where:     where,
 		Domain:    domain,
 		UserName:  s.Config.UserName(),
 		Signature: fmt.Sprintf("%x-%x", sig.R, sig.S),
 
+		Curve:    curve,
 		Proquint: proquint,
 	})
 	if err != nil {
@@ -312,7 +321,7 @@ Domain configuration and keys for the user
 were generated and placed under the directory:
 	{{.Dir}}
 If you lose the keys you can re-create them by running this command
-	upspin keygen -where {{.Dir}} -secretseed {{.Proquint}}
+	upspin keygen -curve {{.Curve}} -secretseed {{.Proquint}} {{.Dir}}
 Write this command down and store it in a secure, private place.
 Do not share your private key or this command with anyone.
 
