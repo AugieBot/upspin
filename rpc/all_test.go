@@ -5,10 +5,7 @@
 package rpc
 
 import (
-	"crypto/x509"
 	"fmt"
-	"io/ioutil"
-	"net"
 	"net/http"
 	"testing"
 	"time"
@@ -44,20 +41,7 @@ func lookup(user upspin.UserName) (upspin.PublicKey, error) {
 	if user == joeUser {
 		return upspin.PublicKey(joePublic), nil
 	}
-	return "", errors.E(errors.NotExist, errors.Str("No user here"))
-}
-
-func pickPort() (port string) {
-	listener, err := net.Listen("tcp", "localhost:0")
-	if err != nil {
-		log.Fatalf("Failed to listen: %v", err)
-	}
-	_, port, err = net.SplitHostPort(listener.Addr().String())
-	if err != nil {
-		log.Fatalf("Failed to parse listener address: %v", err)
-	}
-	listener.Close()
-	return port
+	return "", errors.E(errors.NotExist, "No user here")
 }
 
 type server struct {
@@ -67,7 +51,11 @@ type server struct {
 
 func startServer(t *testing.T) (port string) {
 	srv = &server{t: t}
-	port = pickPort()
+	var err error
+	port, err = testutil.PickPort()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	cfg := config.SetUserName(config.New(), "server@upspin.io")
 	cfg = config.SetKeyEndpoint(cfg, upspin.Endpoint{Transport: upspin.InProcess})
@@ -155,7 +143,7 @@ func (s *server) Count(session Session, reqBytes []byte, done <-chan struct{}) (
 }
 
 type client struct {
-	Client   // For sessions, Ping, and Close.
+	Client   // For sessions and Close.
 	reqCount int
 }
 
@@ -192,6 +180,7 @@ func (c *client) Count(t *testing.T, start, count int32) {
 	}
 	stream := make(countStream)
 	done := make(chan struct{})
+	errc := make(chan error, 1)
 	go func() {
 		defer close(done)
 		for i := int32(0); ; i++ {
@@ -200,16 +189,20 @@ func (c *client) Count(t *testing.T, start, count int32) {
 				if i == count {
 					break
 				}
-				t.Fatalf("stream closed after receiving %v items, want %v", i, count)
+				errc <- errors.Errorf("stream closed after receiving %v items, want %v", i, count)
 			}
 			log.Printf("Client: Count response: %d", resp.Number)
 			if got, want := resp.Number, start+int32(i); got != want {
-				t.Fatalf("stream message out of order, got %v want %v", got, want)
+				errc <- errors.Errorf("stream message out of order, got %v want %v", got, want)
 			}
 		}
+		errc <- nil
 	}()
 	if err := c.Invoke("Server/Count", req, nil, stream, done); err != nil {
 		t.Fatal("Count:", err)
+	}
+	if err := <-errc; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -246,16 +239,7 @@ func startClient(port string, user upspin.UserName) {
 		log.Fatal(err)
 	}
 	cfg = config.SetFactotum(cfg, f)
-
-	pem, err := ioutil.ReadFile("testdata/cert.pem")
-	if err != nil {
-		log.Fatal(err)
-	}
-	pool := x509.NewCertPool()
-	if ok := pool.AppendCertsFromPEM(pem); !ok {
-		log.Fatal("could not add certificates to pool")
-	}
-	cfg = config.SetCertPool(cfg, pool)
+	cfg = config.SetValue(cfg, "tlscerts", "testdata/")
 
 	// Try a few times because the server may not be up yet.
 	var authClient Client
