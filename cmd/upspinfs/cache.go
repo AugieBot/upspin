@@ -22,6 +22,7 @@ import (
 	"upspin.io/client/clientutil"
 	os "upspin.io/cmd/upspinfs/internal/ose"
 	"upspin.io/errors"
+	"upspin.io/log"
 	"upspin.io/pack"
 	"upspin.io/path"
 	"upspin.io/upspin"
@@ -44,9 +45,9 @@ type cachedFile struct {
 	fname   string // Filename in cache.
 	inStore bool   // True if this is a cached version of something in the store.
 	dirty   bool   // True if it needs to be written back on close.
+	seq     int64  // Sequence number of cached file.
 
-	file *os.File           // The cached file.
-	de   []*upspin.DirEntry // If this is a directory, its contents.
+	file *os.File // The cached file.
 }
 
 func newCache(config upspin.Config, dir string) *cache {
@@ -85,10 +86,10 @@ func (c *cache) mkTemp() string {
 // create creates a file in the cache.
 // The corresponding node should be locked.
 func (c *cache) create(h *handle) error {
-	const op = "upspinfs/cache.create"
+	const op errors.Op = "cache.create"
 
 	if h.n.cf != nil {
-		return errors.E(op, errors.IO, errors.Str("create of an open file"))
+		return errors.E(op, errors.IO, "create of an open file")
 	}
 	cf := &cachedFile{c: c, dirty: true}
 	cf.fname = c.mkTemp()
@@ -103,7 +104,7 @@ func (c *cache) create(h *handle) error {
 // open opens the cached version of a file.  If it isn't cached, first retrieve it from the store.
 // The corresponding node should be locked.
 func (c *cache) open(h *handle, flags fuse.OpenFlags) error {
-	const op = "upspinfs/cache.open"
+	const op errors.Op = "cache.open"
 
 	n := h.n
 	name := n.uname
@@ -122,7 +123,7 @@ func (c *cache) open(h *handle, flags fuse.OpenFlags) error {
 	entry, err := dir.Lookup(name)
 	if err != nil {
 		// We don't implement links in the standard way. Instead we
-		// let FUSE to it but stating every file it walks.
+		// let FUSE do it by stating every file it walks.
 		return errors.E(op, err)
 	}
 
@@ -145,6 +146,9 @@ func (c *cache) open(h *handle, flags fuse.OpenFlags) error {
 			}
 		}
 	}
+
+	// Invalidate the kernel cache, this is a new version.
+	n.f.invalidateChan <- n
 
 	// Create an unpacker to decrypt the file blocks.
 	packer := pack.Lookup(entry.Packing)
@@ -192,6 +196,7 @@ func (c *cache) open(h *handle, flags fuse.OpenFlags) error {
 	cf.inStore = true
 	cf.fname = fname
 	cf.file = file
+	n.seq = entry.Sequence
 	h.flags = flags
 	n.attr.Size = uint64(offset)
 	n.cf = cf
@@ -225,11 +230,23 @@ func (cf *cachedFile) close() {
 		return
 	}
 	cf.file.Close()
+	cf.file = nil
+}
+
+// forget is called when the cached version is no longer correct.
+func (cf *cachedFile) forget() {
+	if cf == nil {
+		return
+	}
+	cf.close()
+	if err := os.Remove(cf.fname); err != nil {
+		log.Debug.Printf("%s", err)
+	}
 }
 
 // clone copies the first size bytes of the old cf.file into a new temp file that replaces it.
 func (cf *cachedFile) clone(size int64) error {
-	const op = "upspinfs/cache.clone"
+	const op errors.Op = "cache.clone"
 
 	fname := cf.c.mkTemp()
 	var err error
@@ -267,7 +284,7 @@ func (cf *cachedFile) clone(size int64) error {
 // truncate truncates a currently open cached file.  If it represents a reference in the store,
 // copy it rather than truncating in place.
 func (cf *cachedFile) truncate(n *node, size int64) error {
-	const op = "upspinfs/cache.truncate"
+	const op errors.Op = "cache.truncate"
 
 	// This is the easy case.
 	if cf.dirty {
@@ -305,7 +322,7 @@ func (cf *cachedFile) writeAt(buf []byte, offset int64) (int, error) {
 
 // writeback writes the cached file to the store if it is dirty. Called with node locked.
 func (cf *cachedFile) writeback(h *handle) error {
-	const op = "upspinfs/cache.writeback"
+	const op errors.Op = "cache.writeback"
 	n := h.n
 
 	// Nothing to do if the cache file isn't dirty.
@@ -338,6 +355,7 @@ func (cf *cachedFile) writeback(h *handle) error {
 	for tries := 0; ; tries++ {
 		de, err = cf.c.client.Put(n.uname, cleartext)
 		if err == nil {
+			n.seq = de.Sequence
 			n.attr.Mtime = de.Time.Go()
 			break
 		}
@@ -348,7 +366,7 @@ func (cf *cachedFile) writeback(h *handle) error {
 				// increase the ref count for the cached version
 				// so that the xattr at least lasts as long as
 				// upspinfs stays up. Not perfect but keeps
-				// MacOS finder happy.
+				// macOS finder happy.
 				// TODO(p): this might be improved by constraining
 				// to fewer error types.
 				cf.file.Pin()
@@ -360,8 +378,7 @@ func (cf *cachedFile) writeback(h *handle) error {
 	}
 
 	// Rename it to reflect the actual reference in the store so that new
-	// opens will find the cached version.  Assume a single block.
-	// TODO(p): what if it isn't a single block?
+	// opens will find the cached version.
 	cdir, fname := cf.c.cacheName(de)
 	if err := os.Rename(cf.fname, fname); err != nil {
 		// Otherwise rename to the common name.
@@ -378,7 +395,7 @@ func (cf *cachedFile) writeback(h *handle) error {
 
 // putRedirect assumes that the target fits in a single block.
 func (c *cache) putRedirect(n *node, target upspin.PathName) error {
-	const op = "upspinfs/cache.putRedirect"
+	const op errors.Op = "cache.putRedirect"
 
 	// Use the client library to write it.
 	_, err := c.client.PutLink(target, n.uname)
