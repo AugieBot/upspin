@@ -32,7 +32,7 @@ var _ upspin.StoreServer = (*server)(nil)
 
 // New returns a StoreServer that serves the given endpoint with the provided options.
 func New(options ...string) (upspin.StoreServer, error) {
-	const op = "store/server.New"
+	const op errors.Op = "store/server.New"
 
 	var backend string
 	var dialOpts []storage.DialOpts
@@ -45,7 +45,9 @@ func New(options ...string) (upspin.StoreServer, error) {
 		// Pass other options to the storage backend.
 		dialOpts = append(dialOpts, storage.WithOptions(option))
 	}
-
+	if backend == "" {
+		return nil, errors.E(op, errors.Invalid, `storage "backend" option is missing`)
+	}
 	s, err := storage.Dial(backend, dialOpts...)
 	if err != nil {
 		return nil, errors.E(op, err)
@@ -57,7 +59,7 @@ func New(options ...string) (upspin.StoreServer, error) {
 
 // Put implements upspin.StoreServer.
 func (s *server) Put(data []byte) (*upspin.Refdata, error) {
-	const op = "store/server.Put"
+	const op errors.Op = "store/server.Put"
 
 	m, sp := metric.NewSpan(op)
 	sp.SetAnnotation(fmt.Sprintf("size=%d", len(data)))
@@ -79,7 +81,7 @@ func (s *server) Put(data []byte) (*upspin.Refdata, error) {
 
 // Get implements upspin.StoreServer.
 func (s *server) Get(ref upspin.Reference) ([]byte, *upspin.Refdata, []upspin.Location, error) {
-	const op = "store/server.Get"
+	const op errors.Op = "store/server.Get"
 
 	m, sp := metric.NewSpan(op)
 	defer m.Done()
@@ -121,7 +123,7 @@ func (s *server) Get(ref upspin.Reference) ([]byte, *upspin.Refdata, []upspin.Lo
 
 // Delete implements upspin.StoreServer.
 func (s *server) Delete(ref upspin.Reference) error {
-	const op = "store/server.Delete"
+	const op errors.Op = "store/server.Delete"
 
 	m, _ := metric.NewSpan(op)
 	defer m.Done()
@@ -139,11 +141,6 @@ func (s *server) Dial(config upspin.Config, e upspin.Endpoint) (upspin.Service, 
 	defer s.mu.Unlock()
 	s.refCount++
 	return s, nil
-}
-
-// Ping implements upspin.Service.
-func (s *server) Ping() bool {
-	return true
 }
 
 // Close implements upspin.Service.
