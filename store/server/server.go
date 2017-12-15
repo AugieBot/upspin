@@ -7,6 +7,7 @@
 package server // import "upspin.io/store/server"
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -32,7 +33,7 @@ var _ upspin.StoreServer = (*server)(nil)
 
 // New returns a StoreServer that serves the given endpoint with the provided options.
 func New(options ...string) (upspin.StoreServer, error) {
-	const op = "store/server.New"
+	const op errors.Op = "store/server.New"
 
 	var backend string
 	var dialOpts []storage.DialOpts
@@ -45,7 +46,9 @@ func New(options ...string) (upspin.StoreServer, error) {
 		// Pass other options to the storage backend.
 		dialOpts = append(dialOpts, storage.WithOptions(option))
 	}
-
+	if backend == "" {
+		return nil, errors.E(op, errors.Invalid, `storage "backend" option is missing`)
+	}
 	s, err := storage.Dial(backend, dialOpts...)
 	if err != nil {
 		return nil, errors.E(op, err)
@@ -57,7 +60,7 @@ func New(options ...string) (upspin.StoreServer, error) {
 
 // Put implements upspin.StoreServer.
 func (s *server) Put(data []byte) (*upspin.Refdata, error) {
-	const op = "store/server.Put"
+	const op errors.Op = "store/server.Put"
 
 	m, sp := metric.NewSpan(op)
 	sp.SetAnnotation(fmt.Sprintf("size=%d", len(data)))
@@ -79,13 +82,14 @@ func (s *server) Put(data []byte) (*upspin.Refdata, error) {
 
 // Get implements upspin.StoreServer.
 func (s *server) Get(ref upspin.Reference) ([]byte, *upspin.Refdata, []upspin.Location, error) {
-	const op = "store/server.Get"
+	const op errors.Op = "store/server.Get"
 
 	m, sp := metric.NewSpan(op)
 	defer m.Done()
 	defer sp.End()
 
-	if ref == upspin.HTTPBaseMetadata {
+	switch {
+	case ref == upspin.HTTPBaseMetadata:
 		refData := &upspin.Refdata{Reference: ref}
 		s.mu.Lock()
 		base := s.linkBase
@@ -104,24 +108,49 @@ func (s *server) Get(ref upspin.Reference) ([]byte, *upspin.Refdata, []upspin.Lo
 		s.linkBase = base
 		s.mu.Unlock()
 		return base, refData, nil, nil
-	}
 
-	data, err := s.storage.Download(string(ref))
-	if err != nil {
-		return nil, nil, nil, errors.E(op, err)
+	case strings.HasPrefix(string(ref), string(upspin.ListRefsMetadata)):
+		ls, ok := s.storage.(storage.Lister)
+		if !ok {
+			return nil, nil, nil, upspin.ErrNotSupported
+		}
+		token := strings.TrimPrefix(string(ref), string(upspin.ListRefsMetadata))
+		refs, next, err := ls.List(token)
+		if err != nil {
+			return nil, nil, nil, errors.E(op, err)
+		}
+		result := upspin.ListRefsResponse{
+			Refs: refs,
+			Next: next,
+		}
+		b, err := json.Marshal(result)
+		if err != nil {
+			return nil, nil, nil, errors.E(op, err)
+		}
+		refdata := &upspin.Refdata{
+			Reference: ref,
+			Volatile:  true,
+		}
+		return b, refdata, nil, nil
+
+	default:
+		data, err := s.storage.Download(string(ref))
+		if err != nil {
+			return nil, nil, nil, errors.E(op, err)
+		}
+		refdata := &upspin.Refdata{
+			Reference: ref,
+			Volatile:  false,
+			Duration:  0,
+		}
+		sp.SetAnnotation(fmt.Sprintf("refsize=%d", len(ref)))
+		return data, refdata, nil, nil
 	}
-	refdata := &upspin.Refdata{
-		Reference: ref,
-		Volatile:  false,
-		Duration:  0,
-	}
-	sp.SetAnnotation(fmt.Sprintf("refsize=%d", len(ref)))
-	return data, refdata, nil, nil
 }
 
 // Delete implements upspin.StoreServer.
 func (s *server) Delete(ref upspin.Reference) error {
-	const op = "store/server.Delete"
+	const op errors.Op = "store/server.Delete"
 
 	m, _ := metric.NewSpan(op)
 	defer m.Done()
@@ -139,11 +168,6 @@ func (s *server) Dial(config upspin.Config, e upspin.Endpoint) (upspin.Service, 
 	defer s.mu.Unlock()
 	s.refCount++
 	return s, nil
-}
-
-// Ping implements upspin.Service.
-func (s *server) Ping() bool {
-	return true
 }
 
 // Close implements upspin.Service.
