@@ -16,13 +16,11 @@ import (
 	"time"
 
 	pb "github.com/golang/protobuf/proto"
-	gContext "golang.org/x/net/context"
 
 	"upspin.io/errors"
 	"upspin.io/factotum"
 	"upspin.io/log"
 	"upspin.io/upspin"
-	"upspin.io/upspin/proto"
 	"upspin.io/valid"
 )
 
@@ -190,7 +188,7 @@ func (s *serverImpl) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func sendResponse(w http.ResponseWriter, resp pb.Message, err error) {
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		sendError(w, err)
 		return
 	}
 	payload, err := pb.Marshal(resp)
@@ -202,11 +200,18 @@ func sendResponse(w http.ResponseWriter, resp pb.Message, err error) {
 	w.Write(payload)
 }
 
+func sendError(w http.ResponseWriter, err error) {
+	h := w.Header()
+	h.Set("Content-type", "application/octet-stream")
+	w.WriteHeader(http.StatusInternalServerError)
+	w.Write(errors.MarshalError(err))
+}
+
 func serveStream(s Stream, sess Session, w http.ResponseWriter, body []byte) {
 	done := make(chan struct{})
 	msgs, err := s(sess, body, done)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		sendError(w, err)
 		return
 	}
 
@@ -254,7 +259,7 @@ func serveStream(s Stream, sess Session, w http.ResponseWriter, body []byte) {
 }
 
 func (s *serverImpl) SessionForRequest(w http.ResponseWriter, r *http.Request) (session Session, err error) {
-	const op = "rpc.SessionForRequest"
+	const op errors.Op = "rpc.SessionForRequest"
 
 	defer func() {
 		if err == nil {
@@ -274,34 +279,29 @@ func (s *serverImpl) SessionForRequest(w http.ResponseWriter, r *http.Request) (
 
 	proxyRequest, ok := r.Header[proxyRequestHeader]
 	if ok && len(proxyRequest) != 1 {
-		return nil, errors.E(errors.Invalid, errors.Str("invalid proxy request in header"))
+		return nil, errors.E(errors.Invalid, "invalid proxy request in header")
 	}
 
 	// Clients send a single header line with comma-separated values.
 	authRequest, ok := r.Header[authRequestHeader]
 	if !ok {
-		return nil, errors.E(errors.Invalid, errors.Str("missing auth request header"))
+		return nil, errors.E(errors.Invalid, "missing auth request header")
 	} else if len(authRequest) == 5 {
 		// Old-style authentication tokens should now fail,
 		// but provide an informative error message when they do.
 		// TODO(adg): Remove this if/else block on April 15.
-		return nil, errors.E(errors.Invalid, errors.Str("invalid auth request header (please update your Upspin clients and servers)"))
+		return nil, errors.E(errors.Invalid, "invalid auth request header (please update your Upspin clients and servers)")
 	} else if len(authRequest) != 1 {
-		return nil, errors.E(errors.Invalid, errors.Str("invalid auth request header"))
+		return nil, errors.E(errors.Invalid, "invalid auth request header")
 	}
 	authRequest = strings.Split(authRequest[0], ",")
 
 	return s.handleSessionRequest(w, authRequest, proxyRequest, r.Host)
 }
 
-// Ping implements Pinger.
-func (s *serverImpl) Ping(gContext gContext.Context, req *proto.PingRequest) (*proto.PingResponse, error) {
-	return &proto.PingResponse{PingSequence: req.PingSequence}, nil
-}
-
 func (s *serverImpl) validateToken(authToken string) (Session, error) {
 	if len(authToken) < authTokenEntropyLen {
-		return nil, errors.E(errors.Invalid, errors.Str("invalid auth token"))
+		return nil, errors.E(errors.Invalid, "invalid auth token")
 	}
 
 	// Get the session for this authToken
@@ -339,8 +339,8 @@ func (s *serverImpl) handleSessionRequest(w http.ResponseWriter, authRequest []s
 	// set the signed host to that endpoint.
 	ep := &upspin.Endpoint{}
 	if len(proxyRequest) == 1 {
-		if user != s.config.UserName() {
-			return nil, errors.E(errors.Permission, "client and proxy user must match")
+		if pUser := s.config.UserName(); user != pUser {
+			return nil, errors.E(errors.Permission, errors.Errorf("client %q and proxy %q users mismatched", user, pUser))
 		}
 		ep, err = upspin.ParseEndpoint(proxyRequest[0])
 		if err != nil {
@@ -412,8 +412,12 @@ func verifyUser(key upspin.PublicKey, msg []string, magic, host string, now time
 	hash := hashUser(magic, msg[0], msg[1], msg[2])
 	err = factotum.Verify(hash, upspin.Signature{R: &rs, S: &ss}, key)
 	if err != nil {
-		err = errors.Errorf("signature fails to validate using the provided key: %s", err)
-		log.Debug.Printf("rpc/server: verifyUser: %s", err)
+		shortKey := string(key)
+		if len(shortKey) > 16 {
+			shortKey = shortKey[:16] + "..."
+		}
+		user := msg[0]
+		log.Debug.Printf("rpc/server: signature fails to validate using key %q for %q: %s", shortKey, user, err)
 		return err
 	}
 	return nil
@@ -426,7 +430,7 @@ func signUser(cfg upspin.Config, magic, host string) ([]string, error) {
 	}
 	f := cfg.Factotum()
 	if f == nil {
-		return nil, errors.Str("no factotum available")
+		return nil, errors.E(cfg.UserName(), "no factotum available")
 	}
 
 	user := string(cfg.UserName())
