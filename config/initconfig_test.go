@@ -12,11 +12,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
-	"sync"
 	"testing"
 
 	"upspin.io/pack"
-	"upspin.io/rpc/local"
 	"upspin.io/upspin"
 
 	_ "upspin.io/pack/ee"
@@ -27,8 +25,6 @@ func init() {
 	inTest = true
 }
 
-var once sync.Once
-
 type expectations struct {
 	username    upspin.UserName
 	keyserver   upspin.Endpoint
@@ -36,16 +32,7 @@ type expectations struct {
 	storeserver upspin.Endpoint
 	packing     upspin.Packing
 	secrets     string
-	cmdflags    map[string]map[string]string
-}
-
-type envs struct {
-	username    string
-	keyserver   string
-	dirserver   string
-	storeserver string
-	packing     string
-	secrets     string
+	cmdflags    string
 }
 
 var secretsDir string
@@ -78,6 +65,12 @@ func TestDefaults(t *testing.T) {
 }
 
 func TestBadKey(t *testing.T) {
+	// TODO(adg): with the addition of Value to the upspin.Config interface
+	// it is not clear whether the "unknown" keys should trigger errors.
+	// To do this we'd need to make the config package aware of all valid
+	// config keys, which may or may not be desirable.
+	t.Skip("not sure whether this should be the expected behavior")
+
 	// "name=" should be "username=".
 	const config = `name: p@google.com
 packing: ee
@@ -111,10 +104,11 @@ secrets: ` + secretsDir + "\n"
 		keyserver:   upspin.Endpoint{Transport: upspin.Remote, NetAddr: "key.example.com:443"},
 		dirserver:   upspin.Endpoint{Transport: upspin.Remote, NetAddr: "dir.example.com:443"},
 		storeserver: upspin.Endpoint{Transport: upspin.Remote, NetAddr: "store.example.com:8080"},
-		cmdflags: map[string]map[string]string{
-			"cacheserver": map[string]string{"cachedir": "/tmp", "cachesize": "1000000000"},
-			"upspinfs":    map[string]string{"cachedir": "/tmp"},
-		},
+		cmdflags: `cacheserver:
+  cachedir: /tmp
+  cachesize: 1000000000
+upspinfs:
+  cachedir: /tmp`,
 	}
 	testConfig(t, &expect, config)
 }
@@ -150,6 +144,11 @@ cmdflags:
 		t.Fatalf("cachesize got %v, expected %v", *cacheSizeFlag, expectedSize)
 	}
 
+	// No flags present for upspinfs, and that's fine.
+	if err := SetFlagValues(config, "upspinfs"); err != nil {
+		t.Fatalf("SetFlagValues should not have failed for upspinfs: %v", err)
+	}
+
 	// Add an undefined flag and expect an error from the apply.
 	configuration = `
 secrets: ` + secretsDir + `
@@ -165,119 +164,6 @@ cmdflags:
 	}
 	if err := SetFlagValues(config, "cacheserver"); err == nil {
 		t.Fatalf("SetFlagValues should have failed %v", configuration)
-	}
-
-}
-
-func TestCacheValues(t *testing.T) {
-	// Test values for cache:.
-	base := "secrets: " + secretsDir + "\n"
-	baseConfig, err := InitConfig(strings.NewReader(base))
-	if err != nil {
-		t.Fatalf("could not parse config %v: %v", base, err)
-	}
-	localAddr := local.LocalName(baseConfig, "cacheserver")
-	tests := []struct {
-		val    string
-		expect string
-	}{
-		{"y", localAddr},
-		{"yes", localAddr},
-		{"true", localAddr},
-		{"n", ""},
-		{"no", ""},
-		{"false", ""},
-		{"remote,server.example.com", "remote,server.example.com"},
-	}
-	for _, test := range tests {
-		configuration := base + "cache: " + test.val + "\n"
-		config, err := InitConfig(strings.NewReader(configuration))
-		if err != nil {
-			t.Fatalf("could not parse config %v: %v", configuration, err)
-		}
-		ep, err := parseTestEndpoint(test.expect)
-		if err != nil {
-			t.Fatalf("bad test: %v: %s", test, err)
-		}
-		if ep.String() != config.CacheEndpoint().String() {
-			t.Fatalf("expect %s got %s", ep, config.CacheEndpoint())
-		}
-	}
-}
-
-func parseTestEndpoint(text string) (upspin.Endpoint, error) {
-	if text == "" {
-		return upspin.Endpoint{}, nil
-	}
-
-	ep, err := upspin.ParseEndpoint(text)
-	// If no transport is provided, assume remote transport.
-	if err != nil && !strings.Contains(text, ",") {
-		var err2 error
-		if ep, err2 = upspin.ParseEndpoint("remote," + text); err2 == nil {
-			err = nil
-		}
-	}
-	if err != nil {
-		return upspin.Endpoint{}, err
-	}
-
-	// If it's a remote and the provided address does not include a port,
-	// assume port 443.
-	if ep.Transport == upspin.Remote && !strings.Contains(string(ep.NetAddr), ":") {
-		ep.NetAddr += ":443"
-	}
-	return *ep, nil
-}
-
-func TestEnv(t *testing.T) {
-	expect := expectations{
-		username:    "quux",
-		keyserver:   upspin.Endpoint{Transport: upspin.InProcess, NetAddr: ""},
-		dirserver:   upspin.Endpoint{Transport: upspin.Remote, NetAddr: "who.knows:1234"},
-		storeserver: upspin.Endpoint{Transport: upspin.Remote, NetAddr: "who.knows:1234"},
-		packing:     upspin.EEPack,
-		secrets:     secretsDir,
-	}
-
-	defer func() {
-		os.Setenv("upspinusername", "")
-		os.Setenv("upspinkeyserver", "")
-		os.Setenv("upspindirserver", "")
-		os.Setenv("upspinstoreserver", "")
-		os.Setenv("upspinpacking", "")
-	}()
-	config := makeConfig(&expect)
-	expect.username = "p@google.com"
-	os.Setenv("upspinusername", string(expect.username))
-	expect.keyserver = upspin.Endpoint{Transport: upspin.InProcess, NetAddr: ""}
-	expect.dirserver = upspin.Endpoint{Transport: upspin.Remote, NetAddr: "who.knows:1234"}
-	expect.storeserver = upspin.Endpoint{Transport: upspin.Remote, NetAddr: "who.knows:1234"}
-	os.Setenv("upspinkeyserver", expect.keyserver.String())
-	os.Setenv("upspindirserver", expect.dirserver.String())
-	os.Setenv("upspinstoreserver", expect.storeserver.String())
-	expect.packing = upspin.EEPack
-	os.Setenv("upspinpacking", pack.Lookup(expect.packing).String())
-	testConfig(t, &expect, config)
-}
-
-func TestBadEnv(t *testing.T) {
-	expect := expectations{
-		username:    "p@google.com",
-		keyserver:   upspin.Endpoint{Transport: upspin.InProcess, NetAddr: ""},
-		dirserver:   upspin.Endpoint{Transport: upspin.Remote, NetAddr: "who.knows:1234"},
-		storeserver: upspin.Endpoint{Transport: upspin.Remote, NetAddr: "who.knows:1234"},
-		packing:     upspin.EEPack,
-	}
-	config := makeConfig(&expect)
-	os.Setenv("upspinuser", string(expect.username)) // Should be upspinusername.
-	_, err := InitConfig(strings.NewReader(config))
-	os.Unsetenv("upspinuser")
-	if err == nil {
-		t.Fatalf("expected error, got none")
-	}
-	if !strings.Contains(err.Error(), "unrecognized environment variable") {
-		t.Fatalf("expected bad env var error; got %q", err)
 	}
 }
 
@@ -340,38 +226,6 @@ func makeConfig(expect *expectations) string {
 	return buf.String()
 }
 
-func saveEnvs(e *envs) {
-	e.username = os.Getenv("upspinusername")
-	e.keyserver = os.Getenv("upspinkeyserver")
-	e.dirserver = os.Getenv("upspindirserver")
-	e.storeserver = os.Getenv("upspinstoreserver")
-	e.packing = os.Getenv("upspinpacking")
-	e.secrets = os.Getenv("upspinsecrets")
-}
-
-func restoreEnvs(e *envs) {
-	os.Setenv("upspinusername", e.username)
-	os.Setenv("upspinkeyserver", e.keyserver)
-	os.Setenv("upspindirserver", e.dirserver)
-	os.Setenv("upspinstoreserver", e.storeserver)
-	os.Setenv("upspinpacking", e.packing)
-	os.Setenv("upspinsecrets", e.secrets)
-}
-
-func resetEnvs() {
-	var emptyEnv envs
-	restoreEnvs(&emptyEnv)
-}
-
-func TestMain(m *testing.M) {
-	var e envs
-	saveEnvs(&e)
-	resetEnvs()
-	code := m.Run()
-	restoreEnvs(&e)
-	os.Exit(code)
-}
-
 func testConfig(t *testing.T, expect *expectations, configuration string) {
 	config, err := InitConfig(strings.NewReader(configuration))
 	if err != nil {
@@ -396,10 +250,8 @@ func testConfig(t *testing.T, expect *expectations, configuration string) {
 	if config.Packing() != expect.packing {
 		t.Errorf("got %v expected %v", config.Packing(), expect.packing)
 	}
-	for cmd, eflags := range expect.cmdflags {
-		flags := config.Flags(cmd)
-		if !reflect.DeepEqual(eflags, flags) {
-			t.Errorf("cmdflags for %s got %v expected %v", cmd, flags, eflags)
-		}
+	cmdflags := config.Value("cmdflags")
+	if !reflect.DeepEqual(expect.cmdflags, cmdflags) {
+		t.Errorf("got cmdflags\n\t%#v\nexpected\n\t%#v", cmdflags, expect.cmdflags)
 	}
 }
