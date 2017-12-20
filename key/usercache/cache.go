@@ -79,7 +79,7 @@ func ResetGlobal() {
 
 // Lookup implements upspin.KeyServer.
 func (c *userCacheServer) Lookup(name upspin.UserName) (*upspin.User, error) {
-	const op = "key/usercache.Lookup"
+	const op errors.Op = "key/usercache.Lookup"
 
 	// If we have an unexpired cache entry, use it.
 	if v, ok := c.cache.entries.Get(name); ok {
@@ -108,7 +108,7 @@ func (c *userCacheServer) Lookup(name upspin.UserName) (*upspin.User, error) {
 
 // Put implements upspin.KeyServer.
 func (c *userCacheServer) Put(user *upspin.User) error {
-	const op = "key/usercache.Put"
+	const op errors.Op = "key/usercache.Put"
 	if err := c.dial(); err != nil {
 		return errors.E(op, err)
 	}
@@ -130,19 +130,6 @@ func (c *userCacheServer) Endpoint() upspin.Endpoint {
 		return svc.Endpoint()
 	}
 	return c.base.Endpoint()
-}
-
-// Ping implements upspin.Service.
-func (c *userCacheServer) Ping() bool {
-	// We don't want Ping to trigger a Dial.
-	// If we're not yet dialed, just return true.
-	c.dd.mu.Lock()
-	svc := c.dd.dialed
-	c.dd.mu.Unlock()
-	if svc == nil {
-		return true
-	}
-	return svc.Ping()
 }
 
 // Authenticate implements upspin.Service.

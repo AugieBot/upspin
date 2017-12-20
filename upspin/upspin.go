@@ -6,7 +6,6 @@ package upspin // import "upspin.io/upspin"
 
 import (
 	"crypto/elliptic"
-	"crypto/x509"
 	"errors"
 	"math/big"
 	"time"
@@ -85,7 +84,37 @@ var (
 	// may be requested by HTTP(S). The server may return a URL to which
 	// a reference may be appended to obtain that reference's data.
 	HTTPBaseMetadata Reference = "metadata:HTTP-Base"
+
+	// FlushWritebacksMetadata is used as a signal to flush the cache.
+	// A Get will return only after all writebacks have completed.
+	FlushWritebacksMetadata Reference = "metadata:FlushWritebacks"
+
+	// ListRefsMetadata is used by administrators to enumerate the
+	// references held by a StoreServer. Callers pass this value verbatim
+	// for the initial request and append a pagination token for subsequent
+	// requests. The response from such a request is a JSON-encoded
+	// ListRefsResponse.
+	ListRefsMetadata Reference = "metadata:ListRefs:"
 )
+
+// ListRefsResponse describes a response from a StoreServer.Get
+// call for ListRefsMetadata.
+type ListRefsResponse struct {
+	// Refs holds the reference information.
+	Refs []ListRefsItem
+	// Next holds the token to fetch the next page,
+	// or the empty string if this is the last page.
+	Next string
+}
+
+// ListRefsItem describes a reference in a StoreServer,
+// returned as part of a ListRefsResponse.
+type ListRefsItem struct {
+	// Ref holds the reference name.
+	Ref Reference
+	// Size the length of the reference data.
+	Size int64
+}
 
 // Signature is an ECDSA signature.
 type Signature struct {
@@ -114,6 +143,13 @@ type Factotum interface {
 	// The argument hash should be a cryptographic hash of the message you want to sign,
 	// no longer than your key's curve order. Don't use without a security consult.
 	Sign(hash []byte) (Signature, error)
+
+	// HKDF cryptographically mixes salt, info, and the Factotum secret and
+	// writes the result to out, which may be of any length but is typically
+	// 8 or 16 bytes. The result is unguessable without the secret, and does
+	// not leak the secret. For more information, see package
+	// golang.org/x/crypto/hkdf.
+	HKDF(salt, info, out []byte) error
 
 	// Pop derives a Factotum that defaults to the previous key.
 	Pop() Factotum
@@ -210,6 +246,9 @@ type Packer interface {
 	// In case of error, Share skips processing for that reader or packdata.
 	// If packdata[i] is nil on return, it was skipped.
 	// Share trusts the caller to check the arguments are not malicious.
+	// To enable all Upspin users to decrypt the ciphertext, include
+	// AllReadersKey among the provided reader keys.
+	//
 	// TODO: It would be nice if DirServer provided a method to report
 	// which items need updates, so this could be automated.
 	Share(config Config, readers []PublicKey, packdata []*[]byte)
@@ -220,12 +259,21 @@ type Packer interface {
 	// in entry must contain a wrapped key for that user.
 	Name(config Config, entry *DirEntry, path PathName) error
 
+	// SetTime changes the Time field in a DirEntry and recomputes
+	// its signature.
+	SetTime(config Config, entry *DirEntry, time Time) error
+
 	// Countersign updates the signatures in the DirEntry when a writer
 	// is in the process of switching to a new key. It checks that
 	// the first existing signature verifies under the old key, copies
 	// that one over the second existing signature, and creates a new
 	// first signature using the key from factotum.
 	Countersign(oldKey PublicKey, f Factotum, d *DirEntry) error
+
+	// UnpackableByAll reports whether the packed data may be unpacked by
+	// all Upspin users. Access and Group files must have this property, as
+	// should any files for which access.AllUsers have the read permission.
+	UnpackableByAll(d *DirEntry) (bool, error)
 }
 
 const (
@@ -301,6 +349,10 @@ type KeyServer interface {
 // A PublicKey can be seen by anyone and is used for authenticating a user.
 type PublicKey string
 
+// AllUsersKey is a sentinel PublicKey value used to indicate that a
+// Packer.Share operation should make the data readable to anyone.
+var AllUsersKey = PublicKey("read: all")
+
 var (
 	// ErrFollowLink indicates that all or part of a path name has
 	// evaluated to a DirEntry that is a link. In that case, the returned
@@ -320,8 +372,8 @@ var (
 // when evaluating a single path name.
 const MaxLinkHops = 20
 
-// Special order values for Watch that can be used in place of the order
-// argument in the Watch function.
+// Special Sequence values for Watch that can be used in place of the
+// Sequence argument in the Watch function.
 const (
 	// WatchStart returns all known events.
 	WatchStart = -iota
@@ -358,12 +410,13 @@ type DirServer interface {
 	// Time represents a timestamp for the item. It is advisory only
 	// but is included in the packing signature and so should usually
 	// be set to a non-zero value.
+	//
 	// Sequence represents a sequence number that is incremented
 	// after each Put. If it is neither 0 nor -1, the DirServer will
-	// reject the Put operation unless Sequence is the same as that
-	// stored in the metadata for the existing item with the same
-	// path name. If it is -1, Put will fail if there is already an item
-	// with that name.
+	// reject the Put operation if the file does not exist or, for an
+	// existing item, if the Sequence is not the same as that
+	// stored in the metadata. If it is -1, Put will fail if there
+	// is already an item with that name.
 	//
 	// The Name field of the DirEntry identifies where in the directory
 	// tree the entry belongs. The SignedName field, which usually has the
@@ -383,9 +436,12 @@ type DirServer interface {
 	// If the returned error is ErrFollowLink, the caller should
 	// retry the operation as outlined in the description for
 	// ErrFollowLink (with the added step of updating the
-	// Name field of the argument DirEntry). Otherwise, the
-	// returned DirEntry will be nil whether the operation
-	// succeeded or not.
+	// Name field of the argument DirEntry). For any other error,
+	// the return DirEntry will be nil.
+	//
+	// A successful Put returns an incomplete DirEntry (see the
+	// description of AttrIncomplete) containing only the
+	// new sequence number.
 	Put(entry *DirEntry) (*DirEntry, error)
 
 	// Glob matches the pattern against the file names of the full
@@ -403,6 +459,11 @@ type DirServer interface {
 	// DirEntries as outlined in the description for ErrFollowLink,
 	// updating the pattern as appropriate. Note that any returned
 	// links may only partially match the original argument pattern.
+	//
+	// If the pattern evaluates to one or more name that identifies
+	// a link, the DirEntry for the link is returned, not the target.
+	// This is analogous to passing false as the second argument
+	// to Client.Lookup.
 	Glob(pattern string) ([]*DirEntry, error)
 
 	// Delete deletes the DirEntry for a name from the directory service.
@@ -433,19 +494,18 @@ type DirServer interface {
 
 	// Watch returns a channel of Events that describe operations that
 	// affect the specified path and any of its descendants, beginning
-	// at the specified order (an opaque, monotonic value that denotes
-	// a position in the sequence of all events).
+	// at the specified sequence number for the corresponding user root.
 	//
-	// If order is 0, all events known to the DirServer are sent.
+	// If sequence is 0, all events known to the DirServer are sent.
 	//
-	// If order is WatchCurrent, the server first sends a sequence
+	// If sequence is WatchCurrent, the server first sends a sequence
 	// of events describing the entire tree rooted at name. The Events are
 	// sent in sequence such that a directory is sent before its contents.
 	// After the full tree has been sent, the operation proceeds as normal.
 	//
-	// If order is WatchNew, the server sends only new events.
+	// If sequence is WatchNew, the server sends only new events.
 	//
-	// If the order is otherwise invalid, this is reported by the
+	// If the sequence is otherwise invalid, this is reported by the
 	// server sending a single event with a non-nil Error field with
 	// Kind=errors.Invalid. The events channel is then closed.
 	//
@@ -469,18 +529,15 @@ type DirServer interface {
 	// The only errors returned by the Watch method itself are
 	// to report that the name is invalid or refers to a non-existent
 	// root, or that the operation is not supported.
-	Watch(name PathName, order int64, done <-chan struct{}) (<-chan Event, error)
+	Watch(name PathName, sequence int64, done <-chan struct{}) (<-chan Event, error)
 }
 
 // Event represents the creation, modification, or deletion of a DirEntry
 // within a DirServer.
 type Event struct {
-	// Entry is the DirEntry to which the event pertains.
+	// Entry is the DirEntry to which the event pertains. Its Sequence
+	// field captures the ordering of events for this user.
 	Entry *DirEntry
-
-	// Order is an opaque, monotonic value that denotes the position
-	// of this event in the sequence of all of events.
-	Order int64
 
 	// Delete is true only if the entry is being deleted;
 	// otherwise it is being created or modified.
@@ -524,8 +581,12 @@ type DirEntry struct {
 // sync manually because the flags package cannot import this package.
 const BlockSize = 1024 * 1024
 
+// MaxBlockSize is the maximum size permitted for a block. The limit
+// guarantees that 32-bit machines can process the data without problems.
+const MaxBlockSize = 1024 * 1024 * 1024
+
 // DirBlock describes a block of data representing a contiguous section of a file.
-// The block my be of any non-negative size, but in large files is usually
+// The block may be of any non-negative size, but in large files is usually
 // BlockSize long.
 type DirBlock struct {
 	Location Location // Location of data in store.
@@ -551,11 +612,23 @@ const (
 	// A link DirEntry holds zero DirBlocks.
 	AttrLink = Attribute(1 << 1)
 	// AttrIncomplete identifies a DirEntry whose Blocks and Packdata
-	// fields are elided for access control purposes.
+	// fields are elided for access control purposes, or the reply to
+	// a successful Put containing only the updated sequence number.
 	AttrIncomplete = Attribute(1 << 2)
 )
 
-// Special Sequence numbers.
+// Sequence numbers.
+// Sequence numbers are controlled by the DirServer. For a given user root they
+// start at SeqBase and grow monotonically (typically but not necessarily by
+// one) with each Put or Delete operation in that user's tree. After an item is
+// Put to or Deleted from the DirServer, the Sequence of that item (or its
+// directory, for a Delete) and all of the directories on its path will be set
+// to the next Sequence number for the user tree. Thus, as a corollary, any
+// directory but in particular the user root always has the Sequence number of
+// the most recently modified item at that level or deeper in the tree.
+//
+// When a file or directory is being created, the sequence number in the
+// DirEntry provided to Put must be either SeqNotExist or SeqIgnore.
 const (
 	SeqNotExist = -1 // Put will fail if item exists.
 	SeqIgnore   = 0  // Put will not check sequence number, but will update it.
@@ -631,6 +704,10 @@ type Client interface {
 	// name, although it may still exist in the storage server. (See
 	// the documentation for Delete.) Like Get, it is not the usual
 	// access method. The file-like API is preferred.
+	//
+	// A successful Put returns an incomplete DirEntry (see the
+	// description of AttrIncomplete) containing only the
+	// new sequence number.
 	Put(name PathName, data []byte) (*DirEntry, error)
 
 	// PutLink creates a link from the new name to the old name. The
@@ -642,21 +719,42 @@ type Client interface {
 	// argument to PutLink even if it refers to a path that itself
 	// contains links. The name is canonicalized, however (see
 	// path.Clean).
+	//
+	// A successful PutLink returns an incomplete DirEntry (see the
+	// description of AttrIncomplete) containing only the
+	// new sequence number.
 	PutLink(oldName, newName PathName) (*DirEntry, error)
 
 	// PutDuplicate creates a new name for the references referred to
 	// by the old name. Subsequent Puts to either name do not effect
 	// the contents referred to by the other. There must be no existing
-	// item with the new name.
+	// item with the new name. If the final element of the path name
+	// is a link, PutDuplicate will duplicate the link and not the
+	// link target.
+	//
+	// A successful PutDuplicate returns an incomplete DirEntry (see the
+	// description of AttrIncomplete) containing only the
+	// new sequence number.
 	PutDuplicate(oldName, newName PathName) (*DirEntry, error)
 
 	// MakeDirectory creates a directory with the given name, which
 	// must not already exist. All but the last element of the path
 	// name must already exist and be directories.
+	//
+	// A successful MakeDirectory returns an incomplete DirEntry (see the
+	// description of AttrIncomplete) containing only the
+	// new sequence number.
 	MakeDirectory(dirName PathName) (*DirEntry, error)
 
 	// Rename renames oldName to newName. The old name is no longer valid.
+	// If the final element of the path name is a link, Rename will
+	// Rename the link itself, not the link target.
 	Rename(oldName, newName PathName) error
+
+	// SetTime sets the time in name's DirEntry. If the final element
+	// of the path name is a link, SetTime will affect the link itself,
+	// not the link target.
+	SetTime(name PathName, t Time) error
 
 	// Delete deletes the DirEntry associated with the name. The
 	// storage referenced by the DirEntry is not deleted,
@@ -736,16 +834,8 @@ type Config interface {
 	// StoreEndpoint is the endpoint of the StoreServer in which to place new data items.
 	StoreEndpoint() Endpoint
 
-	// CacheEndpoint is the endpoint of the store and directory cache server.
-	CacheEndpoint() Endpoint
-
-	// CertPool returns the x509 certificate pool used to validate client TLS
-	// connections. If the returned pointer is nil then the default system root
-	// certificates should be used.
-	CertPool() *x509.CertPool
-
-	// Flags returns the configured command flags for the named command.
-	Flags(cmd string) map[string]string
+	// Value returns the value for the given configuration key.
+	Value(key string) string
 }
 
 // Dialer defines how to connect and authenticate to a server. Each
@@ -763,9 +853,6 @@ type Dialer interface {
 type Service interface {
 	// Endpoint returns the network endpoint of the server.
 	Endpoint() Endpoint
-
-	// Ping reports whether the Service is reachable.
-	Ping() bool
 
 	// Close closes the connection to the service and releases all resources used.
 	// A Service may not be re-used after close.
