@@ -7,20 +7,25 @@ package main
 import (
 	"flag"
 	"fmt"
-	"os"
 )
 
 func (s *State) watch(args ...string) {
 	const help = `
-Watch watches the given Upspin path beginning with the specified order and
-prints the events to standard output. An order of -1, the default, will send
-the current state of the tree rooted at the given path.
+Watch watches the given Upspin path beginning with the specified
+sequence number and prints the events to standard output. A sequence
+number of -1, the default, will send the current state of the tree
+rooted at the given path.
+
+The -glob flag can be set to false to have watch skip Glob processing,
+treating its arguments as literal text even if they contain special
+characters. (Leading @ signs are always expanded.)
 `
 	fs := flag.NewFlagSet("watch", flag.ExitOnError)
-	order := fs.Int64("order", -1, "order")
-	s.ParseFlags(fs, args, help, "watch [-order=n] path")
+	glob := globFlag(fs)
+	sequence := fs.Int64("sequence", -1, "`sequence` number")
+	s.ParseFlags(fs, args, help, "watch [-sequence=n] path")
 
-	names := s.GlobAllUpspinPath(fs.Args())
+	names := s.expandUpspin(fs.Args(), *glob)
 	if len(names) != 1 {
 		usageAndExit(fs)
 	}
@@ -32,17 +37,18 @@ the current state of the tree rooted at the given path.
 	}
 
 	done := make(chan struct{})
-	events, err := dir.Watch(name, *order, done)
+	events, err := dir.Watch(name, *sequence, done)
 	if err != nil {
 		s.Exit(err)
 	}
 	for e := range events {
 		if e.Error != nil {
-			fmt.Fprintf(os.Stderr, "watch: error: %s\n", e.Error) // TODO: Failf? Set exitCode?
+			fmt.Fprintf(s.Stderr, "watch: error: %s\n", e.Error) // TODO: Failf? Set exitCode?
 			continue
 		}
 
 		de := e.Entry
+		seq := fmt.Sprintf("%10d", de.Sequence)
 		attr := []byte("file")
 		if de.IsDir() {
 			copy(attr, "dir ")
@@ -59,6 +65,6 @@ the current state of the tree rooted at the given path.
 			d, _ := de.Size()
 			size = fmt.Sprintf("%10d", d)
 		}
-		fmt.Printf("%s [%s] %s %s\n", de.Time, attr, size, de.Name)
+		s.Printf("%s %s [%s] %s %s\n", de.Time, seq, attr, size, de.Name)
 	}
 }
