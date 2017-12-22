@@ -8,8 +8,11 @@ package keyserver // import "upspin.io/serverutil/keyserver"
 
 import (
 	"flag"
+	"io/ioutil"
 	"net/http"
 
+	"upspin.io/cloud/mail"
+	"upspin.io/cloud/mail/sendgrid"
 	"upspin.io/config"
 	"upspin.io/errors"
 	"upspin.io/flags"
@@ -17,10 +20,13 @@ import (
 	"upspin.io/key/server"
 	"upspin.io/log"
 	"upspin.io/rpc/keyserver"
+	"upspin.io/serverutil/signup"
 	"upspin.io/upspin"
 
 	// Load required transports
 	_ "upspin.io/key/transports"
+
+	yaml "gopkg.in/yaml.v2"
 )
 
 // mailConfig specifies a config file name for the mail service.
@@ -47,7 +53,6 @@ func Main(setup func(upspin.KeyServer)) {
 		key, err = server.New(flags.ServerConfig...)
 	default:
 		err = errors.Errorf("bad -kind %q", flags.ServerKind)
-
 	}
 	if err != nil {
 		log.Fatalf("Setting up KeyServer: %v", err)
@@ -57,30 +62,53 @@ func Main(setup func(upspin.KeyServer)) {
 		setup(key)
 	}
 
-	httpStore := keyserver.New(cfg, key, upspin.NetAddr(flags.NetAddr))
-	http.Handle("/api/Key/", httpStore)
+	http.Handle("/api/Key/", keyserver.New(cfg, key, upspin.NetAddr(flags.NetAddr)))
 
 	if logger, ok := key.(server.Logger); ok {
 		http.Handle("/log", logHandler{logger: logger})
 	}
-	if *mailConfigFile != "" {
-		f := cfg.Factotum()
-		if f == nil {
-			log.Fatal("supplied config must include keys when -mail_config set")
-		}
-		project := ""
-		flag.Visit(func(f *flag.Flag) {
-			if f.Name != "project" {
-				return
-			}
-			project = f.Value.String()
-		})
-		h, err := newSignupHandler(f, key, *mailConfigFile, project)
-		if err != nil {
-			log.Fatal(err)
-		}
-		http.Handle("/signup", h)
-	} else {
-		log.Println("keyserver: -mail_config not set, /signup deactivated")
+
+	signupURL := "https://" + flags.NetAddr + "/signup"
+	f := cfg.Factotum()
+	if f == nil {
+		log.Fatal("keyserver: supplied config must include keys")
 	}
+	var mc *signup.MailConfig
+	if *mailConfigFile == "" {
+		log.Info.Printf("keyserver: WARNING: -mail_config not supplied; no emails will be sent, they will be logged instead")
+		mc = &signup.MailConfig{Mail: mail.Logger(log.Info)}
+	} else {
+		data, err := ioutil.ReadFile(*mailConfigFile)
+		if err != nil {
+			log.Fatalf("keyserver: %v", err)
+		}
+		mc, err = parseMailConfig(data)
+		if err != nil {
+			log.Fatalf("keyserver: %v", err)
+		}
+	}
+	http.Handle("/signup", signup.NewHandler(signupURL, f, key, mc))
+}
+
+// parseMailConfig reads YAML data and returns a signup.MailConfig
+// 	apikey: SENDGRID_API_KEY
+// 	notify: notify-signups@email.com
+// 	from: sender@email.com
+//	project: test
+func parseMailConfig(data []byte) (*signup.MailConfig, error) {
+	c := make(map[string]string)
+	if err := yaml.Unmarshal(data, &c); err != nil {
+		return nil, errors.E(errors.IO, err)
+	}
+	for _, k := range []string{"apikey", "notify", "project", "from"} {
+		if c[k] == "" {
+			return nil, errors.E(errors.Invalid, errors.Errorf(`key "%s" is missing in config (need "apikey", "notify", "project" and "from")`, k))
+		}
+	}
+	return &signup.MailConfig{
+		Project: c["project"],
+		Notify:  c["notify"],
+		From:    c["from"],
+		Mail:    sendgrid.New(c["apikey"]),
+	}, nil
 }

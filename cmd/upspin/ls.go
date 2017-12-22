@@ -7,7 +7,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"os"
 	"strings"
 
 	"upspin.io/upspin"
@@ -57,10 +56,24 @@ func (s *State) list(entry *upspin.DirEntry, done map[upspin.PathName]bool, long
 		dirContents = []*upspin.DirEntry{entry}
 	}
 
+	// Glob doesn't follow the final link. We may have to do so ourselves.
+	if followLinks {
+		for i, entry := range dirContents {
+			if entry.IsLink() {
+				e, err := s.Client.Lookup(entry.Link, false)
+				if err != nil {
+					s.Fail(err)
+					continue
+				}
+				dirContents[i] = e
+			}
+		}
+	}
+
 	if longFormat {
-		printLongDirEntries(dirContents)
+		s.printLongDirEntries(dirContents)
 	} else {
-		printShortDirEntries(dirContents)
+		s.printShortDirEntries(dirContents)
 	}
 
 	if !recur {
@@ -68,7 +81,7 @@ func (s *State) list(entry *upspin.DirEntry, done map[upspin.PathName]bool, long
 	}
 	for _, entry := range dirContents {
 		if entry.IsDir() && !done[entry.Name] {
-			fmt.Printf("\n%s:\n", entry.Name)
+			s.Printf("\n%s:\n", entry.Name)
 			s.list(entry, done, longFormat, followLinks, recur)
 		}
 	}
@@ -78,27 +91,28 @@ func hasFinalSlash(name upspin.PathName) bool {
 	return strings.HasSuffix(string(name), "/")
 }
 
-func printShortDirEntries(de []*upspin.DirEntry) {
+func (s *State) printShortDirEntries(de []*upspin.DirEntry) {
 	for _, e := range de {
-		if e.IsDir() && !hasFinalSlash(e.Name) {
-			fmt.Printf("%s/\n", e.Name)
-		} else {
-			fmt.Printf("%s\n", e.Name)
+		switch {
+		case e.IsDir() && !hasFinalSlash(e.Name):
+			s.Printf("%s/\n", e.Name)
+		default:
+			s.Printf("%s\n", e.Name)
 		}
 	}
 }
 
-func printLongDirEntries(de []*upspin.DirEntry) {
+func (s *State) printLongDirEntries(de []*upspin.DirEntry) {
 	seqWidth := 2
 	sizeWidth := 2
 	for _, e := range de {
-		s := fmt.Sprintf("%d", upspin.SeqVersion(e.Sequence))
-		if seqWidth < len(s) {
-			seqWidth = len(s)
+		str := fmt.Sprintf("%d", e.Sequence)
+		if seqWidth < len(str) {
+			seqWidth = len(str)
 		}
-		s = fmt.Sprintf("%d", sizeOf(e))
-		if sizeWidth < len(s) {
-			sizeWidth = len(s)
+		str = fmt.Sprintf("%d", s.sizeOf(e))
+		if sizeWidth < len(str) {
+			sizeWidth = len(str)
 		}
 	}
 	for _, e := range de {
@@ -128,15 +142,15 @@ func printLongDirEntries(de []*upspin.DirEntry) {
 			endpt += loc
 		}
 		packStr := "?"
-		packer := lookupPacker(e)
+		packer := s.lookupPacker(e)
 		if packer != nil {
 			packStr = packer.String()
 		}
-		fmt.Printf("%c %-6s %*d %*d %s [%s]\t%s%s\n",
+		s.Printf("%c %-6s %*d %*d %s [%s]\t%s%s\n",
 			attrChar,
 			packStr,
-			seqWidth, upspin.SeqVersion(e.Sequence),
-			sizeWidth, sizeOf(e),
+			seqWidth, e.Sequence,
+			sizeWidth, s.sizeOf(e),
 			e.Time.Go().Local().Format("Mon Jan _2 15:04:05"),
 			endpt,
 			e.Name,
@@ -144,10 +158,10 @@ func printLongDirEntries(de []*upspin.DirEntry) {
 	}
 }
 
-func sizeOf(e *upspin.DirEntry) int64 {
+func (s *State) sizeOf(e *upspin.DirEntry) int64 {
 	size, err := e.Size()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%q: %s\n", e.Name, err)
+		fmt.Fprintf(s.Stderr, "%q: %s\n", e.Name, err)
 	}
 	return size
 }

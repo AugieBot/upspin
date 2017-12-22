@@ -5,7 +5,8 @@
 package server
 
 import (
-	"strings"
+	"io/ioutil"
+	"os"
 	"testing"
 
 	"upspin.io/cloud/storage"
@@ -17,9 +18,8 @@ import (
 )
 
 const (
-	expectedRef   = "978F93921702F861CF941AAACE56B83AE17C8F6845FD674263FFF374A2696A4F"
-	serverBaseURL = "http://go-download-from-gcp.goog.com"
-	contents      = "contents of our file"
+	expectedRef = "978F93921702F861CF941AAACE56B83AE17C8F6845FD674263FFF374A2696A4F"
+	contents    = "contents of our file"
 )
 
 func TestPutAndGet(t *testing.T) {
@@ -82,24 +82,29 @@ func TestNew(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Expected error")
 	}
-	expected := "invalid operation"
-	if !strings.Contains(err.Error(), expected) {
-		t.Errorf("Expected %q, got %q", expected, err)
+	expErr := errors.E(errors.Invalid)
+	if !errors.Match(expErr, err) {
+		t.Errorf("Expected %v, got %v", expErr, err)
 	}
 
-	_, err = New("backend=disk,dance=the macarena")
+	_, err = New("backend=Disk", "basePath=/tmp", "dance=the macarena")
 	if err == nil {
 		t.Fatalf("Expected error")
 	}
-	expected = "invalid operation"
-	if !strings.Contains(err.Error(), expected) {
-		t.Errorf("Expected %q, got %q", expected, err)
+	expErr = errors.E(errors.IO)
+	if !errors.Match(expErr, err) {
+		t.Errorf("Expected %v, got %v", expErr, err)
 	}
 
 	if testing.Short() {
 		t.Skip("skipping part of test when network unavailable; depends on credential availability")
 	}
-	_, err = New("backend=Disk")
+	dir, err := ioutil.TempDir("", "test-store")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = New("backend=Disk", "basePath="+dir)
+	os.RemoveAll(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,10 +122,6 @@ func newStoreServer(s storage.Storage) *server {
 	return &server{
 		storage: s,
 	}
-}
-
-type storeTestServer struct {
-	server *server
 }
 
 type testGCP struct {
