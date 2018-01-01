@@ -9,27 +9,47 @@ package flags // import "upspin.io/flags"
 import (
 	"flag"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"upspin.io/config"
 	"upspin.io/log"
+	"upspin.io/upspin"
 )
 
 // flagVar represents a flag in this package.
 type flagVar struct {
-	set  func()        // Set the value at parse time.
-	arg  func() string // Return the argument to set the flag.
-	arg2 func() string // Return the argument to set the second flag; usually nil.
+	set  func(fs *flag.FlagSet) // Set the value at parse time.
+	arg  func() string          // Return the argument to set the flag.
+	arg2 func() string          // Return the argument to set the second flag; usually nil.
 }
 
 const (
-	defaultBlockSize  = 1024 * 1024 // Keep in sync with upspin.BlockSize.]
+	defaultBlockSize  = upspin.BlockSize
+	maxBlockSize      = upspin.MaxBlockSize
 	defaultHTTPAddr   = ":80"
 	defaultHTTPSAddr  = ":443"
 	defaultLog        = "info"
 	defaultServerKind = "inprocess"
+	defaultCacheSize  = int64(5e9)
 )
+
+var (
+	defaultCacheDir         = upspinDir("")
+	defaultLetsEncryptCache = upspinDir("letsencrypt")
+	defaultConfig           = upspinDir("config")
+)
+
+func upspinDir(subdir string) string {
+	home, err := config.Homedir()
+	if err != nil {
+		log.Error.Printf("flags: could not locate home directory: %v", err)
+		home = "."
+	}
+	return filepath.Join(home, "upspin", subdir)
+}
 
 // None is the set of no flags. It is rarely needed as most programs
 // use either the Server or Client set.
@@ -51,19 +71,19 @@ var Client = []string{
 // command-line flags.
 var (
 	// BlockSize ("blocksize") is the block size used when writing large files.
-	// The default is 1MB.
+	// The default is 1MB; it can be no larger than 1GB.
 	BlockSize = defaultBlockSize
 
 	// CacheDir ("cachedir") specifies the directory for the various file
 	// caches.
 	CacheDir = defaultCacheDir
 
-	defaultCacheDir = filepath.Join(config.Home(), "upspin")
+	// CacheSize ("cachesize") specifies the maximum bytes used by
+	// the various file caches. This is only approximate.
+	CacheSize = defaultCacheSize
 
 	// Config ("config") names the Upspin configuration file to use.
 	Config = defaultConfig
-
-	defaultConfig = filepath.Join(config.Home(), "upspin", "config")
 
 	// HTTPAddr ("http") is the network address on which to listen for
 	// incoming insecure network connections.
@@ -81,8 +101,6 @@ var (
 	// the Let's Encrypt certificates are stored. The containing directory
 	// should be owner-accessible only (chmod 0700).
 	LetsEncryptCache = defaultLetsEncryptCache
-
-	defaultLetsEncryptCache = filepath.Join(config.Home(), "upspin", "letsencrypt")
 
 	// Log ("log") sets the level of logging (implements flag.Value).
 	Log logFlag
@@ -111,6 +129,10 @@ var (
 	// certificate/key pair used for serving TLS (HTTPS).
 	TLSCertFile = ""
 	TLSKeyFile  = ""
+
+	// Version causes the program to print its release version and exit.
+	// The printed version is only meaningful in released binaries.
+	Version = false
 )
 
 // flags is a map of flag registration functions keyed by flag name,
@@ -118,8 +140,9 @@ var (
 var flags = map[string]*flagVar{
 	"addr": strVar(&NetAddr, "addr", NetAddr, "publicly accessible network address (`host:port`)"),
 	"blocksize": &flagVar{
-		set: func() {
-			flag.IntVar(&BlockSize, "blocksize", BlockSize, "`size` of blocks when writing large files")
+		set: func(fs *flag.FlagSet) {
+			usage := fmt.Sprintf("`size` of blocks when writing large files (default %d)", defaultBlockSize)
+			fs.Var(&blockSize, "blocksize", usage)
 		},
 		arg: func() string {
 			if BlockSize == defaultBlockSize {
@@ -129,12 +152,23 @@ var flags = map[string]*flagVar{
 		},
 	},
 	"cachedir": strVar(&CacheDir, "cachedir", CacheDir, "`directory` containing all file caches"),
-	"config":   strVar(&Config, "config", Config, "user's configuration `file`"),
-	"http":     strVar(&HTTPAddr, "http", HTTPAddr, "`address` for incoming insecure network connections"),
-	"https":    strVar(&HTTPSAddr, "https", HTTPSAddr, "`address` for incoming secure network connections"),
+	"cachesize": &flagVar{
+		set: func(fs *flag.FlagSet) {
+			fs.Int64Var(&CacheSize, "cachesize", defaultCacheSize, "maximum bytes for file caches")
+		},
+		arg: func() string {
+			if CacheSize == defaultCacheSize {
+				return ""
+			}
+			return fmt.Sprintf("-cachesize=%d", CacheSize)
+		},
+	},
+	"config": strVar(&Config, "config", Config, "user's configuration `file`"),
+	"http":   strVar(&HTTPAddr, "http", HTTPAddr, "`address` for incoming insecure network connections"),
+	"https":  strVar(&HTTPSAddr, "https", HTTPSAddr, "`address` for incoming secure network connections"),
 	"insecure": &flagVar{
-		set: func() {
-			flag.BoolVar(&InsecureHTTP, "insecure", false, "whether to serve insecure HTTP instead of HTTPS")
+		set: func(fs *flag.FlagSet) {
+			fs.BoolVar(&InsecureHTTP, "insecure", false, "whether to serve insecure HTTP instead of HTTPS")
 		},
 		arg: func() string {
 			if InsecureHTTP {
@@ -143,24 +177,24 @@ var flags = map[string]*flagVar{
 			return ""
 		},
 	},
-	"kind":      strVar(&ServerKind, "kind", ServerKind, "server implementation `kind` (inprocess, gcp)"),
+	"kind":      strVar(&ServerKind, "kind", ServerKind, "server implementation `kind` (inprocess, server)"),
 	"letscache": strVar(&LetsEncryptCache, "letscache", defaultLetsEncryptCache, "Let's Encrypt cache `directory`"),
 	"log": &flagVar{
-		set: func() {
+		set: func(fs *flag.FlagSet) {
 			Log.Set("info")
-			flag.Var(&Log, "log", "`level` of logging: debug, info, error, disabled")
+			fs.Var(&Log, "log", "`level` of logging: debug, info, error, disabled")
 		},
 		arg: func() string { return strArg("log", Log.String(), defaultLog) },
 	},
 	"serverconfig": &flagVar{
-		set: func() {
-			flag.Var(configFlag{&ServerConfig}, "serverconfig", "comma-separated list of configuration options (key=value) for this server")
+		set: func(fs *flag.FlagSet) {
+			fs.Var(configFlag{&ServerConfig}, "serverconfig", "comma-separated list of configuration options (key=value) for this server")
 		},
 		arg: func() string { return strArg("serverconfig", configFlag{&ServerConfig}.String(), "") },
 	},
 	"prudent": &flagVar{
-		set: func() {
-			flag.BoolVar(&Prudent, "prudent", false, "protect against malicious directory server")
+		set: func(fs *flag.FlagSet) {
+			fs.BoolVar(&Prudent, "prudent", false, "protect against malicious directory server")
 		},
 		arg: func() string {
 			if !Prudent {
@@ -170,12 +204,23 @@ var flags = map[string]*flagVar{
 		},
 	},
 	"tls": &flagVar{
-		set: func() {
-			flag.StringVar(&TLSCertFile, "tls_cert", "", "TLS Certificate `file` in PEM format")
-			flag.StringVar(&TLSKeyFile, "tls_key", "", "TLS Key `file` in PEM format")
+		set: func(fs *flag.FlagSet) {
+			fs.StringVar(&TLSCertFile, "tls_cert", "", "TLS Certificate `file` in PEM format")
+			fs.StringVar(&TLSKeyFile, "tls_key", "", "TLS Key `file` in PEM format")
 		},
 		arg:  func() string { return strArg("tls_cert", TLSCertFile, "") },
 		arg2: func() string { return strArg("tls_key", TLSKeyFile, "") },
+	},
+	"version": &flagVar{
+		set: func(fs *flag.FlagSet) {
+			fs.BoolVar(&Version, "version", false, "print build version and exit")
+		},
+		arg: func() string {
+			if !Version {
+				return ""
+			}
+			return "-version"
+		},
 	},
 }
 
@@ -190,17 +235,36 @@ var flags = map[string]*flagVar{
 // 	flags.Parse(nil) // Register all flags.
 // 	flags.Parse(flags.None, "config", "endpoint") // Register only config and endpoint.
 func Parse(defaultList []string, extras ...string) {
+	ParseArgsInto(flag.CommandLine, os.Args[1:], defaultList, extras...)
+}
+
+// ParseInto is the same as Parse but accepts a FlagSet argument instead of
+// using the default flag.CommandLine FlagSet.
+func ParseInto(fs *flag.FlagSet, defaultList []string, extras ...string) {
+	ParseArgsInto(fs, os.Args[1:], defaultList, extras...)
+}
+
+// ParseArgs is the same as Parse but uses the provided argument list
+// instead of those provided on the command line. For ParseArgs, the
+// initial command name should not be provided.
+func ParseArgs(args, defaultList []string, extras ...string) {
+	ParseArgsInto(flag.CommandLine, args, defaultList, extras...)
+}
+
+// ParseArgsInto is the same as ParseArgs but accepts a FlagSet argument instead of
+// using the default flag.CommandLine FlagSet.
+func ParseArgsInto(fs *flag.FlagSet, args, defaultList []string, extras ...string) {
 	if len(defaultList) == 0 && len(extras) == 0 {
-		Register()
+		RegisterInto(fs)
 	} else {
 		if len(defaultList) > 0 {
-			Register(defaultList...)
+			RegisterInto(fs, defaultList...)
 		}
 		if len(extras) > 0 {
-			Register(extras...)
+			RegisterInto(fs, extras...)
 		}
 	}
-	flag.Parse()
+	fs.Parse(args)
 }
 
 // Register registers the command-line flags for the given flag names.
@@ -213,18 +277,24 @@ func Parse(defaultList []string, extras ...string) {
 // or
 // 	flags.Register() // Register all flags.
 func Register(names ...string) {
+	RegisterInto(flag.CommandLine, names...)
+}
+
+// RegisterInto  is the same as Register but accepts a FlagSet argument instead of
+// using the default flag.CommandLine FlagSet.
+func RegisterInto(fs *flag.FlagSet, names ...string) {
 	if len(names) == 0 {
 		// Register all flags if no names provided.
-		for _, flag := range flags {
-			flag.set()
+		for _, f := range flags {
+			f.set(fs)
 		}
 	} else {
 		for _, n := range names {
-			flag, ok := flags[n]
+			f, ok := flags[n]
 			if !ok {
 				panic(fmt.Sprintf("unknown flag %q", n))
 			}
-			flag.set()
+			f.set(fs)
 		}
 	}
 }
@@ -233,14 +303,14 @@ func Register(names ...string) {
 // the state of the flags. Flags set to their default value are elided.
 func Args() []string {
 	var args []string
-	for _, flag := range flags {
-		arg := flag.arg()
+	for _, f := range flags {
+		arg := f.arg()
 		if arg == "" {
 			continue
 		}
 		args = append(args, arg)
-		if flag.arg2 != nil {
-			args = append(args, flag.arg2())
+		if f.arg2 != nil {
+			args = append(args, f.arg2())
 		}
 	}
 	return args
@@ -249,8 +319,8 @@ func Args() []string {
 // strVar returns a flagVar for the given string flag.
 func strVar(value *string, name, _default, usage string) *flagVar {
 	return &flagVar{
-		set: func() {
-			flag.StringVar(value, name, _default, usage)
+		set: func(fs *flag.FlagSet) {
+			fs.StringVar(value, name, _default, usage)
 		},
 		arg: func() string {
 			return strArg(name, *value, _default)
@@ -265,6 +335,36 @@ func strArg(name, value, _default string) string {
 		return ""
 	}
 	return "-" + name + "=" + value
+}
+
+// BlockSize is twinned to this implementation of flag.Value,
+// allowing us to check the value when the flag is set.
+type blockSizeFlag int
+
+var blockSize blockSizeFlag
+
+// String implements flag.Value.
+func (f blockSizeFlag) String() string {
+	return fmt.Sprint(int64(f))
+}
+
+// Set implements flag.Value.
+func (f *blockSizeFlag) Set(size string) error {
+	v, err := strconv.ParseInt(size, 0, 64)
+	if err != nil {
+		return err
+	}
+	if v <= 0 || v > maxBlockSize {
+		return fmt.Errorf("block size %d out of range; maximum %d", v, maxBlockSize)
+	}
+	*f = blockSizeFlag(v)
+	BlockSize = int(v)
+	return nil
+}
+
+// Get implements flag.Getter.
+func (f blockSizeFlag) Get() interface{} {
+	return int(f)
 }
 
 type logFlag string
