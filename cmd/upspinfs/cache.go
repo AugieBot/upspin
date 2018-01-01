@@ -18,10 +18,12 @@ import (
 
 	"bazil.org/fuse"
 
+	lrucache "upspin.io/cache"
 	"upspin.io/client"
 	"upspin.io/client/clientutil"
 	os "upspin.io/cmd/upspinfs/internal/ose"
 	"upspin.io/errors"
+	"upspin.io/log"
 	"upspin.io/pack"
 	"upspin.io/path"
 	"upspin.io/upspin"
@@ -37,20 +39,34 @@ type cache struct {
 	dir    string        // Directory for in-the-clear cached files.
 	next   int           // The next sequence to use for temp files.
 	client upspin.Client // A client for writing back files.
+
+	// lru is a cache closed but not yet deleted files.
+	lru         *lrucache.LRU
+	lruBytes    int64 // Sum of storage bytes represented by files in lru.
+	lruMaxBytes int64 // Maximum storage bytes allowed for files in lru.
 }
+
+const (
+	maxRefs = 20
+)
 
 type cachedFile struct {
-	c       *cache // cache this belongs to.
-	fname   string // Filename in cache.
-	inStore bool   // True if this is a cached version of something in the store.
-	dirty   bool   // True if it needs to be written back on close.
-
-	file *os.File           // The cached file.
-	de   []*upspin.DirEntry // If this is a directory, its contents.
+	c       *cache   // cache this belongs to.
+	n       *node    // node representing this file.
+	fname   string   // Filename in cache.
+	inStore bool     // True if this is a cached version of something in the store.
+	dirty   bool     // True if it needs to be written back on close.
+	seq     int64    // Sequence number of cached file.
+	file    *os.File // The cached file.
 }
 
-func newCache(config upspin.Config, dir string) *cache {
-	c := &cache{dir: dir, client: client.New(config)}
+type cachedClosedFile struct {
+	c    *cache // cache this file belongs to
+	size int64  // size in bytes
+}
+
+func newCache(config upspin.Config, dir string, cacheSize int64) *cache {
+	c := &cache{dir: dir, client: client.New(config), lru: lrucache.NewLRU(maxRefs), lruMaxBytes: cacheSize}
 	os.Mkdir(dir, 0700)
 
 	// Clean out all cache files.
@@ -85,10 +101,10 @@ func (c *cache) mkTemp() string {
 // create creates a file in the cache.
 // The corresponding node should be locked.
 func (c *cache) create(h *handle) error {
-	const op = "upspinfs/cache.create"
+	const op errors.Op = "cache.create"
 
 	if h.n.cf != nil {
-		return errors.E(op, errors.IO, errors.Str("create of an open file"))
+		return errors.E(op, errors.IO, "create of an open file")
 	}
 	cf := &cachedFile{c: c, dirty: true}
 	cf.fname = c.mkTemp()
@@ -97,13 +113,14 @@ func (c *cache) create(h *handle) error {
 		return errors.E(op, err)
 	}
 	h.n.cf = cf
+	cf.n = h.n
 	return nil
 }
 
 // open opens the cached version of a file.  If it isn't cached, first retrieve it from the store.
 // The corresponding node should be locked.
 func (c *cache) open(h *handle, flags fuse.OpenFlags) error {
-	const op = "upspinfs/cache.open"
+	const op errors.Op = "cache.open"
 
 	n := h.n
 	name := n.uname
@@ -122,7 +139,7 @@ func (c *cache) open(h *handle, flags fuse.OpenFlags) error {
 	entry, err := dir.Lookup(name)
 	if err != nil {
 		// We don't implement links in the standard way. Instead we
-		// let FUSE to it but stating every file it walks.
+		// let FUSE do it by stating every file it walks.
 		return errors.E(op, err)
 	}
 
@@ -133,18 +150,26 @@ func (c *cache) open(h *handle, flags fuse.OpenFlags) error {
 	cf := &cachedFile{c: c}
 	cdir, fname := c.cacheName(entry)
 	if entry.Packing != upspin.PlainPack {
+		c.Lock()
 		// Look for a dirty cached version.
 		cf.file, err = os.OpenFile(fname, os.O_RDWR, 0700)
 		if err == nil {
 			h.flags = flags
 			if info, err := cf.file.Stat(); err == nil {
+				c.lru.Remove(fname)
+				c.Unlock()
 				n.cf = cf
+				cf.n = n
 				n.attr.Size = uint64(info.Size())
 				cf.fname = fname
 				return nil
 			}
 		}
+		c.Unlock()
 	}
+
+	// Invalidate the kernel cache, this is a new version.
+	n.f.invalidateChan <- n
 
 	// Create an unpacker to decrypt the file blocks.
 	packer := pack.Lookup(entry.Packing)
@@ -185,6 +210,7 @@ func (c *cache) open(h *handle, flags fuse.OpenFlags) error {
 		if err := os.Rename(tmpName, fname); err != nil {
 			file.Close()
 			os.Remove(tmpName)
+			return errors.E(op, name, err)
 		}
 	}
 
@@ -192,9 +218,11 @@ func (c *cache) open(h *handle, flags fuse.OpenFlags) error {
 	cf.inStore = true
 	cf.fname = fname
 	cf.file = file
+	n.seq = entry.Sequence
 	h.flags = flags
 	n.attr.Size = uint64(offset)
 	n.cf = cf
+	cf.n = n
 	return nil
 }
 
@@ -225,11 +253,49 @@ func (cf *cachedFile) close() {
 		return
 	}
 	cf.file.Close()
+	cf.file = nil
+	cf.c.Lock()
+	cf.c.lru.Add(cf.fname, &cachedClosedFile{c: cf.c, size: int64(cf.n.attr.Size)})
+	if cf.c.lruBytes < 0 {
+		log.Error.Print("lruBytes < 0")
+		cf.c.lruBytes = 0
+	}
+	cf.c.lruBytes += int64(cf.n.attr.Size)
+	for cf.c.lruBytes > cf.c.lruMaxBytes {
+		k, v := cf.c.lru.RemoveOldest()
+		if k == nil {
+			log.Error.Print("lruBytes > 0 but cache empty")
+			cf.c.lruBytes = 0
+			break
+		}
+		v.(*cachedClosedFile).OnEviction(k)
+	}
+	cf.c.Unlock()
+}
+
+// OnEviction is called whenever a file is evicted from the LRU.
+// This is called from lru.Add and cf.close with ccf.c locked.
+func (ccf *cachedClosedFile) OnEviction(k interface{}) {
+	ccf.c.lruBytes -= ccf.size
+	if err := os.Remove(k.(string)); err != nil {
+		log.Debug.Printf("%s", err)
+	}
+}
+
+// forget is called when the cached version is no longer correct.
+func (cf *cachedFile) forget() {
+	if cf == nil {
+		return
+	}
+	cf.close()
+	if err := os.Remove(cf.fname); err != nil {
+		log.Debug.Printf("%s", err)
+	}
 }
 
 // clone copies the first size bytes of the old cf.file into a new temp file that replaces it.
 func (cf *cachedFile) clone(size int64) error {
-	const op = "upspinfs/cache.clone"
+	const op errors.Op = "cache.clone"
 
 	fname := cf.c.mkTemp()
 	var err error
@@ -267,7 +333,7 @@ func (cf *cachedFile) clone(size int64) error {
 // truncate truncates a currently open cached file.  If it represents a reference in the store,
 // copy it rather than truncating in place.
 func (cf *cachedFile) truncate(n *node, size int64) error {
-	const op = "upspinfs/cache.truncate"
+	const op errors.Op = "cache.truncate"
 
 	// This is the easy case.
 	if cf.dirty {
@@ -304,11 +370,17 @@ func (cf *cachedFile) writeAt(buf []byte, offset int64) (int, error) {
 }
 
 // writeback writes the cached file to the store if it is dirty. Called with node locked.
-func (cf *cachedFile) writeback(h *handle) error {
-	const op = "upspinfs/cache.writeback"
-	n := h.n
+func (cf *cachedFile) writeback(n *node) error {
+	const op errors.Op = "cache.writeback"
+
+	if n.noWB {
+		return nil
+	}
 
 	// Nothing to do if the cache file isn't dirty.
+	if cf == nil {
+		return nil
+	}
 	if !cf.dirty {
 		return nil
 	}
@@ -338,6 +410,7 @@ func (cf *cachedFile) writeback(h *handle) error {
 	for tries := 0; ; tries++ {
 		de, err = cf.c.client.Put(n.uname, cleartext)
 		if err == nil {
+			n.seq = de.Sequence
 			n.attr.Mtime = de.Time.Go()
 			break
 		}
@@ -348,7 +421,7 @@ func (cf *cachedFile) writeback(h *handle) error {
 				// increase the ref count for the cached version
 				// so that the xattr at least lasts as long as
 				// upspinfs stays up. Not perfect but keeps
-				// MacOS finder happy.
+				// macOS finder happy.
 				// TODO(p): this might be improved by constraining
 				// to fewer error types.
 				cf.file.Pin()
@@ -360,8 +433,7 @@ func (cf *cachedFile) writeback(h *handle) error {
 	}
 
 	// Rename it to reflect the actual reference in the store so that new
-	// opens will find the cached version.  Assume a single block.
-	// TODO(p): what if it isn't a single block?
+	// opens will find the cached version.
 	cdir, fname := cf.c.cacheName(de)
 	if err := os.Rename(cf.fname, fname); err != nil {
 		// Otherwise rename to the common name.
@@ -378,7 +450,7 @@ func (cf *cachedFile) writeback(h *handle) error {
 
 // putRedirect assumes that the target fits in a single block.
 func (c *cache) putRedirect(n *node, target upspin.PathName) error {
-	const op = "upspinfs/cache.putRedirect"
+	const op errors.Op = "cache.putRedirect"
 
 	// Use the client library to write it.
 	_, err := c.client.PutLink(target, n.uname)
