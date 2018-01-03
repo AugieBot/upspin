@@ -50,7 +50,7 @@ func (d *drng) Read(p []byte) (n int, err error) {
 
 // CreateKeys creates a key pair based on the chosen curve and a slice of entropy.
 func CreateKeys(curveName string, entropy []byte) (public upspin.PublicKey, private string, err error) {
-	const op = "pack/ee.CreateKeys"
+	const op errors.Op = "pack/ee.CreateKeys"
 	var curve elliptic.Curve
 	switch curveName {
 	case "p256":
@@ -74,10 +74,7 @@ func CreateKeys(curveName string, entropy []byte) (public upspin.PublicKey, priv
 // GenEntropy fills the slice with cryptographically-secure random bytes.
 func GenEntropy(entropy []byte) error {
 	_, err := rand.Read(entropy)
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
 
 // encodeKeys converts an ecsda private key into an upspin key pair. No error checking is performed.
