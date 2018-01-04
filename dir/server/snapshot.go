@@ -5,10 +5,10 @@
 package server
 
 import (
+	"strings"
 	"time"
 
-	"strings"
-	"upspin.io/dir/server/tree"
+	"upspin.io/dir/server/serverlog"
 	"upspin.io/errors"
 	"upspin.io/log"
 	"upspin.io/path"
@@ -23,7 +23,6 @@ import (
 // Snapshots are automatically taken every 12 hours.
 const (
 	snapshotSuffix          = "snapshot"
-	snapshotGlob            = "*+" + snapshotSuffix + "@*"
 	snapshotControlFile     = "TakeSnapshot"
 	snapshotDateFormat      = "2006/01/02/"
 	snapshotTimeFormat      = "15:04"
@@ -67,17 +66,13 @@ func (s *server) startSnapshotLoop() {
 		log.Error.Printf("dir/server.startSnapshotLoop: attempting to restart snapshot worker")
 		return
 	}
-	s.snapshotControl = make(chan upspin.UserName)
+	s.snapshotControl = make(chan snapshotCreate)
 	go s.snapshotLoop()
 }
 
-func (s *server) stopSnapshotLoop() {
-	if s.snapshotControl != nil {
-		close(s.snapshotControl)
-	}
-}
-
-// snapshotLoop runs in a goroutine and performs periodic snapshots.
+// snapshotLoop runs in a goroutine and performs snapshots.
+// We call takeSnapshotFor only from here to serialize requests with
+// time-triggered snapshot.
 func (s *server) snapshotLoop() {
 	// Run once upon starting.
 	s.snapshotAll() // returned error is already logged.
@@ -89,12 +84,12 @@ func (s *server) snapshotLoop() {
 		select {
 		case <-ticker.C:
 			s.snapshotAll() // returned error is already logged.
-		case userName := <-s.snapshotControl:
-			if userName == "" {
-				// Closing the channel.
+		case sc := <-s.snapshotControl:
+			if sc.userName == "" {
+				// Closing the ticker channel.
 				return
 			}
-			s.takeSnapshotFor(userName)
+			sc.created <- s.takeSnapshotFor(sc.userName)
 		}
 	}
 }
@@ -102,8 +97,8 @@ func (s *server) snapshotLoop() {
 // snapshotAll scans all roots that have a +snapshot suffix, determines whether
 // it's time to perform a new snapshot for them and if so snapshots them.
 func (s *server) snapshotAll() error {
-	const op = "dir/server.snapshotAll"
-	users, err := tree.ListUsers(snapshotGlob, s.logDir)
+	const op errors.Op = "dir/server.snapshotAll"
+	users, err := serverlog.ListUsersWithSuffix(snapshotSuffix, s.logDir)
 	if err != nil {
 		log.Error.Printf("%s: error listing snapshot users: %s", op, err)
 		return err
@@ -153,7 +148,7 @@ func (s *server) snapshotDir(cfg *snapshotConfig) (path.Parsed, error) {
 // shouldSnapshot reports whether it's time to snapshot the given configuration.
 // It also returns the parsed path of where the snapshot will be made.
 func (s *server) shouldSnapshot(cfg *snapshotConfig) (bool, path.Parsed, error) {
-	const op = "dir/server.shouldSnapshot"
+	const op errors.Op = "dir/server.shouldSnapshot"
 
 	p, err := s.snapshotDir(cfg)
 	if err != nil {
@@ -161,18 +156,19 @@ func (s *server) shouldSnapshot(cfg *snapshotConfig) (bool, path.Parsed, error) 
 	}
 
 	// List today's snapshot directory, including any suffixed snapshot.
-	entries, err := s.globWithoutPermissions(p.String() + "/*")
+	tree, err := s.loadTreeFor(p.User())
 	if err != nil {
-		if err == upspin.ErrFollowLink {
-			// We need to get the real entry and we cannot resolve links on our own.
-			return false, path.Parsed{}, errors.E(op, errors.Internal, p.Path(), errors.Str("cannot follow a link to snapshot"))
-		}
-		if !errors.Match(errNotExist, err) {
-			// Some other error. Abort.
-			return false, path.Parsed{}, errors.E(op, err)
-		}
-		// Ok, proceed.
-	} else {
+		return false, path.Parsed{}, errors.E(op, err)
+	}
+	entries, _, err := tree.List(p)
+	if err == upspin.ErrFollowLink {
+		// We need to get the real entry and we cannot resolve links on our own.
+		return false, path.Parsed{}, errors.E(op, errors.Internal, p.Path(), "cannot follow a link to snapshot")
+	} else if err != nil && !errors.Is(errors.NotExist, err) {
+		// Some other error. Abort.
+		return false, path.Parsed{}, errors.E(op, err)
+	}
+	if len(entries) > 0 {
 		var mostRecent time.Time
 		for _, e := range entries {
 			parsed, _ := path.Parse(e.Name) // can't be an error.
@@ -196,6 +192,7 @@ func (s *server) shouldSnapshot(cfg *snapshotConfig) (bool, path.Parsed, error) 
 }
 
 // takeSnapshotFor takes a snapshot for a user.
+// Other than in tests, it is called only from the snapshotLoop goroutine.
 func (s *server) takeSnapshotFor(user upspin.UserName) error {
 	cfg, err := s.getSnapshotConfig(user)
 	if err != nil {
@@ -214,7 +211,7 @@ func (s *server) takeSnapshot(dstDir path.Parsed, srcDir upspin.PathName) error 
 	if err != nil {
 		return err
 	}
-	entry, err := s.lookup("takeSnapshot", srcParsed, entryMustBeClean)
+	entry, err := s.lookup(srcParsed, entryMustBeClean)
 	if err != nil {
 		return err
 	}
@@ -240,8 +237,8 @@ func (s *server) takeSnapshot(dstDir path.Parsed, srcDir upspin.PathName) error 
 	return nil
 }
 
-// makeSnapshotPath makes the full path name, creating any necessary
-// subdirectories.
+// makeSnapshotPath makes all directories leading up to (but not including)
+// name.
 func (s *server) makeSnapshotPath(name upspin.PathName) error {
 	p, err := path.Parse(name)
 	if err != nil {
@@ -249,7 +246,7 @@ func (s *server) makeSnapshotPath(name upspin.PathName) error {
 	}
 	// Traverse the path one element of a time making each subdir. We start
 	// from 1 as we don't try to make the root.
-	for i := 1; i <= p.NElem(); i++ {
+	for i := 1; i < p.NElem(); i++ {
 		err = s.mkDirIfNotExist(p.First(i))
 		if err != nil {
 			return err
@@ -277,9 +274,9 @@ func (s *server) mkDirIfNotExist(name path.Parsed) error {
 	}
 	_, _, err = tree.Lookup(name)
 	if err == upspin.ErrFollowLink {
-		return errors.E(errors.Internal, errors.Str("cannot mkdir through a link"))
+		return errors.E(errors.Internal, "cannot mkdir through a link")
 	}
-	if err != nil && !errors.Match(errNotExist, err) {
+	if err != nil && !errors.Is(errors.NotExist, err) {
 		// Real error. Abort.
 		return err
 	}
@@ -334,7 +331,7 @@ func isSnapshotControlFile(p path.Parsed) bool {
 // control entry we expect in order to start a new snapshot.
 func isValidSnapshotControlEntry(entry *upspin.DirEntry) error {
 	if len(entry.Blocks) != 0 || entry.IsLink() || entry.IsDir() {
-		return errors.E(errors.Invalid, entry.Name, errors.Str("snapshot control entry must be an empty file"))
+		return errors.E(errors.Invalid, entry.Name, "snapshot control entry must be an empty file")
 	}
 	return nil
 }
