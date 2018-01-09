@@ -6,21 +6,17 @@ package main
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"net"
-	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"text/template"
 
 	"upspin.io/config"
 	"upspin.io/flags"
+	"upspin.io/serverutil/signup"
 	"upspin.io/subcmd"
 	"upspin.io/upspin"
 	"upspin.io/user"
@@ -58,18 +54,18 @@ The -signuponly flag tells signup to skip the generation of the configuration
 file and keys and only send the signup request to the key server.
 `
 	fs := flag.NewFlagSet("signup", flag.ExitOnError)
+	defaultKeyServer := string(config.New().KeyEndpoint().NetAddr)
 	var (
 		force       = fs.Bool("force", false, "create a new user even if keys and config file exist")
-		where       = fs.String("where", filepath.Join(config.Home(), ".ssh"), "`directory` to store keys")
+		keyServer   = fs.String("key", defaultKeyServer, "Key server `address`")
 		dirServer   = fs.String("dir", "", "Directory server `address`")
 		storeServer = fs.String("store", "", "Store server `address`")
 		bothServer  = fs.String("server", "", "Store and Directory server `address` (if combined)")
 		signupOnly  = fs.Bool("signuponly", false, "only send signup request to key server; do not generate config or keys")
+		secrets     = fs.String("secrets", "", "`directory` to store key pair")
+		curve       = fs.String("curve", "p256", "cryptographic curve `name`: p256, p384, or p521")
+		secretseed  = fs.String("secretseed", "", "the seed containing a 128 bit secret in proquint format or a file that contains it")
 	)
-	// Used only in keygen.
-	fs.String("curve", "p256", "cryptographic curve `name`: p256, p384, or p521")
-	fs.String("secretseed", "", "the seed containing a 128 bit secret in proquint format or a file that contains it")
-	fs.Bool("rotate", false, "always false during sign up")
 
 	s.ParseFlags(fs, args, help, "[-config=<file>] signup -dir=<addr> -store=<addr> [flags] <username>\n       upspin [-config=<file>] signup -server=<addr> [flags] <username>")
 
@@ -85,7 +81,7 @@ file and keys and only send the signup request to the key server.
 
 	if *signupOnly {
 		// Don't generate; just send the signup request to the key server.
-		s.registerUser(flags.Config)
+		s.registerUser(*keyServer)
 		return
 	}
 
@@ -107,7 +103,11 @@ file and keys and only send the signup request to the key server.
 		usageAndExit(fs)
 	}
 
-	// Parse -dir and -store flags as addresses and construct remote endpoints.
+	// Parse -key, -dir and -store flags as addresses and construct remote endpoints.
+	keyEndpoint, err := parseAddress(*keyServer)
+	if err != nil {
+		s.Exitf("error parsing -key=%q: %v", keyServer, err)
+	}
 	dirEndpoint, err := parseAddress(*dirServer)
 	if err != nil {
 		s.Exitf("error parsing -dir=%q: %v", dirServer, err)
@@ -127,10 +127,7 @@ file and keys and only send the signup request to the key server.
 	}
 
 	userName := upspin.UserName(uname + "@" + domain)
-
-	env := os.Environ()
-	wipeUpspinEnvironment()
-	defer restoreEnvironment(env)
+	*secrets = subcmd.Tilde(*secrets)
 
 	// Verify if we have a config file.
 	_, err = config.FromFile(flags.Config)
@@ -142,10 +139,11 @@ file and keys and only send the signup request to the key server.
 	var configContents bytes.Buffer
 	err = configTemplate.Execute(&configContents, configData{
 		UserName:  userName,
+		Key:       keyEndpoint,
 		Dir:       dirEndpoint,
 		Store:     storeEndpoint,
-		SecretDir: subcmd.Tilde(*where),
 		Packing:   "ee",
+		SecretDir: *secrets,
 	})
 	if err != nil {
 		s.Exit(err)
@@ -154,90 +152,71 @@ file and keys and only send the signup request to the key server.
 	if err != nil {
 		// Directory doesn't exist, perhaps.
 		if !os.IsNotExist(err) {
-			s.Exitf("cannot create %s: %v", flags.Config, err)
+			s.Exit(err)
 		}
 		dir := filepath.Dir(flags.Config)
 		if _, statErr := os.Stat(dir); !os.IsNotExist(statErr) {
 			// Looks like the directory exists, so stop now and report original error.
-			s.Exitf("cannot create %s: %v", flags.Config, err)
+			s.Exit(err)
 		}
 		if mkdirErr := os.Mkdir(dir, 0700); mkdirErr != nil {
-			s.Exitf("cannot make directory %s: %v", dir, mkdirErr)
+			s.Exit(err)
 		}
 		err = ioutil.WriteFile(flags.Config, configContents.Bytes(), 0640)
 		if err != nil {
 			s.Exit(err)
 		}
 	}
-	fmt.Fprintf(os.Stderr, "Configuration file written to:\n")
-	fmt.Fprintf(os.Stderr, "\t%s\n\n", flags.Config)
+	fmt.Fprintf(s.Stderr, "Configuration file written to:\n")
+	fmt.Fprintf(s.Stderr, "\t%s\n\n", flags.Config)
 
 	// Generate a new key.
-	s.keygenCommand(fs)
+	if *secrets == "" {
+		// Use the default secrets directory if none specified.
+		*secrets, err = config.DefaultSecretsDir(userName)
+		if err != nil {
+			s.Exit(err)
+		}
+	}
+	s.keygenCommand(*secrets, *curve, *secretseed, false)
 
 	// Send the signup request to the key server.
-	s.registerUser(flags.Config)
+	s.registerUser(*keyServer)
 }
 
 // registerUser reads the config file and sends its information to the key server.
-func (s *State) registerUser(configFile string) {
-	cfg, err := config.FromFile(configFile)
+func (s *State) registerUser(keyServer string) {
+	cfg, err := config.FromFile(flags.Config)
 	if err != nil {
 		s.Exit(err)
 	}
-
-	// Make signup request.
-	signupURL, err := makeSignupURL(cfg)
-	if err != nil {
+	cfg = config.SetKeyEndpoint(cfg, upspin.Endpoint{
+		Transport: upspin.Remote,
+		NetAddr:   upspin.NetAddr(keyServer),
+	})
+	if err := signup.MakeRequest(cfg); err != nil {
 		s.Exit(err)
 	}
-	r, err := http.Post(signupURL, "text/plain", nil)
-	if err != nil {
-		s.Exit(err)
-	}
-	b, err := ioutil.ReadAll(r.Body)
-	r.Body.Close()
-	if err != nil {
-		s.Exit(err)
-	}
-	if r.StatusCode != http.StatusOK {
-		s.Exitf("key server error: %s", b)
-	}
-	fmt.Fprintf(os.Stderr, "A signup email has been sent to %q,\n", cfg.UserName())
-	fmt.Fprintf(os.Stderr, "please read it for further instructions.\n")
-}
-
-// makeSignupURL returns an encoded URL used to sign up a new user with the
-// default keyserver.
-func makeSignupURL(cfg upspin.Config) (string, error) {
-	hash, vals := signupRequestHash(cfg.UserName(), cfg.DirEndpoint().NetAddr, cfg.StoreEndpoint().NetAddr, cfg.Factotum().PublicKey())
-	sig, err := cfg.Factotum().Sign(hash)
-	if err != nil {
-		return "", err
-	}
-	vals.Add("sigR", sig.R.String())
-	vals.Add("sigS", sig.S.String())
-	return (&url.URL{
-		Scheme:   "https",
-		Host:     "key.upspin.io",
-		Path:     "/signup",
-		RawQuery: vals.Encode(),
-	}).String(), nil
+	fmt.Fprintf(s.Stderr, "A signup email has been sent to %q,\n", cfg.UserName())
+	fmt.Fprintf(s.Stderr, "please read it for further instructions.\n")
 }
 
 type configData struct {
-	UserName   upspin.UserName
-	Store, Dir *upspin.Endpoint
-	SecretDir  string
-	Packing    string
+	UserName        upspin.UserName
+	Key, Store, Dir *upspin.Endpoint
+	Packing         string
+	SecretDir       string
 }
 
 var configTemplate = template.Must(template.New("config").Parse(`
+{{with .Key}}keyserver: {{.}}
+{{end}}
 username: {{.UserName}}
-secrets: {{.SecretDir}}
 storeserver: {{.Store}}
 dirserver: {{.Dir}}
 packing: {{.Packing}}
+{{with .SecretDir}}secrets: {{.}}
+{{end}}
 `))
 
 func parseAddress(a string) (*upspin.Endpoint, error) {
@@ -250,46 +229,4 @@ func parseAddress(a string) (*upspin.Endpoint, error) {
 		}
 	}
 	return upspin.ParseEndpoint(fmt.Sprintf("remote,%s:%s", host, port))
-}
-
-func wipeUpspinEnvironment() {
-	for _, env := range os.Environ() {
-		if strings.HasPrefix(env, "upspin") {
-			os.Setenv(env, "")
-		}
-	}
-}
-
-func restoreEnvironment(env []string) {
-	for _, e := range env {
-		kv := strings.Split(e, "=")
-		if len(kv) != 2 {
-			continue
-		}
-		os.Setenv(kv[0], kv[1])
-	}
-}
-
-// signupRequestHash generates a hash of the supplied arguments
-// that, when signed, is used to prove that a signup request originated
-// from the user that owns the supplied private key.
-// Keep it in sync with cmd/keyserver/signup.go.
-func signupRequestHash(name upspin.UserName, dir, store upspin.NetAddr, key upspin.PublicKey) ([]byte, url.Values) {
-	const magic = "signup-request"
-
-	u := url.Values{}
-	h := sha256.New()
-	h.Write([]byte(magic))
-	w := func(key, val string) {
-		var l [4]byte
-		binary.BigEndian.PutUint32(l[:], uint32(len(val)))
-		h.Write(l[:])
-		h.Write([]byte(val))
-		u.Add(key, val)
-	}
-	w("name", string(name))
-	w("dir", string(dir))
-	w("store", string(store))
-	w("key", string(key))
-	return h.Sum(nil), u
 }
