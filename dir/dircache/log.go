@@ -22,12 +22,6 @@ package dircache // import "upspin.io/dir/dircache"
 // consistency. This consistency is implemented by the refresh goroutine which will
 // periodically refresh all entries. The refresh interval increases if the entry is
 // unchanged, reflecting file inertia.
-//
-// We store in individual globReq entries, the pertinent Access file, if any. This is
-// updated as we learn more about Access files through Glob, Put, Lookup, Delete or
-// WhichAccess. Since we maintain an LRU of known DirEntries rather than a tree, we
-// must run the LRU whenever an Access file is added or removed to flush any stale
-// entries.
 
 import (
 	"bufio"
@@ -51,9 +45,6 @@ import (
 	"upspin.io/upspin"
 )
 
-// notExist is used to match against returned errors.
-var notExist = errors.E(errors.NotExist)
-
 // request is the requested operation to be performed on the DirEntry.
 type request int
 
@@ -73,7 +64,7 @@ const (
 	// obsoleteReq marks an LRU entry as no longer necessarily
 	// matching what is in the directory server. Whenever the
 	// watcher gets an error saying that the log cannot be
-	// watched at its current order, we mark all entries obsolete.
+	// watched at its current sequence, we mark all entries obsolete.
 	//
 	// obsoleteReq entries are never written to log files.
 	obsoleteReq
@@ -83,14 +74,8 @@ const (
 
 	// version is the version of the formatting of the log file.
 	// It must change every time we change the log file format.
-	version = "20170118"
+	version = "20170922"
 )
-
-// noAccessFile indicates we did a WhichAccess and it returned no DirEntry.
-const noAccessFile = upspin.PathName("none")
-
-// unknownAccessFile indicates we don't know which access file pertains.
-const unknownAccessFile = upspin.PathName("")
 
 // clogEntry corresponds to a cached operation.
 type clogEntry struct {
@@ -107,11 +92,11 @@ type clogEntry struct {
 	children map[string]bool
 	complete bool // true if the children are the complete set
 
-	// For directories, the Access file that pertains.
-	access upspin.PathName
+	// True if we know a directory has no access file.
+	noAccessFile bool
 
-	// The watch order.
-	order int64
+	// The watch sequence number.
+	sequence int64
 }
 
 // clog represents the replayable log of DirEntry changes.
@@ -127,8 +112,7 @@ type clog struct {
 	rotate        chan bool // input signals the rotater to rotate the logs
 	rotaterExited chan bool // closing confirms the rotater is exiting
 
-	// globalLock keeps everyone else out when we are traversing the whole LRU to
-	// update Access files.
+	// globalLock serializes requests.
 	globalLock sync.RWMutex
 
 	// logFileLock provides exclusive access to the log file.
@@ -137,6 +121,11 @@ type clog struct {
 	wr             *bufio.Writer
 	logSize        int64 // current log file size in bytes
 	highestLogFile int   // highest numbered logfile
+
+	// sequenceLRU contains the highest sequence number seen
+	// for a path. Watch will ignore any events with an equal or
+	// lower sequence.
+	sequenceLRU *cache.LRU // [PathName]int64
 
 	pathLocks hashLockArena
 	globLocks hashLockArena
@@ -154,15 +143,22 @@ type lruKey struct {
 	glob bool
 }
 
-// LRUMax is the maximum number of entries in the LRU.
-const LRUMax = 10000
+const (
+	// LRUMax is the maximum number of entries in the LRU.
+	LRUMax = 10000
+
+	// SequenceLRUMax is the maximum number of paths that
+	// whose sequence we will remember. This is used to
+	// avoid reapplying Watch Events that reflect actions
+	// we have already applied or overridden.
+	SequenceLRUMax = 2000
+)
 
 // openLog reads the current log.
 // - dir is the directory for log files.
 // - maxDisk is an approximate limit on disk space for log files
 // - userToDirServer is a map from user names to directory endpoints, maintained by the server
 func openLog(cfg upspin.Config, dir string, maxDisk int64) (*clog, error) {
-	const op = "rpc/dircache.openLog"
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
@@ -175,12 +171,9 @@ func openLog(cfg upspin.Config, dir string, maxDisk int64) (*clog, error) {
 		exit:          make(chan bool),
 		rotate:        make(chan bool),
 		rotaterExited: make(chan bool),
+		sequenceLRU:   cache.NewLRU(SequenceLRUMax),
 	}
 	l.proxied = newProxiedDirs(l)
-
-	// updateLRU expects these to be held.
-	l.globalLock.RLock()
-	defer l.globalLock.RUnlock()
 
 	// Read the log files in ascending time order.
 	files, highestLogFile, err := listSorted(dir, true)
@@ -199,14 +192,18 @@ func openLog(cfg upspin.Config, dir string, maxDisk int64) (*clog, error) {
 	return l, nil
 }
 
-func (l *clog) proxyFor(path upspin.PathName, ep *upspin.Endpoint) {
-	l.proxied.proxyFor(path, ep)
+func (l *clog) cacheable(path upspin.PathName, ep *upspin.Endpoint) bool {
+	return l.proxied.cacheable(path, ep)
+}
+
+func (l *clog) retryWatch(parsed path.Parsed) {
+	l.proxied.retryWatch(parsed)
 }
 
 // rotateLog creates a new log file and removes enough old ones to stay under
 // the l.maxDisk limit.
 func (l *clog) rotateLog() {
-	const op = "rpc/dircache.rotateLog"
+	const op errors.Op = "rpc/dircache.rotateLog"
 
 	l.flush()
 
@@ -257,7 +254,8 @@ func (l *clog) rotateLog() {
 // were most recently interested in. The watcher should eventually
 // replace them with trusted information.
 func (l *clog) wipeLog(user upspin.UserName) {
-	const op = "rpc/dircache.wipeLog"
+	log.Info.Printf("wiping log")
+
 	l.globalLock.Lock()
 	defer l.globalLock.Unlock()
 
@@ -281,8 +279,10 @@ func (l *clog) wipeLog(user upspin.UserName) {
 			continue
 		}
 		e.request = obsoleteReq
-		l.appendToLogFile(e)
 	}
+
+	// Forget any sequence numbers since they may no longer make sense.
+	l.sequenceLRU = cache.NewLRU(SequenceLRUMax)
 }
 
 func (l *clog) flush() {
@@ -377,7 +377,7 @@ func (l *clog) rotater() {
 
 // readLogFile reads a single log file. The log file must begin and end with a version record.
 func (l *clog) readLogFile(fn string) error {
-	const op = "rpc/dircache.readLogFile"
+	const op errors.Op = "rpc/dircache.readLogFile"
 
 	log.Debug.Printf("%s: %s", op, fn)
 
@@ -417,7 +417,6 @@ func (l *clog) readLogFile(fn string) error {
 		switch e.request {
 		case versionReq:
 			log.Info.Printf("%s: version other than first record", op)
-			break
 		case globReq:
 			// Since we first log all the contents of a directory before the glob,
 			// we need to first add all entries to a manufactured glob entry. Once
@@ -458,9 +457,6 @@ func (l *clog) lookup(name upspin.PathName) (*upspin.DirEntry, error, bool) {
 		dumpMemStats()
 	}
 
-	l.globalLock.RLock()
-	defer l.globalLock.RUnlock()
-
 	plock := l.pathLocks.lock(name)
 	e := l.getFromLRU(lruKey{name: name, glob: false})
 	if e != nil {
@@ -474,13 +470,17 @@ func (l *clog) lookup(name upspin.PathName) (*upspin.DirEntry, error, bool) {
 	// Look for a complete globReq. If there is one and it doesn't list
 	// this name, we can return a NotExist error.
 	dirName := path.DropPath(name, 1)
+	if dirName == name {
+		// Name is the root, no glob entry can contain it.
+		return nil, nil, false
+	}
 	glock := l.globLocks.lock(dirName)
 	defer glock.Unlock()
 	ge := l.getFromLRU(lruKey{name: dirName, glob: true})
 	if ge == nil {
 		return nil, nil, false
 	}
-	if !l.complete(ge) {
+	if !ge.complete {
 		return nil, nil, false
 	}
 	if ge.children[lastElem(name)] {
@@ -496,9 +496,6 @@ func (l *clog) lookupGlob(pattern upspin.PathName) ([]*upspin.DirEntry, error, b
 	if !ok {
 		return nil, nil, false
 	}
-
-	l.globalLock.RLock()
-	defer l.globalLock.RUnlock()
 
 	// Lookup the glob.
 	glock := l.globLocks.lock(dirPath)
@@ -532,6 +529,8 @@ func (l *clog) lookupGlob(pattern upspin.PathName) ([]*upspin.DirEntry, error, b
 
 // complete returns true if (1) this was the result of a '*' glob and if
 // all its children are still valid in the LRU.
+//
+// Called with the glob entry locked.
 func (l *clog) complete(e *clogEntry) bool {
 	if !e.complete {
 		return false
@@ -554,65 +553,114 @@ func (l *clog) complete(e *clogEntry) bool {
 	return true
 }
 
-func (l *clog) whichAccess(name upspin.PathName) (*upspin.DirEntry, bool) {
-	l.globalLock.RLock()
-	defer l.globalLock.RUnlock()
-
-	// Do we have a cached entry for name that refers to a known Access file?
-	var afn upspin.PathName
-	plock := l.pathLocks.lock(name)
-	e := l.getFromLRU(lruKey{name: name})
-	if e != nil && e.error != nil {
-		afn = e.access
-	}
-	plock.Unlock()
-	if afn == unknownAccessFile {
-		// Do we have a cached entry for name's directory that refers to a known Access file?
-		dirName := path.DropPath(name, 1)
-		glock := l.globLocks.lock(dirName)
-		e = l.getFromLRU(lruKey{name: dirName, glob: true})
-		if e != nil && e.error != nil {
-			afn = e.access
-		}
-		glock.Unlock()
-		if afn == unknownAccessFile {
-			return nil, false
-		}
-	}
-
-	// Is the Access file's entry cached?
-	if afn == noAccessFile {
-		return nil, true
-	}
-	plock = l.pathLocks.lock(afn)
-	defer plock.Unlock()
-	e = l.getFromLRU(lruKey{name: afn})
-	if e == nil || e.de == nil || e.error != nil {
+// globHasAccess looks to see if there is a glob for the name with
+// an Access file. it returns:
+// - the Access file's DirEntry and true if it does
+// - nil and true if the glob definitively has no Access file
+// - nil and false if it cannot be determined
+func (l *clog) globHasAccess(name upspin.PathName) (*upspin.DirEntry, bool) {
+	glock := l.globLocks.lock(name)
+	defer glock.Unlock()
+	e := l.getFromLRU(lruKey{name: name, glob: true})
+	if e == nil {
+		// No cached Glob. We don't know.
 		return nil, false
 	}
-	return e.de, true
+	if _, ok := e.children[access.AccessFile]; ok {
+		// The directory has a Access file, see if we have a cached DirEntry for it.
+		afn := path.Join(name, access.AccessFile)
+		plock := l.pathLocks.lock(afn)
+		e := l.getFromLRU(lruKey{name: afn, glob: false})
+		plock.Unlock()
+		if e != nil && e.error == nil && e.de != nil {
+			// We have the entry for the access file. Return it.
+			return e.de, true
+		}
+	} else {
+		// No access file, is this conplete knowledge?
+		if e.complete || e.noAccessFile {
+			// We know there is no access file.
+			return nil, true
+		}
+	}
+
+	// We don't know.
+	return nil, false
+}
+
+// whichAcess returns the applicable Access file to name if one is known.
+// We search the cache by walking the path to the root looking for a glob
+// entry that contains an Access file. If at any step in the walk, we
+// don't have a definitive answer, give up and let the request go to the
+// server.
+//
+// The Access file for a directory can be in the directory itself while the Access
+// file for other files can be in its containing directory. That means we have
+// to know type of the target is to begin our search. If we can't
+// determine that, we have to assume it is a directory and start the search
+// for globs of that name.
+func (l *clog) whichAccess(name upspin.PathName) (*upspin.DirEntry, error, bool) {
+	p, err := path.Parse(name)
+	if err != nil {
+		log.Debug.Printf("dir/dircache/whichAccess: %s", err)
+		return nil, nil, false
+	}
+
+	// Is the target in the cache?
+	e := l.getFromLRU(lruKey{name: name, glob: false})
+	if e != nil {
+		// Give up if there was a previous error.
+		if e.error != nil || e.de == nil {
+			return nil, nil, false
+		}
+
+		if e.de.IsLink() {
+			return e.de, upspin.ErrFollowLink, true
+		}
+
+		// If the target is not a directory, start the search from its parent.
+		if !e.de.IsDir() {
+			p = p.Drop(1)
+		}
+	}
+
+	// Walk the cached glob entries to the root looking for the pertinent Access file.
+	for {
+		de, ok := l.globHasAccess(p.Path())
+		if !ok {
+			// We don't know enough, ask the actual server.
+			return nil, nil, false
+		}
+		if de != nil {
+			// We found an Access file.
+			return de, nil, true
+		}
+		if p.IsRoot() {
+			// We walked the whole path with no access file.
+			return nil, nil, true
+		}
+		p = p.Drop(1)
+	}
 }
 
 func (l *clog) logRequest(op request, name upspin.PathName, err error, de *upspin.DirEntry) {
-	l.logRequestWithOrder(op, name, err, de, 0)
+	l.logRequestWithSequence(op, name, err, de, 0)
 }
 
-func (l *clog) logRequestWithOrder(op request, name upspin.PathName, err error, de *upspin.DirEntry, order int64) {
+func (l *clog) logRequestWithSequence(op request, name upspin.PathName, err error, de *upspin.DirEntry, sequence int64) {
 	if !cacheableError(err) {
 		return
 	}
 
-	l.globalLock.RLock()
-	defer l.globalLock.RUnlock()
-
 	e := &clogEntry{
-		name:    name,
-		request: op,
-		error:   err,
-		de:      de,
-		order:   order,
+		name:     name,
+		request:  op,
+		error:    err,
+		de:       de,
+		sequence: sequence,
 	}
-	l.append(e)
+	l.appendToLogFile(e)
+	l.updateLRU(e)
 
 	// Optimization: when creating a directory, fake a complete globReq entry since
 	// we know that the directory is empty and don't have to ask the server.
@@ -624,7 +672,8 @@ func (l *clog) logRequestWithOrder(op request, name upspin.PathName, err error, 
 			children: make(map[string]bool),
 			complete: true,
 		}
-		l.append(e)
+		l.appendToLogFile(e)
+		l.updateLRU(e)
 	}
 }
 
@@ -637,7 +686,7 @@ func cacheableGlob(p upspin.PathName) (upspin.PathName, bool) {
 
 	// This test also rejects globs with escaped glob characters, i.e., real glob
 	// characters in file names.
-	if strings.IndexAny(string(pp), "*?[") >= 0 {
+	if strings.ContainsAny(string(pp), "*?[") {
 		return p, false
 	}
 	return pp, true
@@ -659,9 +708,6 @@ func (l *clog) logGlobRequest(pattern upspin.PathName, err error, entries []*ups
 		l.logRequest(lookupReq, de.Name, err, de)
 	}
 
-	l.globalLock.RLock()
-	defer l.globalLock.RUnlock()
-
 	// If any files have disappeared from a preexisting glob, remove them.
 	glock := l.globLocks.lock(dirName)
 	oe := l.getFromLRU(lruKey{name: dirName, glob: true})
@@ -674,7 +720,6 @@ func (l *clog) logGlobRequest(pattern upspin.PathName, err error, entries []*ups
 			}
 		}
 	}
-	glock.Unlock()
 
 	// The deleted files may have been recreated while we were doing this. Just forget
 	// what we know about them.
@@ -691,17 +736,9 @@ func (l *clog) logGlobRequest(pattern upspin.PathName, err error, entries []*ups
 		children: children,
 		complete: true,
 	}
-	l.append(e)
-}
-
-// append appends a clogEntry to the end of the clog and replaces existing in the LRU.
-func (l *clog) append(e *clogEntry) error {
-	const op = "rpc/dircache.append"
-
-	l.updateLRU(e)
 	l.appendToLogFile(e)
-
-	return nil
+	glock.Unlock()
+	l.updateLRU(e)
 }
 
 // updateLRU adds the entry to the in core LRU version of the clog. We don't remember errors
@@ -717,26 +754,13 @@ func (l *clog) updateLRU(e *clogEntry) {
 			l.addToGlob(e)
 			return
 		}
-		if !errors.Match(notExist, e.error) {
+		if !errors.Is(errors.NotExist, e.error) {
 			log.Debug.Printf("updateLRU %s error %s", e.name, e.error)
 			return
-		}
-		// Recursively remove from everywhere possible.
-		if e.request == globReq {
-			for k := range e.children {
-				ae := &clogEntry{
-					request: globReq,
-					name:    path.Join(e.name, k),
-					error:   e.error,
-					de:      e.de,
-				}
-				l.updateLRU(ae)
-			}
 		}
 		l.removeFromLRU(e, true)
 		l.removeFromLRU(e, false)
 		l.removeFromGlob(e)
-		l.removeAccess(e)
 
 		// Add back in as a non-existent file.
 		e.request = lookupReq
@@ -750,17 +774,18 @@ func (l *clog) updateLRU(e *clogEntry) {
 		l.removeFromLRU(e, true)
 		l.removeFromLRU(e, false)
 		l.removeFromGlob(e)
-		l.removeAccess(e)
 	case putReq:
 		l.addToLRU(e)
 		l.addToGlob(e)
-		l.addAccess(e)
 	case lookupReq, globReq:
 		l.addToLRU(e)
 		l.addToGlob(e)
-		l.addAccess(e)
 	case whichAccessReq:
-		// Log the access file itself as a lookup.
+		// Log the access file itself as a lookup. This adds the
+		// Access file to the glob of its parent directory and
+		// then calls fixAccess to set noAccessFile in all
+		// directories between the Access file and the file it
+		// is an Access file for.
 		if e.de != nil {
 			ae := &clogEntry{
 				request: lookupReq,
@@ -768,22 +793,9 @@ func (l *clog) updateLRU(e *clogEntry) {
 				error:   nil,
 				de:      e.de,
 			}
-			l.addAccess(ae)
-		}
-
-		// Add it to the specific entry.
-		dirName := path.DropPath(e.name, 1)
-		glock := l.globLocks.lock(dirName)
-		defer glock.Unlock()
-		ge := l.getFromLRU(lruKey{name: dirName, glob: true})
-		if ge != nil {
-			newVal := noAccessFile
-			if e.de != nil {
-				newVal = e.de.Name
-			}
-			if ge.access != newVal {
-				ge.access = newVal
-			}
+			l.addToLRU(ae)
+			l.addToGlob(ae)
+			l.fixAccess(e)
 		}
 	case obsoleteReq:
 		// These never get logged. They are just markers that the file
@@ -791,7 +803,6 @@ func (l *clog) updateLRU(e *clogEntry) {
 	default:
 		log.Printf("unknown request type: %s", e)
 	}
-	return
 }
 
 // addToLRU adds an entry to the LRU.
@@ -840,6 +851,9 @@ func (l *clog) addToGlob(e *clogEntry) {
 		l.lru.Add(k, ge)
 	}
 	lelem := lastElem(e.name)
+	if lelem == access.AccessFile {
+		ge.noAccessFile = false
+	}
 	ge.children[lelem] = true
 }
 
@@ -854,115 +868,49 @@ func (l *clog) removeFromGlob(e *clogEntry) {
 	glock := l.globLocks.lock(dirName)
 	if ge := l.getFromLRU(k); ge != nil {
 		delete(ge.children, lelem)
+		if lelem == access.AccessFile {
+			ge.noAccessFile = true
+		}
 	}
 	glock.Unlock()
 }
 
-func (l *clog) addAccess(e *clogEntry) {
-	if !access.IsAccessFile(e.name) {
-		return
-	}
-	// If the Access file entry hasn't changed, don't do anything.
-	ne := l.getFromLRU(lruKey{name: e.name, glob: false})
-	if ne != nil && ne.de != nil && e.de != nil && ne.de.Sequence == e.de.Sequence && ne.de.Attr == e.de.Attr {
-		return
-	}
-
-	l.changeAccess(e, true)
-}
-
-func (l *clog) removeAccess(e *clogEntry) {
-	if !access.IsAccessFile(e.name) {
-		return
-	}
-	l.changeAccess(e, false)
-}
-
-// changeAccess is called whenever the Access file, access, changes. It
-// updates the access pointer for any file that is a descendant of
-// access's directory and which doesn't have a more specific Access file.
-//
-// Since this walks through many entries in the LRU, it grabs the
-// global write lock to keep every other thread out.
-func (l *clog) changeAccess(access *clogEntry, add bool) {
-	const op = "dircache.changeAccess"
-
-	parsedAccess, err := path.Parse(access.name)
+// fixAccess sets noAccessFile in all glob entries between the e.name and e.de.Name.
+func (l *clog) fixAccess(e *clogEntry) {
+	p, err := path.Parse(e.name)
 	if err != nil {
-		log.Debug.Printf("%s: %s", op, err)
+		log.Debug.Printf("dir/dirCache/fixAccess: %s", err)
 		return
 	}
-	parsedAccessDir := parsedAccess.Drop(1)
 
-	// notMe is true if access's directory belongs to another user.
-	notMe := l.cfg.UserName() != parsedAccess.User()
+	// The DirEntry for the Access file.
+	accessName := e.de.Name
 
-	// For unreadable Access files, the DirEntry will be incomplete.
-	unreadable := !add || access.de == nil || access.de.IsIncomplete()
-
-	newval := unknownAccessFile
-	if add {
-		newval = access.name
-	}
-
-	// Lock everyone else out while we run the LRU.
-	l.globalLock.RUnlock()
-	l.globalLock.Lock()
-	defer func() {
-		l.globalLock.Unlock()
-		l.globalLock.RLock()
-	}()
-
-	iter := l.lru.NewIterator()
+	// Walk the tree marking cached Glob entries
+	// with noAccessFile = true.
 	for {
-		_, v, ok := iter.GetAndAdvance()
-		if !ok {
+		dirName := p.Path()
+		if len(dirName) < len(accessName) {
 			break
 		}
-		entry := v.(*clogEntry)
-		parsedEntry, err := path.Parse(entry.name)
-		if err != nil {
-			log.Debug.Printf("%s: %s", op, err)
-			continue
+		e := l.getFromLRU(lruKey{name: dirName, glob: true})
+		if e != nil {
+			e.noAccessFile = true
 		}
-		if !parsedEntry.HasPrefix(parsedAccessDir) {
-			continue
-		}
-		if parsedEntry.Equal(parsedAccessDir) {
-			entry.access = newval
-			// We may no longer be able to list
-			// elements of the other user's directory
-			// so mark it as incomplete.
-			if notMe {
-				entry.complete = false
-			}
-			continue
-		}
-		if parsedEntry.Drop(1).Equal(parsedAccessDir) {
-			entry.access = newval
-			// If we can't read the Access file in the
-			// other User's directory, we can't read any
-			// files in that directory.
-			if notMe && unreadable {
-				entry.invalidate()
-			}
-			continue
-		}
-		if len(entry.access) > len(access.name) {
-			// This file uses a more specific Access file.
-			// It is unaffected by the change.
-			continue
-		}
+		p = p.Drop(1)
+	}
+}
 
-		// entry is a descendent of access's directory and is not known to use
-		// a more specific Access file. Mark its Access file as unknown
-		// and, if the directory is not our own, invalidate entry since
-		// we no longer know our ability to access it.
-		entry.access = unknownAccessFile
-		if notMe {
-			entry.invalidate()
+// inSequence returns true if the sequence number is a valid new
+// sequence number for name while updating the cached sequence.
+func (l *clog) inSequence(name upspin.PathName, seq int64) bool {
+	if v, ok := l.sequenceLRU.Get(name); ok {
+		if v.(int64) >= seq {
+			return false
 		}
 	}
+	l.sequenceLRU.Add(name, seq)
+	return true
 }
 
 // invalidate invalidates an entry but leaves it in the LRU to remember
@@ -979,6 +927,11 @@ func (e *clogEntry) invalidate() {
 
 // appendToLogFile appends to the clog file.
 func (l *clog) appendToLogFile(e *clogEntry) error {
+	if e.request == obsoleteReq {
+		log.Info.Printf("appendToLogFile: obsolete requests should not be written to log")
+		return nil
+	}
+
 	buf, err := e.marshal()
 	if buf == nil {
 		// Either an error or nothing to marshal.
@@ -1011,18 +964,18 @@ func cacheableError(err error) bool {
 		return true
 	}
 	if e, ok := err.(*errors.Error); ok {
-		return errors.Match(notExist, e)
+		return errors.Is(errors.NotExist, e)
 	}
 	return err == upspin.ErrFollowLink
 }
 
-var tooShort = errors.E(errors.Invalid, errors.Errorf("log entry too short"))
-var tooLong = errors.E(errors.Invalid, errors.Errorf("log entry too long"))
-var badVersion = errors.E(errors.Invalid, errors.Errorf("bad log file version"))
+var tooShort = errors.E(errors.Invalid, "log entry too short")
+var tooLong = errors.E(errors.Invalid, "log entry too long")
+var badVersion = errors.E(errors.Invalid, "bad log file version")
 
 // A marshalled entry is of the form:
 //   request-type: byte
-//   order: varint
+//   sequence: varint
 //   error: len + marshalled upspin.Error
 //   direntry: len + marshalled upspin.DirEntry
 //   if direntry == nil {
@@ -1047,9 +1000,9 @@ func (e *clogEntry) marshal() ([]byte, error) {
 	}
 	b := []byte{byte(e.request)}
 
-	// order
+	// sequence
 	var tmp [16]byte
-	n := binary.PutVarint(tmp[:], e.order)
+	n := binary.PutVarint(tmp[:], e.sequence)
 	b = append(b, tmp[:n]...)
 
 	// error
@@ -1087,9 +1040,9 @@ func (e *clogEntry) unmarshal(b []byte) (err error) {
 	}
 	b = b[1:]
 
-	// order
+	// sequence
 	var n int
-	e.order, n = binary.Varint(b)
+	e.sequence, n = binary.Varint(b)
 	if n == 0 {
 		return tooShort
 	}
@@ -1124,7 +1077,7 @@ func (e *clogEntry) unmarshal(b []byte) (err error) {
 		e.complete = true
 	}
 	if len(b) != 0 {
-		return errors.E(errors.Invalid, errors.Errorf("log entry too long"))
+		return errors.E(errors.Invalid, "log entry too long")
 	}
 	return
 }
@@ -1152,10 +1105,10 @@ func (e *clogEntry) read(l *clog, rd *bufio.Reader) error {
 		return err
 	}
 
-	// If order is set, update the order in the proxied directories.
-	if e.order != 0 {
-		l.proxied.setOrder(e.name, e.order)
-		e.order = 0
+	// If sequence is set, update the sequence in the proxied directories.
+	if e.sequence != 0 {
+		l.proxied.setSequence(e.name, e.sequence)
+		e.sequence = 0
 	}
 	return nil
 }
@@ -1271,6 +1224,7 @@ var reqName = map[request]string{
 	putReq:         "put",
 	whichAccessReq: "whichAccess",
 	versionReq:     "version",
+	obsoleteReq:    "obsolete",
 }
 
 func (e *clogEntry) String() string {
@@ -1279,8 +1233,8 @@ func (e *clogEntry) String() string {
 		rv = reqName[e.request]
 	}
 	rv += fmt.Sprintf(" %s ", e.name)
-	if e.order != 0 {
-		rv += fmt.Sprintf(" order<%d>", e.order)
+	if e.sequence != 0 {
+		rv += fmt.Sprintf(" sequence<%d>", e.sequence)
 	}
 	if e.error != nil {
 		rv += fmt.Sprintf(" error<%s>", e.error)

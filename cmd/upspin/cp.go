@@ -40,8 +40,9 @@ very efficient, copying only the references to the data rather than
 the data itself.
 `
 	fs := flag.NewFlagSet("cp", flag.ExitOnError)
-	fs.Bool("v", false, "log each file as it is copied")
-	fs.Bool("R", false, "recursively copy directories")
+	verbose := fs.Bool("v", false, "log each file as it is copied")
+	recur := fs.Bool("R", false, "recursively copy directories")
+	overwrite := fs.Bool("overwrite", true, "overwrite existing files")
 	s.ParseFlags(fs, args, help, "cp [opts] file... file or cp [opts] file... directory")
 
 	var err error
@@ -53,10 +54,11 @@ the data itself.
 	}
 
 	cs := &copyState{
-		state:   s,
-		flagSet: fs,
-		recur:   subcmd.BoolFlag(fs, "R"),
-		verbose: subcmd.BoolFlag(fs, "v"),
+		state:     s,
+		flagSet:   fs,
+		overwrite: *overwrite,
+		recur:     *recur,
+		verbose:   *verbose,
 	}
 
 	// Do all the glob processing here.
@@ -76,10 +78,11 @@ the data itself.
 }
 
 type copyState struct {
-	state   *State
-	flagSet *flag.FlagSet // Used only to call Usage.
-	verbose bool
-	recur   bool
+	state     *State
+	flagSet   *flag.FlagSet // Used only to call Usage.
+	overwrite bool
+	recur     bool
+	verbose   bool
 }
 
 func (c *copyState) logf(format string, args ...interface{}) {
@@ -95,12 +98,6 @@ type cpFile struct {
 	isUpspin bool
 }
 
-var (
-	errExist    = errors.E(errors.Exist)
-	errNotExist = errors.E(errors.NotExist)
-	errIsDir    = errors.E(errors.IsDir)
-)
-
 func (s *State) copyCommand(cs *copyState, srcFiles []cpFile, dstFile cpFile) {
 	// TODO: Check for nugatory copies.
 	if s.isDir(dstFile) {
@@ -108,12 +105,11 @@ func (s *State) copyCommand(cs *copyState, srcFiles []cpFile, dstFile cpFile) {
 		return
 	}
 	if len(srcFiles) != 1 {
-		s.Failf("copying multiple files but %s is not a directory", dstFile.path)
+		s.Exitf("copying multiple files but %s is not a directory", dstFile.path)
 		usageAndExit(cs.flagSet)
 	}
 	if cs.recur {
-		s.Failf("recursive copy requires that final argument (%s) be an existing directory", dstFile.path)
-		usageAndExit(cs.flagSet)
+		s.Exitf("recursive copy requires that final argument (%s) be an existing directory", dstFile.path)
 	}
 	reader, err := s.open(srcFiles[0])
 	if err != nil {
@@ -129,7 +125,7 @@ func (s *State) isDir(cf cpFile) bool {
 		entry, err := s.Client.Lookup(upspin.PathName(cf.path), true)
 		// Report the error here if it's anything odd, because otherwise
 		// we'll report "not a directory" misleadingly.
-		if err != nil && !errors.Match(errNotExist, err) {
+		if err != nil && !errors.Is(errors.NotExist, err) {
 			log.Printf("%q: %v", cf.path, err)
 		}
 		return err == nil && entry.IsDir()
@@ -137,6 +133,28 @@ func (s *State) isDir(cf cpFile) bool {
 	// Not an Upspin name. Is it a local directory?
 	info, err := os.Stat(cf.path)
 	return err == nil && info.IsDir()
+}
+
+// exists reports whether the file exists.
+func (s *State) exists(file cpFile) (bool, error) {
+	if file.isUpspin {
+		_, err := s.Client.Lookup(upspin.PathName(file.path), true)
+		if err == nil {
+			return true, nil
+		}
+		if errors.Is(errors.NotExist, err) {
+			return false, nil
+		}
+		return false, err
+	}
+	_, err := os.Stat(file.path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
 }
 
 // open opens the file regardless of its location.
@@ -173,7 +191,7 @@ func (s *State) copyToDir(cs *copyState, src []cpFile, dir cpFile) {
 			}
 		}
 		reader, err := s.open(from)
-		if cs.recur && errors.Match(errIsDir, err) {
+		if cs.recur && errors.Is(errors.IsDir, err) {
 			// If the problem is that from is a directory but we have -R,
 			// recur on the contents.
 			cs.logf("recursive descent into %s", from.path)
@@ -187,7 +205,7 @@ func (s *State) copyToDir(cs *copyState, src []cpFile, dir cpFile) {
 				// Rather than use the libraries and a lot of casting, it's easiest just to cat the strings here.
 				subDir.path = subDir.path + "/" + filepath.Base(from.path) // TODO: is filepath.Base OK?
 				_, err := s.Client.MakeDirectory(upspin.PathName(subDir.path))
-				if err != nil && !errors.Match(errExist, err) {
+				if err != nil && !errors.Is(errors.Exist, err) {
 					s.Fail(err)
 					continue
 				}
@@ -216,6 +234,13 @@ func (s *State) copyToDir(cs *copyState, src []cpFile, dir cpFile) {
 
 // copyToFile copies the source to the destination. The source file has already been opened.
 func (s *State) copyToFile(cs *copyState, reader io.ReadCloser, src, dst cpFile) {
+	if !cs.overwrite {
+		if ok, err := s.exists(dst); err != nil {
+			s.Exit(err)
+		} else if ok {
+			return
+		}
+	}
 	cs.logf("start cp %s %s", src.path, dst.path)
 	defer cs.logf("end cp %s %s", src.path, dst.path)
 	// If both are in Upspin, we can avoid touching the data by copying
@@ -226,6 +251,7 @@ func (s *State) copyToFile(cs *copyState, reader io.ReadCloser, src, dst cpFile)
 		if err == nil {
 			return
 		}
+		s.Fail(err) // Failed at fastCopy; but try normal copy.
 	}
 	writer, err := s.create(dst)
 	if err != nil {
@@ -245,18 +271,16 @@ func (s *State) fastCopy(src, dst upspin.PathName) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Match(errExist, err) {
+	if errors.Is(errors.Exist, err) {
 		// File already exists, which PutDuplicate doesn't handle.
 		// Use regular copy. We could remove it and retry
 		// but that's a little scary.
 		return err
 	}
-	if errors.Match(errIsDir, err) {
+	if errors.Is(errors.IsDir, err) {
 		// Oops, we have a directory. Retry.
 		return err
 	}
-	// Unexpected error. Die.
-	s.Fail(err)
 	return nil
 }
 
