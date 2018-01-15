@@ -15,14 +15,13 @@ import (
 	"time"
 
 	"upspin.io/bind"
-	"upspin.io/flags"
 	"upspin.io/log"
+	"upspin.io/rpc"
 	"upspin.io/upspin"
 )
 
 var (
 	writethrough = flag.Bool("writethrough", false, "make storage cache writethrough")
-	cacheSize    = flag.Int64("cachesize", 5e9, "max disk `bytes` for cache")
 )
 
 // detach detaches a process from the parent process group,
@@ -30,14 +29,16 @@ var (
 var detach = func(*exec.Cmd) {}
 
 // Start starts the cacheserver if the config requires it and it is not already running.
-func Start(cfg upspin.Config) {
+func Start(cfg upspin.Config) (usingCache bool) {
 	if cfg == nil {
 		return
 	}
-	ce := cfg.CacheEndpoint()
-	if ce.Transport == upspin.Unassigned {
+	ce, err := rpc.CacheEndpoint(cfg)
+	if err != nil || ce == nil {
+		// TODO(adg): log error message?
 		return // not using a cache server
 	}
+	usingCache = true
 
 	// Ping the cache server.
 	if err := ping(cfg, ce); err == nil {
@@ -47,14 +48,13 @@ func Start(cfg upspin.Config) {
 	// Start a cache server.
 	cacheErrorChan := make(chan bool)
 	go func() {
-		cmd := exec.Command(
-			"cacheserver",
-			"-cachedir="+flags.CacheDir,
-			"-log="+log.GetLevel(),
-			fmt.Sprintf("-writethrough=%v", *writethrough),
-			fmt.Sprintf("-cachesize=%d", *cacheSize),
-			"-config="+flags.Config,
-			"-addr="+flags.NetAddr)
+		args := []string{"-log=" + log.GetLevel()}
+		args = addFlag(args, "config")
+		args = addFlag(args, "addr")
+		args = addFlag(args, "cachedir")
+		args = addFlag(args, "cachesize")
+		args = addFlag(args, "writethrough")
+		cmd := exec.Command("cacheserver", args...)
 		detach(cmd)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -79,11 +79,24 @@ func Start(cfg upspin.Config) {
 	}
 
 	fmt.Fprintf(os.Stderr, "Timed out waiting for cacheserver to start.\n")
+	return
+}
+
+// addFlag adds a flag to the command if it is at a non-default value.
+func addFlag(args []string, name string) []string {
+	f := flag.Lookup(name)
+	if f == nil {
+		return args
+	}
+	if f.Value.String() == f.DefValue {
+		return args
+	}
+	return append(args, fmt.Sprintf("-%s=%s", name, f.Value.String()))
 }
 
 // ping determines if the cacheserver is functioning.
-func ping(cfg upspin.Config, ce upspin.Endpoint) error {
-	store, err := bind.StoreServer(cfg, ce)
+func ping(cfg upspin.Config, ce *upspin.Endpoint) error {
+	store, err := bind.StoreServer(cfg, *ce)
 	if err != nil {
 		return err
 	}
