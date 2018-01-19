@@ -7,17 +7,19 @@ package server
 
 import (
 	"io/ioutil"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"upspin.io/access"
 	"upspin.io/cache"
+	"upspin.io/cloud/storage"
+	"upspin.io/dir/server/serverlog"
 	"upspin.io/dir/server/tree"
 	"upspin.io/errors"
 	"upspin.io/log"
 	"upspin.io/metric"
+	"upspin.io/pack"
 	"upspin.io/path"
 	"upspin.io/serverutil"
 	"upspin.io/shutdown"
@@ -88,13 +90,25 @@ type server struct {
 	userLocks []sync.Mutex
 
 	// snapshotControl is a channel for passing control messages to the
-	// snapshot loop. Possible control messages are: the username to
-	// snapshot or close the channel to stop the snapshot loop.
-	snapshotControl chan upspin.UserName
+	// snapshot loop.
+	snapshotControl chan snapshotCreate
 
 	// now returns the time now. It's usually just upspin.Now but is
 	// overridden for tests.
 	now func() upspin.Time
+
+	// dialed reports whether the instance was created using Dial, not New.
+	dialed bool
+
+	// The Storage backend in which to make backup copies of roots.
+	// If nil, no backups are made.
+	storage storage.Storage
+}
+
+// snapshotCreate is used to create a snapshot and report its success.
+type snapshotCreate struct {
+	userName upspin.UserName
+	created  chan error
 }
 
 var _ upspin.DirServer = (*server)(nil)
@@ -108,58 +122,43 @@ type options struct {
 
 // New creates a new instance of DirServer with the given options
 func New(cfg upspin.Config, options ...string) (upspin.DirServer, error) {
-	const op = "dir/server.New"
+	const op errors.Op = "dir/server.New"
 	if cfg == nil {
-		return nil, errors.E(op, errors.Invalid, errors.Str("nil config"))
+		return nil, errors.E(op, errors.Invalid, "nil config")
 	}
 	if cfg.DirEndpoint().Transport == upspin.Unassigned {
-		return nil, errors.E(op, errors.Invalid, errors.Str("directory endpoint cannot be unassigned"))
+		return nil, errors.E(op, errors.Invalid, "directory endpoint cannot be unassigned")
 	}
 	if cfg.KeyEndpoint().Transport == upspin.Unassigned {
-		return nil, errors.E(op, errors.Invalid, errors.Str("key endpoint cannot be unassigned"))
+		return nil, errors.E(op, errors.Invalid, "key endpoint cannot be unassigned")
 	}
 	if cfg.StoreEndpoint().Transport == upspin.Unassigned {
-		return nil, errors.E(op, errors.Invalid, errors.Str("store endpoint cannot be unassigned"))
+		return nil, errors.E(op, errors.Invalid, "store endpoint cannot be unassigned")
 	}
 	if cfg.UserName() == "" {
-		return nil, errors.E(op, errors.Invalid, errors.Str("empty user name"))
+		return nil, errors.E(op, errors.Invalid, "empty user name")
 	}
 	if cfg.Factotum() == nil {
-		return nil, errors.E(op, errors.Invalid, errors.Str("nil factotum"))
+		return nil, errors.E(op, errors.Invalid, "nil factotum")
 	}
 	// Check which options are present and pick suitable defaults.
-	userCacheSize := 1000
-	accessCacheSize := 1000
-	groupCacheSize := 100
-	logDir := ""
+	var (
+		logDir         string
+		storageBackend string
+		storageOpts    []storage.DialOpts
+	)
 	for _, opt := range options {
-		o := strings.Split(opt, "=")
-		if len(o) != 2 {
-			return nil, errors.E(op, errors.Invalid, errors.Errorf("invalid option format: %q", opt))
+		const logDirPrefix = "logDir="
+		if strings.HasPrefix(opt, logDirPrefix) {
+			logDir = opt[len(logDirPrefix):]
+			continue
 		}
-		k, v := o[0], o[1]
-		switch k {
-		case "userCacheSize", "accessCacheSize", "groupCacheSize":
-			cacheSize, err := strconv.ParseInt(v, 10, 32)
-			if err != nil {
-				return nil, errors.E(op, errors.Invalid, errors.Errorf("invalid cache size %q: %s", v, err))
-			}
-			if cacheSize < 1 {
-				return nil, errors.E(op, errors.Invalid, errors.Errorf("%s: cache size too small: %d", k, cacheSize))
-			}
-			switch opt {
-			case "userCacheSize":
-				userCacheSize = int(cacheSize)
-			case "accessCacheSize":
-				accessCacheSize = int(cacheSize)
-			case "groupCacheSize":
-				groupCacheSize = int(cacheSize)
-			}
-		case "logDir":
-			logDir = v
-		default:
-			return nil, errors.E(op, errors.Invalid, errors.Errorf("unknown option %q", k))
+		const backendPrefix = "backend="
+		if strings.HasPrefix(opt, backendPrefix) {
+			storageBackend = opt[len(backendPrefix):]
+			continue
 		}
+		storageOpts = append(storageOpts, storage.WithOptions(opt))
 	}
 	if logDir == "" {
 		dir, err := ioutil.TempDir("", "DirServer")
@@ -170,6 +169,21 @@ func New(cfg upspin.Config, options ...string) (upspin.DirServer, error) {
 		logDir = dir
 	}
 
+	var store storage.Storage
+	if storageBackend != "" {
+		// Dial a storage backend in which to store the roots.
+		var err error
+		store, err = storage.Dial(storageBackend, storageOpts...)
+		if err != nil {
+			return nil, errors.E(op, err)
+		}
+	}
+
+	const (
+		userCacheSize   = 1000
+		accessCacheSize = 1000
+		groupCacheSize  = 100
+	)
 	s := &server{
 		serverConfig:  cfg,
 		userName:      cfg.UserName(),
@@ -180,6 +194,7 @@ func New(cfg upspin.Config, options ...string) (upspin.DirServer, error) {
 		remoteGroups:  cache.NewLRU(groupCacheSize),
 		userLocks:     make([]sync.Mutex, numUserLocks),
 		now:           upspin.Now,
+		storage:       store,
 	}
 	shutdown.Handle(s.shutdown)
 	// Start background services.
@@ -190,19 +205,19 @@ func New(cfg upspin.Config, options ...string) (upspin.DirServer, error) {
 
 // Lookup implements upspin.DirServer.
 func (s *server) Lookup(name upspin.PathName) (*upspin.DirEntry, error) {
-	const op = "dir/server.Lookup"
+	const op errors.Op = "dir/server.Lookup"
 	o, m := newOptMetric(op)
 	defer m.Done()
 	return s.lookupWithPermissions(op, name, o)
 }
 
-func (s *server) lookupWithPermissions(op string, name upspin.PathName, opts ...options) (*upspin.DirEntry, error) {
+func (s *server) lookupWithPermissions(op errors.Op, name upspin.PathName, opts ...options) (*upspin.DirEntry, error) {
 	p, err := path.Parse(name)
 	if err != nil {
 		return nil, errors.E(op, name, err)
 	}
 
-	entry, err := s.lookup(op, p, entryMustBeClean, opts...)
+	entry, err := s.lookup(p, entryMustBeClean, opts...)
 
 	// Check if the user can know about the file at all. If not, to prevent
 	// leaking its existence, return Private.
@@ -210,20 +225,20 @@ func (s *server) lookupWithPermissions(op string, name upspin.PathName, opts ...
 		return s.errLink(op, entry, opts...)
 	}
 	if err != nil {
-		if errors.Match(errNotExist, err) {
+		if errors.Is(errors.NotExist, err) {
 			if canAny, _, err := s.hasRight(access.AnyRight, p, opts...); err != nil {
-				return nil, err
+				return nil, errors.E(op, err)
 			} else if !canAny {
 				return nil, errors.E(op, name, errors.Private)
 			}
 		}
-		return nil, err // s.lookup wraps err already.
+		return nil, errors.E(op, err)
 	}
 
 	// Check for Read access permission.
 	canRead, _, err := s.hasRight(access.Read, p, opts...)
 	if err == upspin.ErrFollowLink {
-		return nil, errors.E(op, errors.Internal, p.Path(), errors.Str("can't be link at this point"))
+		return nil, errors.E(op, errors.Internal, p.Path(), "can't be link at this point")
 	}
 	if err != nil {
 		return nil, errors.E(op, err)
@@ -236,7 +251,9 @@ func (s *server) lookupWithPermissions(op string, name upspin.PathName, opts ...
 		if !canAny {
 			return nil, s.errPerm(op, p, opts...)
 		}
-		entry.MarkIncomplete()
+		if !access.IsAccessControlFile(entry.SignedName) {
+			entry.MarkIncomplete()
+		}
 	}
 	return entry, nil
 }
@@ -244,13 +261,13 @@ func (s *server) lookupWithPermissions(op string, name upspin.PathName, opts ...
 // lookup implements Lookup for a parsed path. It is used by Lookup as well as
 // by put. If entryMustBeClean is true, the returned entry is guaranteed to have
 // valid references in its DirBlocks.
-func (s *server) lookup(op string, p path.Parsed, entryMustBeClean bool, opts ...options) (*upspin.DirEntry, error) {
+func (s *server) lookup(p path.Parsed, entryMustBeClean bool, opts ...options) (*upspin.DirEntry, error) {
 	o, ss := subspan("lookup", opts)
 	defer ss.End()
 
 	tree, err := s.loadTreeFor(p.User(), o)
 	if err != nil {
-		return nil, errors.E(op, err)
+		return nil, err
 	}
 	entry, dirty, err := tree.Lookup(p)
 	if err != nil {
@@ -261,14 +278,14 @@ func (s *server) lookup(op string, p path.Parsed, entryMustBeClean bool, opts ..
 		// Flush and repeat.
 		err = tree.Flush()
 		if err != nil {
-			return nil, errors.E(op, err)
+			return nil, err
 		}
 		entry, dirty, err = tree.Lookup(p)
 		if err != nil {
-			return nil, errors.E(op, err)
+			return nil, err
 		}
 		if dirty {
-			return nil, errors.E(op, errors.Internal, errors.Str("flush didn't clean entry"))
+			return nil, errors.E(errors.Internal, "flush didn't clean entry")
 		}
 	}
 	if entry.IsLink() {
@@ -279,7 +296,7 @@ func (s *server) lookup(op string, p path.Parsed, entryMustBeClean bool, opts ..
 
 // Put implements upspin.DirServer.
 func (s *server) Put(entry *upspin.DirEntry) (*upspin.DirEntry, error) {
-	const op = "dir/server.Put"
+	const op errors.Op = "dir/server.Put"
 	o, m := newOptMetric(op)
 	defer m.Done()
 
@@ -300,8 +317,12 @@ func (s *server) Put(entry *upspin.DirEntry) (*upspin.DirEntry, error) {
 			return nil, errors.E(op, err)
 		}
 		// Start a snapshot for this user.
-		s.snapshotControl <- p.User()
-		return entry, nil // Confirm snapshot has been started.
+		errorC := make(chan error)
+		s.snapshotControl <- snapshotCreate{
+			userName: p.User(),
+			created:  errorC,
+		}
+		return entry, <-errorC // Returned error reports status of snapshot.
 	}
 
 	isAccess := access.IsAccessFile(p.Path())
@@ -311,18 +332,28 @@ func (s *server) Put(entry *upspin.DirEntry) (*upspin.DirEntry, error) {
 	// Links can't be named Access or Group.
 	if isLink {
 		if isAccess || isGroup {
-			return nil, errors.E(op, p.Path(), errors.Invalid, errors.Str("link cannot be named Access or Group"))
+			return nil, errors.E(op, p.Path(), errors.Invalid, "link cannot be named Access or Group")
 		}
 	}
 	// Directories cannot have reserved names.
 	if isAccess && entry.IsDir() {
-		return nil, errors.E(op, errors.Invalid, entry.Name, errors.Str("cannot make directory named Access"))
+		return nil, errors.E(op, errors.Invalid, entry.Name, "cannot make directory named Access")
 	}
 
 	// Special files must use integrity pack (plain text + signature).
 	isGroupFile := isGroup && !entry.IsDir()
-	if (isGroupFile || isAccess) && entry.Packing != upspin.EEIntegrityPack {
-		return nil, errors.E(op, p.Path(), errors.Invalid, errors.Str("must use integrity pack"))
+	if isGroupFile || isAccess {
+		packer := pack.Lookup(entry.Packing)
+		if packer == nil {
+			return nil, errors.E(op, errors.Errorf("unknown packing %s", entry.Packing))
+		}
+		ok, err := packer.UnpackableByAll(entry)
+		if err != nil {
+			return nil, errors.E(op, err)
+		}
+		if !ok {
+			return nil, errors.E(op, p.Path(), "Access or Group files must be readable by all")
+		}
 	}
 
 	if isAccess {
@@ -349,16 +380,16 @@ func (s *server) Put(entry *upspin.DirEntry) (*upspin.DirEntry, error) {
 	}
 
 	// Check for links along the path.
-	existingEntry, err := s.lookup(op, p, !entryMustBeClean, o)
+	existingEntry, err := s.lookup(p, !entryMustBeClean, o)
 	if err == upspin.ErrFollowLink {
 		return s.errLink(op, existingEntry, o)
 	}
 
-	if errors.Match(errNotExist, err) {
+	if errors.Is(errors.NotExist, err) {
 		// OK; entry not found as expected. Can we create it?
 		canCreate, _, err := s.hasRight(access.Create, p, o)
 		if err == upspin.ErrFollowLink {
-			return nil, errors.E(op, p.Path(), errors.Internal, errors.Str("unexpected ErrFollowLink"))
+			return nil, errors.E(op, p.Path(), errors.Internal, "unexpected ErrFollowLink")
 		}
 		if err != nil {
 			return nil, errors.E(op, err)
@@ -367,9 +398,9 @@ func (s *server) Put(entry *upspin.DirEntry) (*upspin.DirEntry, error) {
 			return nil, s.errPerm(op, p, o)
 		}
 
-		// New file should have a valid sequence number, if user didn't pick one already.
-		if entry.Sequence == upspin.SeqNotExist || entry.Sequence == upspin.SeqIgnore && !entry.IsDir() {
-			entry.Sequence = upspin.NewSequence()
+		// The provided sequence number for a new item may be only SeqNotExist or SeqIgnore.
+		if entry.Sequence != upspin.SeqNotExist && entry.Sequence != upspin.SeqIgnore {
+			return nil, errors.E(op, p.Path(), errors.Invalid, "invalid sequence number")
 		}
 	} else if err != nil {
 		// Some unexpected error happened looking up path. Abort.
@@ -382,15 +413,15 @@ func (s *server) Put(entry *upspin.DirEntry) (*upspin.DirEntry, error) {
 		}
 		// Check if we can overwrite.
 		if existingEntry.IsDir() {
-			return nil, errors.E(op, p.Path(), errors.Exist, errors.Str("can't overwrite directory"))
+			return nil, errors.E(op, p.Path(), errors.Exist, "can't overwrite directory")
 		}
 		if entry.IsDir() {
-			return nil, errors.E(op, p.Path(), errors.Exist, errors.Str("can't overwrite file with directory"))
+			return nil, errors.E(op, p.Path(), errors.Exist, "can't overwrite file with directory")
 		}
 		// To overwrite a file, we need Write permission.
 		canWrite, _, err := s.hasRight(access.Write, p, o)
 		if err == upspin.ErrFollowLink {
-			return nil, errors.E(op, p.Path(), errors.Internal, errors.Str("unexpected ErrFollowLink"))
+			return nil, errors.E(op, p.Path(), errors.Internal, "unexpected ErrFollowLink")
 		}
 		if err != nil {
 			return nil, errors.E(op, err)
@@ -405,14 +436,9 @@ func (s *server) Put(entry *upspin.DirEntry) (*upspin.DirEntry, error) {
 		// We also must have the correct sequence number or SeqIgnore.
 		if entry.Sequence != upspin.SeqIgnore {
 			if entry.Sequence != existingEntry.Sequence {
-				return nil, errors.E(op, entry.Name, errors.Invalid, errors.Str("sequence number"))
+				return nil, errors.E(op, entry.Name, errors.Invalid, "sequence number")
 			}
 		}
-		// Note: sequence number updates for directories is maintained
-		// by the Tree since directory entries are never Put by the
-		// user explicitly. Here we adjust the dir entries that the user
-		// sent us (those representing files only).
-		entry.Sequence = upspin.SeqNext(existingEntry.Sequence)
 
 		// If we're updating an Access file delete it from the cache and
 		// let it be re-loaded lazily when needed again.
@@ -430,11 +456,20 @@ func (s *server) Put(entry *upspin.DirEntry) (*upspin.DirEntry, error) {
 		}
 	}
 
-	return s.put(op, p, entry, o)
+	entry, err = s.put(op, p, entry, o)
+	if err != nil {
+		return entry, err
+	}
+	// Return Incomplete entry with Sequence number.
+	retEntry := &upspin.DirEntry{
+		Attr:     upspin.AttrIncomplete,
+		Sequence: entry.Sequence,
+	}
+	return retEntry, nil
 }
 
 // put performs Put on the user's tree.
-func (s *server) put(op string, p path.Parsed, entry *upspin.DirEntry, opts ...options) (*upspin.DirEntry, error) {
+func (s *server) put(op errors.Op, p path.Parsed, entry *upspin.DirEntry, opts ...options) (*upspin.DirEntry, error) {
 	o, ss := subspan("put", opts)
 	defer ss.End()
 
@@ -455,18 +490,20 @@ func (s *server) put(op string, p path.Parsed, entry *upspin.DirEntry, opts ...o
 
 // Glob implements upspin.DirServer.
 func (s *server) Glob(pattern string) ([]*upspin.DirEntry, error) {
-	const op = "dir/server.Glob"
+	const op errors.Op = "dir/server.Glob"
 	o, m := newOptMetric(op)
 	defer m.Done()
 
+	// lookup implements serverutil.LookupFunc. It checks permissions.
 	lookup := func(name upspin.PathName) (*upspin.DirEntry, error) {
-		const op = "dir/server.Lookup"
+		const op errors.Op = "dir/server.Lookup"
 		o, ss := subspan(op, []options{o})
 		defer ss.End()
 		return s.lookupWithPermissions(op, name, o)
 	}
+	// lookup implements serverutil.ListFunc. It checks permissions.
 	listDir := func(dirName upspin.PathName) ([]*upspin.DirEntry, error) {
-		const op = "dir/server.listDir"
+		const op errors.Op = "dir/server.listDir"
 		o, ss := subspan(op, []options{o})
 		defer ss.End()
 		return s.listDir(op, dirName, o)
@@ -479,50 +516,9 @@ func (s *server) Glob(pattern string) ([]*upspin.DirEntry, error) {
 	return entries, err
 }
 
-func (s *server) globWithoutPermissions(pattern string) ([]*upspin.DirEntry, error) {
-	const op = "dir/server.globWithoutPermissions"
-	o, m := newOptMetric(op)
-	defer m.Done()
-
-	lookup := func(name upspin.PathName) (*upspin.DirEntry, error) {
-		const op = "dir/server.Lookup"
-		o, ss := subspan(op, []options{o})
-		defer ss.End()
-		p, err := path.Parse(name)
-		if err != nil {
-			return nil, errors.E(op, name, err)
-		}
-		return s.lookup(op, p, !entryMustBeClean, o)
-	}
-	listDir := func(dirName upspin.PathName) ([]*upspin.DirEntry, error) {
-		const op = "dir/server.listDir"
-		o, ss := subspan(op, []options{o})
-		defer ss.End()
-		p, err := path.Parse(dirName)
-		if err != nil {
-			return nil, errors.E(op, dirName, err)
-		}
-		tree, err := s.loadTreeFor(p.User(), o)
-		if err != nil {
-			return nil, errors.E(op, err)
-		}
-		entries, _, err := tree.List(p)
-		if err != nil {
-			return nil, errors.E(op, err)
-		}
-		return entries, nil
-	}
-
-	entries, err := serverutil.Glob(pattern, lookup, listDir)
-	if err != nil && err != upspin.ErrFollowLink {
-		err = errors.E(op, err)
-	}
-	return entries, err
-}
-
 // listDir implements serverutil.ListFunc, with an additional options variadic.
-// dirName should always be a directory.
-func (s *server) listDir(op string, dirName upspin.PathName, opts ...options) ([]*upspin.DirEntry, error) {
+// dirName should always be a directory. It checks permissions.
+func (s *server) listDir(op errors.Op, dirName upspin.PathName, opts ...options) ([]*upspin.DirEntry, error) {
 	parsed, err := path.Parse(dirName)
 	if err != nil {
 		return nil, errors.E(op, err)
@@ -531,6 +527,17 @@ func (s *server) listDir(op string, dirName upspin.PathName, opts ...options) ([
 	tree, err := s.loadTreeFor(parsed.User(), opts...)
 	if err != nil {
 		return nil, errors.E(op, err)
+	}
+
+	// Fetch the directory's contents. Don't return the error from List
+	// until we know if we have List rights.
+	entries, isDirty, listErr := tree.List(parsed)
+	if listErr == upspin.ErrFollowLink {
+		entry, err := s.errLink(op, entries[0], opts...)
+		if entry != nil {
+			return []*upspin.DirEntry{entry}, err
+		}
+		return nil, err
 	}
 
 	canList, canRead := false, false
@@ -543,27 +550,28 @@ func (s *server) listDir(op string, dirName upspin.PathName, opts ...options) ([
 	if !canList {
 		return nil, errors.E(op, dirName, errors.Private)
 	}
+	if listErr != nil {
+		return nil, errors.E(op, listErr)
+	}
 	canRead, _, _ = s.hasRight(access.Read, parsed, opts...)
 
-	if canRead {
+	if canRead && isDirty {
 		// User wants DirEntries with valid blocks, so we must flush
-		// the Tree (we could check if !dirty first, but flush when
-		// nothing is dirty is cheap and doing everything again if it
-		// was dirty is expensive, so flush now).
+		// the Tree if something is dirty and try again.
 		err = tree.Flush()
 		if err != nil {
 			return nil, errors.E(op, err)
 		}
-	}
-
-	// Fetch the directory's contents.
-	entries, _, err := tree.List(parsed)
-	if err != nil {
-		return nil, errors.E(op, err)
+		entries, _, err = tree.List(parsed)
+		if err != nil { // Not ErrFollowLink
+			return nil, errors.E(op, err)
+		}
 	}
 	if !canRead {
 		for _, e := range entries {
-			e.MarkIncomplete()
+			if !access.IsAccessControlFile(e.SignedName) {
+				e.MarkIncomplete()
+			}
 		}
 	}
 	return entries, nil
@@ -571,7 +579,7 @@ func (s *server) listDir(op string, dirName upspin.PathName, opts ...options) ([
 
 // Delete implements upspin.DirServer.
 func (s *server) Delete(name upspin.PathName) (*upspin.DirEntry, error) {
-	const op = "dir/server.Delete"
+	const op errors.Op = "dir/server.Delete"
 	o, m := newOptMetric(op)
 	defer m.Done()
 
@@ -617,10 +625,11 @@ func (s *server) Delete(name upspin.PathName) (*upspin.DirEntry, error) {
 	// If we just deleted the root, close the tree, remove it from the cache
 	// and delete all logs associated with the tree owner.
 	if p.IsRoot() {
+		user := t.User()
 		if err := s.closeTree(p.User()); err != nil {
 			return nil, errors.E(op, name, err)
 		}
-		if err := tree.DeleteLogs(p.User(), s.logDir); err != nil {
+		if err := user.DeleteLogs(); err != nil {
 			return nil, errors.E(op, name, err)
 		}
 	}
@@ -630,7 +639,7 @@ func (s *server) Delete(name upspin.PathName) (*upspin.DirEntry, error) {
 
 // WhichAccess implements upspin.DirServer.
 func (s *server) WhichAccess(name upspin.PathName) (*upspin.DirEntry, error) {
-	const op = "dir/server.WhichAccess"
+	const op errors.Op = "dir/server.WhichAccess"
 	o, m := newOptMetric(op)
 	defer m.Done()
 
@@ -655,14 +664,20 @@ func (s *server) WhichAccess(name upspin.PathName) (*upspin.DirEntry, error) {
 }
 
 // Watch implements upspin.DirServer.Watch.
-func (s *server) Watch(name upspin.PathName, order int64, done <-chan struct{}) (<-chan upspin.Event, error) {
-	const op = "dir/server.Watch"
+func (s *server) Watch(name upspin.PathName, sequence int64, done <-chan struct{}) (<-chan upspin.Event, error) {
+	const op errors.Op = "dir/server.Watch"
 	o, m := newOptMetric(op)
 	defer m.Done()
 
 	p, err := path.Parse(name)
 	if err != nil {
 		return nil, errors.E(op, name, err)
+	}
+
+	// Don't permit Watches of snapshot trees.
+	// See issue #536.
+	if isSnapshotUser(p.User()) {
+		return nil, upspin.ErrNotSupported
 	}
 
 	tree, err := s.loadTreeFor(p.User(), o)
@@ -672,7 +687,7 @@ func (s *server) Watch(name upspin.PathName, order int64, done <-chan struct{}) 
 
 	// Establish a channel with the tree and start a goroutine that filters
 	// out requests not visible by the caller.
-	treeEvents, err := tree.Watch(p, order, done)
+	treeEvents, err := tree.Watch(p, sequence, done)
 	if err != nil {
 		return nil, errors.E(op, err)
 	}
@@ -686,7 +701,7 @@ func (s *server) Watch(name upspin.PathName, order int64, done <-chan struct{}) 
 // watcher runs in a goroutine reading events from the tree and passing them
 // along to the original caller, but first verifying whether the user has rights
 // to know about the event.
-func (s *server) watch(op string, treeEvents <-chan *upspin.Event, outEvents chan<- upspin.Event) {
+func (s *server) watch(op errors.Op, treeEvents <-chan *upspin.Event, outEvents chan<- upspin.Event) {
 	const sendTimeout = time.Minute
 
 	t := time.NewTimer(sendTimeout)
@@ -743,7 +758,9 @@ func (s *server) watch(op string, treeEvents <-chan *upspin.Event, outEvents cha
 			return
 		}
 		if !hasRead {
-			e.Entry.MarkIncomplete()
+			if !access.IsAccessControlFile(e.Entry.SignedName) {
+				e.Entry.MarkIncomplete()
+			}
 		}
 		if !sendEvent(e) {
 			return
@@ -753,9 +770,9 @@ func (s *server) watch(op string, treeEvents <-chan *upspin.Event, outEvents cha
 
 // Dial implements upspin.Dialer.
 func (s *server) Dial(ctx upspin.Config, e upspin.Endpoint) (upspin.Service, error) {
-	const op = "dir/server.Dial"
+	const op errors.Op = "dir/server.Dial"
 	if e.Transport == upspin.Unassigned {
-		return nil, errors.E(op, errors.Invalid, errors.Str("transport must not be unassigned"))
+		return nil, errors.E(op, errors.Invalid, "transport must not be unassigned")
 	}
 	if err := valid.UserName(ctx.UserName()); err != nil {
 		return nil, errors.E(op, errors.Invalid, err)
@@ -764,6 +781,7 @@ func (s *server) Dial(ctx upspin.Config, e upspin.Endpoint) (upspin.Service, err
 	cp := *s // copy of the generator instance.
 	// Overwrite the userName and its sub-components (base, suffix, domain).
 	cp.userName = ctx.UserName()
+	cp.dialed = true
 	var err error
 	cp.userBase, cp.userSuffix, cp.userDomain, err = user.Parse(cp.userName)
 	if err != nil {
@@ -781,32 +799,27 @@ func (s *server) Dial(ctx upspin.Config, e upspin.Endpoint) (upspin.Service, err
 
 // Endpoint implements upspin.Service.
 func (s *server) Endpoint() upspin.Endpoint {
-	// TODO: to be removed.
 	return s.serverConfig.DirEndpoint()
-}
-
-// Ping implements upspin.Service.
-func (s *server) Ping() bool {
-	return true
 }
 
 // Close implements upspin.Service.
 func (s *server) Close() {
-	const op = "dir/server.Close"
+	const op errors.Op = "dir/server.Close"
 
 	// Remove this user's tree from the cache. This allows it to be
 	// garbage-collected even if other servers have pointers into the
 	// cache (which at least one will have, the one created with New).
 	if err := s.closeTree(s.userName); err != nil {
-		// TODO: return an error when Close expects it.
 		log.Error.Printf("%s: Error closing user tree %q: %q", op, s.userName, err)
+	}
+
+	if !s.dialed {
+		s.shutdown()
 	}
 }
 
 func (s *server) closeTree(user upspin.UserName) error {
-	mu := s.userLock(s.userName)
-	mu.Lock()
-	defer mu.Unlock()
+	defer s.userLock(s.userName).Unlock()
 
 	if t, ok := s.userTrees.Remove(user).(*tree.Tree); ok {
 		// Close will flush and release all resources.
@@ -818,62 +831,60 @@ func (s *server) closeTree(user upspin.UserName) error {
 }
 
 // loadTreeFor loads the user's tree, if it exists.
-func (s *server) loadTreeFor(user upspin.UserName, opts ...options) (*tree.Tree, error) {
+func (s *server) loadTreeFor(userName upspin.UserName, opts ...options) (*tree.Tree, error) {
 	defer span(opts).StartSpan("loadTreeFor").End()
 
-	if err := valid.UserName(user); err != nil {
+	if err := valid.UserName(userName); err != nil {
 		return nil, errors.E(errors.Invalid, err)
 	}
 
-	mu := s.userLock(user)
-	mu.Lock()
-	defer mu.Unlock()
+	defer s.userLock(s.userName).Unlock()
 
 	// Do we have a cached tree for this user already?
-	if val, found := s.userTrees.Get(user); found {
+	if val, found := s.userTrees.Get(userName); found {
 		if tree, ok := val.(*tree.Tree); ok {
 			return tree, nil
 		}
 		// This should never happen because we only store type tree.Tree in the userTree.
-		return nil, errors.E(user, errors.Internal,
+		return nil, errors.E(userName, errors.Internal,
 			errors.Errorf("userTrees contained value of unexpected type %T", val))
 	}
 	// User is not in the cache. Load a tree from the logs, if they exist.
-	hasLog, err := tree.HasLog(user, s.logDir)
+	hasLog, err := serverlog.HasLog(userName, s.logDir)
 	if err != nil {
 		return nil, err
 	}
-	if !hasLog && !s.canCreateRoot(user) {
+	if !hasLog && !s.canCreateRoot(userName) {
 		// Tree for user does not exist and the logged-in user is not
 		// allowed to create it.
 		return nil, errNotExist
 	}
-	log, logIndex, err := tree.NewLogs(user, s.logDir)
+	user, err := serverlog.Open(userName, s.logDir, s.serverConfig.Factotum(), s.storage)
 	if err != nil {
 		return nil, err
 	}
 	// If user has root, we can load the tree from it.
-	if _, err := logIndex.Root(); err != nil {
+	if _, err := user.Root(); err != nil {
 		// Likely the user has no root yet.
-		if !errors.Match(errNotExist, err) {
+		if !errors.Is(errors.NotExist, err) {
 			// No it's some other error. Abort.
 			return nil, err
 		}
 		// Ok, let it proceed. The  user will still need to make the
 		// root, but we allow setting up a new tree for now.
-		err = logIndex.SaveOffset(0)
+		err = user.SaveOffset(0)
 		if err != nil {
 			return nil, err
 		}
 		// Fall through and load a new tree.
 	}
 	// Create a new tree for the user.
-	tree, err := tree.New(s.serverConfig, log, logIndex)
+	tree, err := tree.New(s.serverConfig, user)
 	if err != nil {
 		return nil, err
 	}
 	// Add to the cache and return
-	s.userTrees.Add(user, tree)
+	s.userTrees.Add(userName, tree)
 	return tree, nil
 }
 
@@ -892,7 +903,7 @@ func (s *server) canCreateRoot(user upspin.UserName) bool {
 // errPerm checks whether the user has any right to the given path, and if so
 // returns a Permission error. Otherwise it returns a Private error.
 // This is used to prevent probing of the name space.
-func (s *server) errPerm(op string, p path.Parsed, opts ...options) error {
+func (s *server) errPerm(op errors.Op, p path.Parsed, opts ...options) error {
 	// Before returning, check that the user has the right to know,
 	// to prevent leaking the name space.
 	if hasAny, _, err := s.hasRight(access.AnyRight, p, opts...); err != nil {
@@ -909,7 +920,7 @@ func (s *server) errPerm(op string, p path.Parsed, opts ...options) error {
 // returns the entry and ErrFollowLink. If the use has no rights, it returns a
 // NotExist error. This is used to prevent probing of the name space using
 // links.
-func (s *server) errLink(op string, link *upspin.DirEntry, opts ...options) (*upspin.DirEntry, error) {
+func (s *server) errLink(op errors.Op, link *upspin.DirEntry, opts ...options) (*upspin.DirEntry, error) {
 	p, err := path.Parse(link.Name)
 	if err != nil {
 		return nil, errors.E(op, errors.Internal, link.Name, err)
@@ -929,21 +940,20 @@ func (s *server) errLink(op string, link *upspin.DirEntry, opts ...options) (*up
 func (s *server) shutdown() {
 	it := s.userTrees.NewIterator()
 	for {
-		k, v, next := it.GetAndAdvance()
+		k, _, next := it.GetAndAdvance()
 		if !next {
 			break
 		}
 		user := k.(upspin.UserName)
-		tree := v.(*tree.Tree)
-		err := tree.Close()
+		err := s.closeTree(user)
 		if err != nil {
-			log.Error.Printf("dir/server.shutdown: Error closing tree for user %s: %s", user, err)
+			log.Printf("error closing tree for user %s: %v", user, err)
 		}
 	}
 }
 
 // newOptMetric creates a new options populated with a metric for operation op.
-func newOptMetric(op string) (options, *metric.Metric) {
+func newOptMetric(op errors.Op) (options, *metric.Metric) {
 	m, sp := metric.NewSpan(op)
 	opts := options{
 		span: sp,
@@ -965,7 +975,7 @@ func span(opts []options) *metric.Span {
 
 // subspan creates a span for an operation op in the given option. It returns
 // a new option with the new span, for passing along subfunctions.
-func subspan(op string, opts []options) (options, *metric.Span) {
+func subspan(op errors.Op, opts []options) (options, *metric.Span) {
 	s := span(opts).StartSpan(op)
 	return options{span: s}, s
 }

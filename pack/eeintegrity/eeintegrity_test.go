@@ -205,11 +205,10 @@ func BenchmarkPackUnpack256_1Mbyte(b *testing.B) {
 func TestSharing(t *testing.T) {
 	// joe@google.com is the owner of a file that is shared with bob@foo.com.
 	const (
-		joesUserName   upspin.UserName = "joe@google.com"
-		pathName                       = upspin.PathName(joesUserName + "/secret_file_shared_with_bob")
-		bobsUserName   upspin.UserName = "bob@foo.com"
-		carlasUserName upspin.UserName = "carla@baz.edu"
-		text                           = "bob, here's the secret file. Sincerely, The Joe."
+		joesUserName upspin.UserName = "joe@google.com"
+		pathName                     = upspin.PathName(joesUserName + "/secret_file_shared_with_bob")
+		bobsUserName upspin.UserName = "bob@foo.com"
+		text                         = "bob, here's the secret file. Sincerely, The Joe."
 	)
 
 	// Set up Joe as the creator/owner.
@@ -270,7 +269,7 @@ type dummyKey struct {
 var _ upspin.KeyServer = (*dummyKey)(nil)
 
 func (d *dummyKey) Lookup(userName upspin.UserName) (*upspin.User, error) {
-	const op = "pack/ei.dummyKey.Lookup"
+	const op errors.Op = "pack/ei.dummyKey.Lookup"
 	for i, u := range d.userToMatch {
 		if u == userName {
 			d.returnedKeys++
@@ -281,7 +280,7 @@ func (d *dummyKey) Lookup(userName upspin.UserName) (*upspin.User, error) {
 			return user, nil
 		}
 	}
-	return nil, errors.E(op, userName, errors.NotExist, errors.Str("user not found"))
+	return nil, errors.E(op, userName, errors.NotExist, "user not found")
 }
 func (d *dummyKey) Dial(cc upspin.Config, e upspin.Endpoint) (upspin.Service, error) {
 	return d, nil
