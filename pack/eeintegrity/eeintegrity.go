@@ -71,7 +71,7 @@ func (ei ei) String() string {
 
 // Pack implements upspin.Packer.
 func (ei ei) Pack(cfg upspin.Config, d *upspin.DirEntry) (upspin.BlockPacker, error) {
-	const op = "pack/eeintegrity.Pack"
+	const op errors.Op = "pack/eeintegrity.Pack"
 	if err := pack.CheckPacking(ei, d); err != nil {
 		return nil, errors.E(op, errors.Invalid, d.Name, err)
 	}
@@ -97,7 +97,7 @@ type blockPacker struct {
 
 // Pack implements upspin.BlockPacker.
 func (bp *blockPacker) Pack(cleartext []byte) (ciphertext []byte, err error) {
-	const op = "pack/eeintegrity.blockPacker.Pack"
+	const op errors.Op = "pack/eeintegrity.blockPacker.Pack"
 	if err := internal.CheckLocationSet(bp.entry); err != nil {
 		return nil, err
 	}
@@ -133,7 +133,7 @@ func (bp *blockPacker) SetLocation(l upspin.Location) {
 
 // Close implements upspin.BlockPacker.
 func (bp *blockPacker) Close() error {
-	const op = "pack/eeintegrity.blockPacker.Close"
+	const op errors.Op = "pack/eeintegrity.blockPacker.Close"
 	if err := internal.CheckLocationSet(bp.entry); err != nil {
 		return err
 	}
@@ -154,7 +154,7 @@ func (bp *blockPacker) Close() error {
 
 // Unpack implements upspin.Packer.
 func (ei ei) Unpack(cfg upspin.Config, d *upspin.DirEntry) (upspin.BlockUnpacker, error) {
-	const op = "pack/eeintegrity.Unpack"
+	const op errors.Op = "pack/eeintegrity.Unpack"
 	if err := pack.CheckPacking(ei, d); err != nil {
 		return nil, errors.E(op, errors.Invalid, d.Name, err)
 	}
@@ -171,7 +171,7 @@ func (ei ei) Unpack(cfg upspin.Config, d *upspin.DirEntry) (upspin.BlockUnpacker
 
 	// Check that our stored+signed block checksum matches the sum of the actual blocks.
 	if got, want := internal.BlockSum(d.Blocks), hash; !bytes.Equal(got, want) {
-		return nil, errors.E(op, d.Name, errors.Str("checksum mismatch"))
+		return nil, errors.E(op, d.Name, "checksum mismatch")
 	}
 
 	// Fetch writer public key.
@@ -215,12 +215,12 @@ type blockUnpacker struct {
 
 // Unpack implements upspin.BlockUnpacker.
 func (bp *blockUnpacker) Unpack(ciphertext []byte) (cleartext []byte, err error) {
-	const op = "pack/eeintegrity.blockUpacker.Unpack"
+	const op errors.Op = "pack/eeintegrity.blockUpacker.Unpack"
 	// Validate checksum.
 	b := sha256.Sum256(ciphertext)
 	sum := b[:]
 	if got, want := sum, bp.entry.Blocks[bp.Block].Packdata; !bytes.Equal(got, want) {
-		return nil, errors.E(op, bp.entry.Name, errors.Str("checksum mismatch"))
+		return nil, errors.E(op, bp.entry.Name, "checksum mismatch")
 	}
 
 	cleartext = bp.buf.Bytes(len(ciphertext))
@@ -242,10 +242,30 @@ func (ei ei) ReaderHashes(packdata []byte) (readers [][]byte, err error) {
 func (ei ei) Share(cfg upspin.Config, readers []upspin.PublicKey, packdata []*[]byte) {
 }
 
-// Name implements upspin.Packer.
+// Name implements upspin.Name.
 func (ei ei) Name(cfg upspin.Config, d *upspin.DirEntry, newName upspin.PathName) error {
-	const op = "pack/eeintegrity.Name"
-	if d.IsDir() {
+	const op errors.Op = "pack/plain.Name"
+	return ei.updateDirEntry(op, cfg, d, newName, d.Time)
+}
+
+// SetTime implements upspin.SetTime.
+func (ei ei) SetTime(cfg upspin.Config, d *upspin.DirEntry, t upspin.Time) error {
+	const op errors.Op = "pack/plain.SetTime"
+	return ei.updateDirEntry(op, cfg, d, d.Name, t)
+}
+
+func (ei ei) updateDirEntry(op errors.Op, cfg upspin.Config, d *upspin.DirEntry, newName upspin.PathName, newTime upspin.Time) error {
+	parsed, err := path.Parse(d.Name)
+	if err != nil {
+		return errors.E(op, err)
+	}
+	parsedNew, err := path.Parse(newName)
+	if err != nil {
+		return errors.E(op, err)
+	}
+	newName = parsedNew.Path()
+
+	if d.IsDir() && !parsed.Equal(parsedNew) {
 		return errors.E(op, d.Name, errors.IsDir, "cannot rename directory")
 	}
 	if err := pack.CheckPacking(ei, d); err != nil {
@@ -256,10 +276,6 @@ func (ei ei) Name(cfg upspin.Config, d *upspin.DirEntry, newName upspin.PathName
 	sig, sig2, cipherSum, err := pdUnmarshal(d.Packdata)
 	if err != nil {
 		return errors.E(op, errors.Invalid, d.Name, err)
-	}
-
-	if _, err := path.Parse(d.Name); err != nil {
-		return errors.E(op, err)
 	}
 
 	// The writer has a well-known public key.
@@ -281,14 +297,10 @@ func (ei ei) Name(cfg upspin.Config, d *upspin.DirEntry, newName upspin.PathName
 		return errors.E(op, d.Name, errVerify)
 	}
 
-	parsedNew, err := path.Parse(newName)
-	if err != nil {
-		return errors.E(op, err)
-	}
-	newName = parsedNew.Path()
-
 	// Compute new signature, using the new name.
+	d.Writer = cfg.UserName()
 	d.SignedName = newName
+	d.Time = newTime
 	vhash = f.DirEntryHash(d.SignedName, d.Link, d.Attr, d.Packing, d.Time, dkey, cipherSum)
 	sig, err = f.FileSign(vhash)
 	if err != nil {
@@ -307,7 +319,7 @@ func (ei ei) Name(cfg upspin.Config, d *upspin.DirEntry, newName upspin.PathName
 
 // Countersign uses the key in factotum f to add a signature to a DirEntry that is already signed by oldKey.
 func (ei ei) Countersign(oldKey upspin.PublicKey, f upspin.Factotum, d *upspin.DirEntry) error {
-	const op = "pack/eeintegrity.Countersign"
+	const op errors.Op = "pack/eeintegrity.Countersign"
 	if d.IsDir() {
 		return errors.E(op, d.Name, errors.IsDir, "cannot sign directory")
 	}
@@ -338,6 +350,11 @@ func (ei ei) Countersign(oldKey upspin.PublicKey, f upspin.Factotum, d *upspin.D
 	}
 	pdMarshal(&d.Packdata, sig1, sig, cipherSum)
 	return nil
+}
+
+func (ei ei) UnpackableByAll(d *upspin.DirEntry) (bool, error) {
+	// Content is not encrypted, so anyone can read it.
+	return true, nil
 }
 
 func pdMarshal(dst *[]byte, sig, sig2 upspin.Signature, cipherSum []byte) error {
