@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"os"
 	"strings"
 
 	"flag"
@@ -30,7 +29,7 @@ import (
 func (s *State) tar(args ...string) {
 	const help = `
 Tar archives an Upspin tree into a local tar file, or with the
--extract flag, unpacks a a local tar file into an Upspin tree.
+-extract flag, unpacks a local tar file into an Upspin tree.
 
 When extracting, the -match and -replace flags cause the extracted
 file to have any prefix that matches be replaced by substitute text.
@@ -56,6 +55,9 @@ always be in Upspin.
 // archiver implements archiving and unarchiving to/from Upspin tree and a local
 // file system.
 type archiver struct {
+	// state holds the current upspin state.
+	state *State
+
 	// client is the Upspin client to use for read or write.
 	client upspin.Client
 
@@ -101,6 +103,7 @@ func (s *State) untarCommand(fs *flag.FlagSet) {
 
 func (s *State) newArchiver(verbose bool) (*archiver, error) {
 	return &archiver{
+		state:   s,
 		client:  s.Client,
 		verbose: verbose,
 	}, nil
@@ -137,7 +140,7 @@ func (a *archiver) doArchive(pathName upspin.PathName, tw *tar.Writer, dst io.Wr
 			ModTime: e.Time.Go(),
 		}
 		if a.verbose {
-			fmt.Fprintf(os.Stderr, "Archiving %q\n", e.Name)
+			fmt.Fprintf(a.state.Stderr, "Archiving %q\n", e.Name)
 		}
 		switch {
 		case e.IsDir():
@@ -166,9 +169,13 @@ func (a *archiver) doArchive(pathName upspin.PathName, tw *tar.Writer, dst io.Wr
 			if err := tw.WriteHeader(hdr); err != nil {
 				return err
 			}
-			if data, err := a.client.Get(e.Name); err != nil {
+			f, err := a.client.Open(e.Name)
+			if err != nil {
 				return err
-			} else if _, err := tw.Write(data); err != nil {
+			}
+			_, err = io.Copy(tw, f)
+			f.Close()
+			if err != nil {
 				return err
 			}
 		}
@@ -215,13 +222,13 @@ func (a *archiver) unarchive(src io.ReadCloser) error {
 		}
 
 		if a.verbose {
-			fmt.Fprintf(os.Stderr, "Extracting %q into %q\n", hdr.Name, name)
+			fmt.Fprintf(a.state.Stderr, "Extracting %q into %q\n", hdr.Name, name)
 		}
 
 		switch hdr.Typeflag {
 		case tar.TypeDir:
 			_, err = a.client.MakeDirectory(name)
-			if err != nil && !errors.Match(errors.E(errors.Exist), err) {
+			if err != nil && !errors.Is(errors.Exist, err) {
 				return err
 			}
 		case tar.TypeSymlink:
@@ -230,28 +237,35 @@ func (a *archiver) unarchive(src io.ReadCloser) error {
 				return err
 			}
 		case tar.TypeReg:
-			buf, err := ioutil.ReadAll(tr)
-			if err != nil {
-				return err
-			}
-			name := upspin.PathName(name)
 			if access.IsAccessFile(name) {
 				// Save Access files for later, to prevent
 				// being locked out from restoring sub-entries.
+				buf, err := ioutil.ReadAll(tr)
+				if err != nil {
+					return err
+				}
 				acc = append(acc, accessFiles{
 					name:     name,
 					contents: buf,
 				})
 				continue
 			}
-			_, err = a.client.Put(name, buf)
+			f, err := a.client.Create(name)
 			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(f, tr); err != nil {
+				f.Close()
+				a.client.Delete(name)
+				return err
+			}
+			if err := f.Close(); err != nil {
 				return err
 			}
 		}
 	}
 
-	// Now extracts Access files.
+	// Now extract Access files.
 	for _, af := range acc {
 		_, err := a.client.Put(af.name, af.contents)
 		if err != nil {
