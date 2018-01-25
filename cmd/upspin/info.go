@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
-	"os"
 	"text/tabwriter"
 	"text/template"
 	"time"
@@ -30,25 +29,37 @@ validity. If it is a link, the command attempts to access the target
 of the link.
 `
 	fs := flag.NewFlagSet("info", flag.ExitOnError)
+	recur := fs.Bool("R", false, "recur into subdirectories")
 	s.ParseFlags(fs, args, help, "info path...")
 
 	if fs.NArg() == 0 {
 		usageAndExit(fs)
 	}
+
 	for _, name := range fs.Args() {
-		name := s.AtSign(name)
-		entries, err := s.DirServer(name).Glob(string(name))
-		// ErrFollowLink is OK; we still get the relevant entry.
-		if err != nil && err != upspin.ErrFollowLink {
-			s.Exit(err)
-		}
-		for _, entry := range entries {
-			s.printInfo(entry)
-			switch {
-			case access.IsAccessFile(entry.Name):
-				s.checkAccessFile(entry.Name)
-			case access.IsGroupFile(entry.Name):
-				s.checkGroupFile(entry.Name)
+		s.doInfo(string(s.AtSign(name)), *recur, true)
+	}
+}
+
+func (s *State) doInfo(pattern string, recur, first bool) {
+	entries, err := s.DirServer(upspin.PathName(pattern)).Glob(pattern)
+	// ErrFollowLink is OK: we show the link itself.
+	if err != nil && err != upspin.ErrFollowLink {
+		s.Exit(err)
+	}
+	if len(entries) == 0 && first {
+		s.Exitf("no such file %q", pattern)
+	}
+	for _, entry := range entries {
+		s.printInfo(entry)
+		switch {
+		case access.IsAccessFile(entry.Name):
+			s.checkAccessFile(entry.Name)
+		case access.IsGroupFile(entry.Name):
+			s.checkGroupFile(entry.Name)
+		case entry.IsDir():
+			if recur {
+				s.doInfo(upspin.AllFilesGlob(entry.Name), recur, false)
 			}
 		}
 	}
@@ -90,8 +101,13 @@ func (d *infoDirEntry) Readers() string {
 		return err.Error()
 	}
 	var b bytes.Buffer
-	for i, user := range users {
-		if i > 0 {
+	if packer := pack.Lookup(d.Packing); packer != nil {
+		if ok, _ := packer.UnpackableByAll(d.DirEntry); ok {
+			b.WriteString(string(access.AllUsers))
+		}
+	}
+	for _, user := range users {
+		if b.Len() > 0 {
 			b.WriteByte(' ')
 		}
 		b.WriteString(string(user))
@@ -101,7 +117,7 @@ func (d *infoDirEntry) Readers() string {
 }
 
 func (d *infoDirEntry) Sequence() int64 {
-	return upspin.SeqVersion(d.DirEntry.Sequence)
+	return d.DirEntry.Sequence
 }
 
 func (d *infoDirEntry) Hashes() string {
@@ -160,11 +176,11 @@ func (d *infoDirEntry) WhichAccess() string {
 		accFile = string(accEntry.Name)
 		data, err := read(d.state.Client, accEntry.Name)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "cannot open access file %q: %s\n", accFile, err)
+			fmt.Fprintf(d.state.Stderr, "cannot open access file %q: %s\n", accFile, err)
 		}
 		acc, err = access.Parse(accEntry.Name, data)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "cannot parse access file %q: %s\n", accFile, err)
+			fmt.Fprintf(d.state.Stderr, "cannot parse access file %q: %s\n", accFile, err)
 		}
 	}
 	d.access = acc
@@ -181,7 +197,7 @@ func (s *State) printInfo(entry *upspin.DirEntry) {
 		state:    s,
 		DirEntry: entry,
 	}
-	writer := tabwriter.NewWriter(os.Stdout, 4, 4, 1, ' ', 0)
+	writer := tabwriter.NewWriter(s.Stdout, 4, 4, 1, ' ', 0)
 	err := infoTmpl.Execute(writer, infoDir)
 	if err != nil {
 		s.Exitf("executing info template: %v", err)
@@ -199,7 +215,7 @@ func (s *State) printInfo(entry *upspin.DirEntry) {
 		// Print the whole error indented, starting on the next line. This helps it stand out.
 		s.Exitf("Error: link %s has invalid target %s:\n\t%v", entry.Name, entry.Link, err)
 	}
-	fmt.Printf("Target of link %s:\n", entry.Name)
+	s.Printf("Target of link %s:\n", entry.Name)
 	s.printInfo(target)
 }
 
@@ -223,7 +239,8 @@ func attrFormat(attr upspin.Attribute) string {
 
 var infoTmpl = template.Must(template.New("info").Parse(infoText))
 
-const infoText = `{{.Name}}
+const infoText = `
+{{.Name}}
 	packing:	{{.Packing}}
 	size:	{{.Size}}
 	time:	{{.TimeString}}
