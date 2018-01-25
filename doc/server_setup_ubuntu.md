@@ -18,12 +18,12 @@ run the appropriate `upspinserver` by following these instructions.
 
 ## Create a user
 
-The following commands must be executed on the server as the super user, `root`,
-perhaps via `sudo su`.
-
 Throughout this document, we will mark commands to be run on your
 local machine with the shell prompt `local$` and commands to be
 run on your server with `server%`, or if running as `root`, `server#`.
+
+The following commands must be executed on the server as the super user, `root`,
+perhaps via `sudo su`.
 
 Create a Unix account named `upspin`:
 
@@ -38,10 +38,9 @@ server# su upspin
 server% cd $HOME
 server% mkdir .ssh
 server% chmod 0700 .ssh
-server% touch .ssh/authorized_keys
-server% chmod 0600 .ssh/authorized_keys
 server% cat > .ssh/authorized_keys
 (Paste your SSH public key here and type Control-D and Enter)
+server% chmod 0600 .ssh/authorized_keys
 ```
 
 Create the letsencrypt cache directory:
@@ -91,10 +90,10 @@ Restart=on-failure
 WantedBy=multi-user.target
 ```
 
-### Allow `upspinserver` to listen on port `443`
+### Allow `upspinserver` to listen on ports `80` and `443`
 
-The `upspinserver` binary needs to listen on port `443` in order to obtain
-its TLS certificates through [LetsEncrypt](https://letsencrypt.org/).
+The `upspinserver` binary needs to listen on ports `80` and `443` in order to
+obtain its TLS certificates through [LetsEncrypt](https://letsencrypt.org/).
 
 Normally only user `root` can bind ports below `1024`.
 Instead of running `upspinserver` as `root` (which is generally discouraged),
