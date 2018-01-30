@@ -3,7 +3,6 @@
 // license that can be found in the LICENSE file.
 
 // +build !windows
-// +build !openbsd
 
 package main
 
@@ -20,6 +19,7 @@ import (
 	"upspin.io/flags"
 	"upspin.io/log"
 	"upspin.io/rpc/local"
+	"upspin.io/version"
 
 	_ "upspin.io/pack/ee"
 	_ "upspin.io/pack/eeintegrity"
@@ -30,18 +30,20 @@ import (
 
 const cmdName = "upspinfs"
 
+var mountpointFlag = flag.String("mountpoint", "", "`directory` on which to mount file system")
+
 func usage() {
-	fmt.Fprintf(os.Stderr, "Usage: %s <mountpoint>\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "Usage: %s [-mountpoint] <mount point>\n", os.Args[0])
 	flag.PrintDefaults()
 }
 
 func main() {
 	flag.Usage = usage
-	flags.Parse(flags.Server, "cachedir")
+	flags.Parse(flags.Server, "cachedir", "cachesize", "prudent", "version")
 
-	if flag.NArg() != 1 {
-		usage()
-		os.Exit(2)
+	if flags.Version {
+		fmt.Print(version.Version())
+		return
 	}
 
 	// Normal setup, get configuration from file and push user cache onto config.
@@ -57,18 +59,32 @@ func main() {
 
 	transports.Init(cfg)
 
-	// Start the cache if needed.
-	cacheutil.Start(cfg)
+	// Start the cacheserver if needed.
+	if cacheutil.Start(cfg) {
+		// Using a cacheserver, adjust cache size for upspinfs down.
+		flags.CacheSize = flags.CacheSize / 10
+	}
 
 	// Mount the file system and start serving.
-	mountpoint, err := filepath.Abs(flag.Arg(0))
-	if err != nil {
-		log.Fatalf("can't determine absolute path to mount point %s: %s", flag.Arg(0), err)
+	if *mountpointFlag != "" {
+		if flag.NArg() > 0 {
+			log.Fatalf("mount point specified as both flag and argument\n")
+		}
+	} else {
+		if flag.NArg() != 1 {
+			usage()
+			os.Exit(2)
+		}
+		*mountpointFlag = flag.Arg(0)
 	}
-	done := do(cfg, mountpoint, flags.CacheDir)
+	mountpoint, err := filepath.Abs(*mountpointFlag)
+	if err != nil {
+		log.Fatalf("can't determine absolute path to mount point %s: %s", *mountpointFlag, err)
+	}
+	done := do(cfg, mountpoint, filepath.Join(flags.CacheDir, string(cfg.UserName())), flags.CacheSize)
 
 	// Serve expvar data.
-	ln, err := local.Listen("tcp", local.LocalName(cfg, cmdName))
+	ln, err := local.Listen("tcp", config.LocalName(cfg, cmdName))
 	if err != nil {
 		log.Fatal(err)
 	}

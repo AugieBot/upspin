@@ -57,7 +57,7 @@ func (s *server) whichAccess(p path.Parsed, opts ...options) (*upspin.DirEntry, 
 			// and ErrFollowLink.
 			return entry, err
 		}
-		if errors.Match(errNotExist, err) {
+		if errors.Is(errors.NotExist, err) {
 			if p.IsRoot() {
 				// Already at the root, nothing found.
 				return nil, nil
@@ -93,7 +93,7 @@ func (s *server) loadPath(name upspin.PathName) ([]byte, error) {
 
 	var entry *upspin.DirEntry
 	if s.userName == p.User() {
-		entry, err = s.lookup("loadPath", p, entryMustBeClean)
+		entry, err = s.lookup(p, entryMustBeClean)
 	} else {
 		entry, err = s.remoteLookup(p)
 		if err == nil {
@@ -134,7 +134,7 @@ func (s *server) remoteLookup(p path.Parsed) (*upspin.DirEntry, error) {
 		if e == s.serverConfig.DirEndpoint() {
 			// It's okay to load the tree for this user, because they
 			// live in this dir server, according to the KeyServer.
-			return s.lookup("remoteLookup", p, entryMustBeClean)
+			return s.lookup(p, entryMustBeClean)
 		}
 		dir, err := bind.DirServer(s.serverConfig, e)
 		if check(err) != nil {
@@ -146,7 +146,7 @@ func (s *server) remoteLookup(p path.Parsed) (*upspin.DirEntry, error) {
 	if firstErr != nil {
 		return nil, firstErr
 	}
-	return nil, errors.E(errors.NotExist, p.Path(), errors.Str("no remote entry for path"))
+	return nil, errors.E(errors.NotExist, p.Path(), "no remote entry for path")
 }
 
 // hasRight reports whether the current user has the given right on the path. If
@@ -218,7 +218,7 @@ func (s *server) getAccess(entry *upspin.DirEntry, opts ...options) (*access.Acc
 
 	// Sanity check: is this really an Access file?
 	if !access.IsAccessFile(entry.Name) {
-		return nil, errors.E(errors.Internal, entry.Name, errors.Str("not an Access file"))
+		return nil, errors.E(errors.Internal, entry.Name, "not an Access file")
 	}
 
 	// Is it in the cache?
@@ -228,7 +228,7 @@ func (s *server) getAccess(entry *upspin.DirEntry, opts ...options) (*access.Acc
 		var ok bool
 		accEntry, ok = a.(*accessEntry)
 		if !ok {
-			return nil, errors.E(errors.Internal, errors.Str("invalid accessEntry"))
+			return nil, errors.E(errors.Internal, "invalid accessEntry")
 		}
 		if entry.Sequence == accEntry.sequence {
 			return accEntry.acc, nil
@@ -265,7 +265,7 @@ func (s *server) getDefaultAccess(userName upspin.UserName) (acc *access.Access,
 		var ok bool
 		acc, ok = cacheEntry.(*access.Access)
 		if !ok {
-			return nil, errors.E(errors.Internal, errors.Str("not an Access file"))
+			return nil, errors.E(errors.Internal, "not an Access file")
 		}
 	}
 	return
