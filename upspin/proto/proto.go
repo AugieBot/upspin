@@ -66,7 +66,7 @@ func UpspinLocations(l []*Location) []upspin.Location {
 // UpspinDirEntry converts a slice of bytes struct to *upspin.DirEntry.
 // If the slice is nil or empty, it returns nil.
 func UpspinDirEntry(b []byte) (*upspin.DirEntry, error) {
-	const op = "proto.UpspinDirEntry"
+	const op errors.Op = "proto.UpspinDirEntry"
 	if len(b) == 0 {
 		return nil, nil
 	}
@@ -76,7 +76,7 @@ func UpspinDirEntry(b []byte) (*upspin.DirEntry, error) {
 		return nil, err
 	}
 	if len(b) != 0 {
-		return nil, errors.E(op, errors.Invalid, errors.Str("extra data"))
+		return nil, errors.E(op, errors.Invalid, "extra data")
 	}
 	return &d, nil
 }
@@ -240,7 +240,6 @@ func UpspinEvent(event *Event) (*upspin.Event, error) {
 	}
 	return &upspin.Event{
 		Entry:  entry, // may be nil.
-		Order:  event.Order,
 		Delete: event.Delete,
 		Error:  errors.UnmarshalError(event.Error),
 	}, nil
@@ -269,7 +268,6 @@ func EventProto(event *upspin.Event) (*Event, error) {
 	}
 	return &Event{
 		Entry:  b,
-		Order:  event.Order,
 		Delete: event.Delete,
 		Error:  err,
 	}, nil
