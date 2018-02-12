@@ -296,9 +296,8 @@ but that has not been done.
 ## Encoding and access for Access and Group files
 
 `Group` and `Access` files are plain UTF-8-encoded text files and are always
-stored using plain packing with integrity checking (LINK).
-They cannot be stored as encrypted files as this would prevent them being
-readable by the servers that enforce the permissions they grant.
+readable by anyone with permission to access them, and by the servers that enforce the
+permissions they grant.
 
 Also, if an `Access` or `Group` file in user U's tree mentions a `Group` file
 from user V's tree, user V must explicitly grant public read access for the
@@ -424,6 +423,12 @@ returned `DirEntry` has empty `Blocks` and `Packdata` fields.
 
 As always, if the name steps through a link, the caller must have some access
 rights for the link entry itself.
+
+The owner has special rights regarding items in the owner's tree:
+
+*   any file can be read
+*   any directory can be listed (its contents can be viewed)
+*   any `Access` or `Group` file can be created, read or modified
 
 For snapshots, once the snapshot tree is initialized it behaves as if the tree
 has an `Access` file with (for `ann+snapshot@example.com`):
