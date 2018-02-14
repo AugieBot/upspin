@@ -11,7 +11,10 @@ import (
 	"strings"
 	"time"
 
+	"upspin.io/access"
+	"upspin.io/bind"
 	"upspin.io/client"
+	"upspin.io/config"
 	"upspin.io/errors"
 	"upspin.io/upspin"
 )
@@ -44,6 +47,7 @@ type Runner struct {
 	Events []upspin.Event
 
 	user    upspin.UserName
+	configs map[upspin.UserName]upspin.Config
 	clients map[upspin.UserName]upspin.Client
 	events  map[upspin.UserName]<-chan upspin.Event
 
@@ -55,6 +59,7 @@ type Runner struct {
 
 func NewRunner() *Runner {
 	return &Runner{
+		configs: make(map[upspin.UserName]upspin.Config),
 		clients: make(map[upspin.UserName]upspin.Client),
 		events:  make(map[upspin.UserName]<-chan upspin.Event),
 	}
@@ -75,6 +80,7 @@ func (r *Runner) AddUser(cfg upspin.Config) {
 	if r.err != nil {
 		return
 	}
+	r.configs[cfg.UserName()] = cfg
 	r.clients[cfg.UserName()] = client.New(cfg)
 }
 
@@ -89,7 +95,17 @@ func (r *Runner) As(u upspin.UserName) {
 		r.setErr(errors.E(errors.NotExist, u))
 		return
 	}
+	r.setErr(r.FlushCache())
 	r.user = u
+}
+
+// Config returns the Config for the current user.
+func (r *Runner) Config() upspin.Config {
+	cfg := r.configs[r.user]
+	if cfg == nil {
+		return config.New()
+	}
+	return cfg
 }
 
 // Get performs a Get request as the user
@@ -191,7 +207,7 @@ func (r *Runner) DirLookup(p upspin.PathName) {
 // DirWatch performs a Watch request to the user's underlying DirServer and
 // populates the Runner's Events channel with the DirServer's returned Event
 // channel. It returns the done channel for this watcher, if successful.
-func (r *Runner) DirWatch(p upspin.PathName, order int64) chan struct{} {
+func (r *Runner) DirWatch(p upspin.PathName, seq int64) chan struct{} {
 	if r.err != nil {
 		return nil
 	}
@@ -201,7 +217,7 @@ func (r *Runner) DirWatch(p upspin.PathName, order int64) chan struct{} {
 		return nil
 	}
 	done := make(chan struct{})
-	r.events[r.user], err = dir.Watch(p, order, done)
+	r.events[r.user], err = dir.Watch(p, seq, done)
 	r.setErr(err)
 	return done
 }
@@ -287,7 +303,7 @@ func (r *Runner) GotEntryWithSequenceVersion(p upspin.PathName, seq int64) bool 
 		r.lastErr = errors.Errorf("got nil entry, want %q", p)
 	} else if r.Entry.Name != p {
 		r.lastErr = errors.Errorf("got entry %q, want %q", r.Entry.Name, p)
-	} else if upspin.SeqVersion(r.Entry.Sequence) != upspin.SeqVersion(seq) {
+	} else if r.Entry.Sequence != seq {
 		r.lastErr = errors.Errorf("got sequence %d, want %d", r.Entry.Sequence, seq)
 	} else {
 		return true
@@ -298,7 +314,8 @@ func (r *Runner) GotEntryWithSequenceVersion(p upspin.PathName, seq int64) bool 
 
 // GotEntries reports whether the names of the Entries match the provided
 // list (in order). It also checks that the presence of block data in
-// those entries matches the boolean.
+// those entries matches the boolean, except it tolerates Access and Group files
+// having blocks even if wantBlockData is false.
 // If not, it notes the discrepancy as the last error state.
 func (r *Runner) GotEntries(wantBlockData bool, ps ...upspin.PathName) bool {
 	if r.Failed() {
@@ -328,8 +345,12 @@ func (r *Runner) GotEntries(wantBlockData bool, ps ...upspin.PathName) bool {
 		if nBlocks > 0 == wantBlockData || r.Entries[i].IsLink() {
 			continue
 		}
+		if nBlocks > 0 && !wantBlockData && access.IsAccessControlFile(r.Entries[i].Name) {
+			// Access and Group file can have blocks in case the reader has any right.
+			continue
+		}
 		if wantBlockData {
-			r.lastErr = errors.Errorf("got entry %q with 0 blocks, want some", got)
+			r.lastErr = errors.Errorf("got entry %q with %d blocks, want some", got, nBlocks)
 		} else {
 			r.lastErr = errors.Errorf("got entry %q with %d blocks, want none", got, nBlocks)
 		}
@@ -432,18 +453,39 @@ func (r *Runner) GetErrorEvent(want error) bool {
 	return r.match(want, r.lastErr)
 }
 
+// GetDeleteEvent gets one event from the user's Event channel and expects
+// it to be a deletion of the file.
+func (r *Runner) GetDeleteEvent(p upspin.PathName) bool {
+	if r.Failed() {
+		return false
+	}
+	event := r.getNextEvent()
+	if r.Failed() {
+		return false
+	}
+	if event.Entry.Name != p {
+		r.lastErr = errors.E(errors.Errorf("path was %q; expected %q", event.Entry.Name, p))
+		return false
+	}
+	if !event.Delete {
+		r.lastErr = errors.E(errors.Errorf("event for %q was not Delete", event.Entry.Name))
+		return false
+	}
+	return true
+}
+
 func (r *Runner) getNextEvent() *upspin.Event {
 	var e upspin.Event
 	var ok bool
 	select {
 	case e, ok = <-r.events[r.user]:
 	case <-time.After(time.Second):
-		r.lastErr = errors.E(errors.Str("no response on event channel after one second"))
+		r.lastErr = errors.E("no response on event channel after one second")
 		_, r.errFile, r.errLine, _ = runtime.Caller(2)
 		return nil
 	}
 	if !ok {
-		r.lastErr = errors.E(errors.Str("event channel closed"))
+		r.lastErr = errors.E("event channel closed")
 		_, r.errFile, r.errLine, _ = runtime.Caller(2)
 		return nil
 	}
@@ -465,4 +507,20 @@ func (r *Runner) Diag() string {
 		return r.lastErr.Error()
 	}
 	return fmt.Sprintf("%s:%d: %v", filepath.Base(r.errFile), r.errLine, r.lastErr)
+}
+
+// FlushCache flushes a user's Store cache.
+func (r *Runner) FlushCache() error {
+	ce := r.Config().CacheEndpoint()
+	if ce.Unassigned() {
+		return nil
+	}
+	store, err := bind.StoreServer(r.Config(), r.Config().StoreEndpoint())
+	if err != nil {
+		return err
+	}
+	if _, _, _, err := store.Get(upspin.FlushWritebacksMetadata); err != nil {
+		return err
+	}
+	return nil
 }

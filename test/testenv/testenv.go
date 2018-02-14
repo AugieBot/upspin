@@ -21,6 +21,7 @@ import (
 	"upspin.io/log"
 	"upspin.io/test/servermux"
 	"upspin.io/test/testutil"
+	"upspin.io/upbox"
 	"upspin.io/upspin"
 	"upspin.io/user"
 
@@ -46,11 +47,20 @@ const (
 
 // Setup is a configuration structure that contains a directory tree and other optional flags.
 type Setup struct {
-	// OwnerName is the name of the directory tree owner.
+	// OwnerName is the name of the user that runs the tests.
 	OwnerName upspin.UserName
 
-	// Kind is what kind of servers to use, "inprocess" or "remote".
+	// Kind is what kind of servers to use, "inprocess", "server", or "remote".
 	Kind string
+
+	// UpBox specifies whether to use upbox to run dirserver,
+	// storeserver, and keyserver processes separate to the test process.
+	// If false, the test server instances are run inside the test process.
+	UpBox bool
+
+	// Cache specifies whether to run a cacheserver for the owner.
+	// This option applies only when UpBox is true.
+	Cache bool
 
 	// Packing is the desired packing for the tree.
 	Packing upspin.Packing
@@ -74,10 +84,11 @@ type Env struct {
 	// Setup contains the original setup options.
 	Setup *Setup
 
-	KeyServer   upspin.KeyServer
-	StoreServer upspin.StoreServer
-	DirServer   upspin.DirServer
+	keyServer   upspin.KeyServer
+	storeServer upspin.StoreServer
+	dirServer   upspin.DirServer
 
+	schema     *upbox.Schema
 	tmpDir     string
 	exitCalled bool
 }
@@ -108,9 +119,26 @@ func randomEndpoint(prefix string) upspin.Endpoint {
 	}
 }
 
+const upboxYAML = `
+users:
+- name: %[1]q
+- name: %[2]q
+  cache: %[3]t
+servers:
+- name: keyserver
+  user: %[1]q
+- name: storeserver
+  user: %[1]q
+- name: dirserver
+  user: %[1]q
+  flags:
+    kind: %[4]s
+domain: example.com
+`
+
 // New creates a new Env for testing.
 func New(setup *Setup) (*Env, error) {
-	const op = "testenv.New"
+	const op errors.Op = "testenv.New"
 	env := &Env{
 		Setup: setup,
 	}
@@ -120,8 +148,34 @@ func New(setup *Setup) (*Env, error) {
 	// DirServers can still interact with each other.
 	cfg = config.SetKeyEndpoint(cfg, upspin.Endpoint{Transport: upspin.InProcess})
 
-	switch k := setup.Kind; k {
+	switch setup.Kind {
 	case "inprocess", "server":
+		if setup.UpBox {
+			// Use upbox.
+			yaml := fmt.Sprintf(upboxYAML,
+				TestServerName,
+				setup.OwnerName,
+				setup.Cache,
+				setup.Kind,
+			)
+			schema, err := upbox.SchemaFromYAML(yaml)
+			if err != nil {
+				return nil, err
+			}
+			if err := schema.Start(); err != nil {
+				return nil, err
+			}
+			env.schema = schema
+
+			cfg, err = config.FromFile(schema.Config(string(TestServerName)))
+			if err != nil {
+				env.cleanup()
+				return nil, err
+			}
+			env.Config = cfg
+			break
+		}
+
 		// Test either the dir/inprocess or dir/server implementations
 		// entire in-memory and offline.
 
@@ -134,8 +188,8 @@ func New(setup *Setup) (*Env, error) {
 		// Set up a StoreServer instance. Just use the inprocess
 		// version for offline tests; the store/server implementation
 		// isn't interesting when run offline.
-		env.StoreServer = storeserver.New()
-		storeServerMux.Register(storeEndpoint, env.StoreServer)
+		env.storeServer = storeserver.New()
+		storeServerMux.Register(storeEndpoint, env.storeServer)
 
 		// Set up user and factotum.
 		cfg = config.SetUserName(cfg, TestServerName)
@@ -146,9 +200,9 @@ func New(setup *Setup) (*Env, error) {
 		cfg = config.SetFactotum(cfg, f)
 
 		// Set up DirServer instance.
-		switch k {
+		switch setup.Kind {
 		case "inprocess":
-			env.DirServer = dirserver_inprocess.New(cfg)
+			env.dirServer = dirserver_inprocess.New(cfg)
 		case "server":
 			// Create temporary directory for DirServer storage.
 			logDir, err := ioutil.TempDir("", "testenv-dirserver")
@@ -156,15 +210,21 @@ func New(setup *Setup) (*Env, error) {
 				return nil, errors.E(op, err)
 			}
 			env.tmpDir = logDir
-			env.DirServer, err = dirserver_server.New(cfg, "logDir="+logDir)
+			env.dirServer, err = dirserver_server.New(cfg, "logDir="+logDir)
 			if err != nil {
-				env.rmTmpDir()
+				env.cleanup()
 				return nil, errors.E(op, err)
 			}
 		}
-		dirServerMux.Register(dirEndpoint, env.DirServer)
+		dirServerMux.Register(dirEndpoint, env.dirServer)
+
+		env.Config = cfg
 
 	case "remote":
+		if setup.UpBox {
+			return nil, errors.E(op, "UpBox set with incompatible Kind (remote)")
+		}
+
 		cfg = config.SetKeyEndpoint(cfg, upspin.Endpoint{
 			Transport: upspin.Remote,
 			NetAddr:   TestKeyServer,
@@ -177,24 +237,21 @@ func New(setup *Setup) (*Env, error) {
 			Transport: upspin.Remote,
 			NetAddr:   TestDirServer,
 		})
+		env.Config = cfg
 
 	default:
-		return nil, errors.E(op, errors.Errorf("bad kind %q", k))
+		return nil, errors.E(op, errors.Errorf("bad kind %q", setup.Kind))
 	}
 
-	// Set the config to use the endpoints we created above.
-	env.Config = cfg
-
-	// Create a testuser, and set the config to the one for the user.
 	cfg, err := env.NewUser(setup.OwnerName)
 	if err != nil {
-		env.rmTmpDir()
+		env.cleanup()
 		return nil, errors.E(op, err)
 	}
 	env.Config = cfg
 
-	if err := makeRootIfNotExist(cfg); err != nil {
-		env.rmTmpDir()
+	if err := makeRootIfNotExist(env.Config); err != nil {
+		env.cleanup()
 		return nil, errors.E(op, err)
 	}
 
@@ -204,10 +261,10 @@ func New(setup *Setup) (*Env, error) {
 
 // Exit indicates the end of the test environment. It must only be called once. If Setup.Cleanup exists it is called.
 func (e *Env) Exit() error {
-	const op = "testenv.Exit"
+	const op errors.Op = "testenv.Exit"
 
 	if e.exitCalled {
-		return errors.E(op, errors.Invalid, errors.Str("exit already called"))
+		return errors.E(op, errors.Invalid, "exit already called")
 	}
 	e.exitCalled = true
 
@@ -226,36 +283,53 @@ func (e *Env) Exit() error {
 		check(e.Setup.Cleanup(e))
 	}
 
-	check(e.rmTmpDir())
+	if e.dirServer != nil {
+		e.dirServer.Close()
+	}
+	if e.storeServer != nil {
+		e.storeServer.Close()
+	}
+	if e.keyServer != nil {
+		e.keyServer.Close()
+	}
 
-	if e.DirServer != nil {
-		e.DirServer.Close()
-	}
-	if e.StoreServer != nil {
-		e.StoreServer.Close()
-	}
-	if e.KeyServer != nil {
-		e.KeyServer.Close()
-	}
+	check(e.cleanup())
 
 	return firstErr
 }
 
-func (e *Env) rmTmpDir() error {
-	if e.tmpDir == "" {
-		return nil
+func (e *Env) cleanup() error {
+	var err error
+	if e.tmpDir != "" {
+		err = os.RemoveAll(e.tmpDir)
+		e.tmpDir = ""
 	}
-	d := e.tmpDir
-	e.tmpDir = ""
-	return os.RemoveAll(d)
+	if e.schema != nil {
+		s := e.schema
+		e.schema = nil
+		err2 := s.Stop()
+		if err == nil {
+			err = err2
+		}
+	}
+	return err
 }
 
 // NewUser creates a new client for a user.  The new user will not
 // have a root created. Callers should use the client to make a root directory if
 // necessary.
 func (e *Env) NewUser(userName upspin.UserName) (upspin.Config, error) {
-	const op = "testenv.NewUser"
+	const op errors.Op = "testenv.NewUser"
+
+	if e.Setup.UpBox {
+		switch userName {
+		case e.Setup.OwnerName, TestServerName:
+			return config.FromFile(e.schema.Config(string(userName)))
+		}
+	}
+
 	cfg := config.SetUserName(e.Config, userName)
+	cfg = config.SetCacheEndpoint(cfg, upspin.Endpoint{})
 	cfg = config.SetPacking(cfg, e.Setup.Packing)
 
 	// Set up a factotum for the user.
@@ -279,7 +353,7 @@ func (e *Env) NewUser(userName upspin.UserName) (upspin.Config, error) {
 	// our test users should be already registered there.
 	if e.Setup.Kind != "remote" {
 		// Register the user with the key server.
-		err = registerUserWithKeyServer(cfg, cfg.UserName())
+		err = registerUserWithKeyServer(e.Config, cfg)
 		if err != nil {
 			return nil, errors.E(op, err)
 		}
@@ -289,22 +363,19 @@ func (e *Env) NewUser(userName upspin.UserName) (upspin.Config, error) {
 }
 
 // registerUserWithKeyServer registers userName's config with the inProcess keyServer.
-func registerUserWithKeyServer(cfg upspin.Config, userName upspin.UserName) error {
-	key, err := bind.KeyServer(cfg, cfg.KeyEndpoint())
+func registerUserWithKeyServer(server upspin.Config, user upspin.Config) error {
+	key, err := bind.KeyServer(server, server.KeyEndpoint())
 	if err != nil {
 		return err
 	}
 	// Install the registered user.
-	user := &upspin.User{
-		Name:      userName,
-		Dirs:      []upspin.Endpoint{cfg.DirEndpoint()},
-		Stores:    []upspin.Endpoint{cfg.StoreEndpoint()},
-		PublicKey: cfg.Factotum().PublicKey(),
+	u := &upspin.User{
+		Name:      user.UserName(),
+		Dirs:      []upspin.Endpoint{user.DirEndpoint()},
+		Stores:    []upspin.Endpoint{user.StoreEndpoint()},
+		PublicKey: user.Factotum().PublicKey(),
 	}
-	if err := key.Put(user); err != nil {
-		return err
-	}
-	return nil
+	return key.Put(u)
 }
 
 func makeRootIfNotExist(cfg upspin.Config) error {
@@ -320,8 +391,8 @@ func makeRootIfNotExist(cfg upspin.Config) error {
 		Attr:       upspin.AttrDirectory,
 	}
 	_, err = dir.Put(entry)
-	if err != nil && !errors.Match(errors.E(errors.Exist), err) {
-		return err
+	if errors.Is(errors.Exist, err) {
+		return nil
 	}
-	return nil
+	return err
 }
