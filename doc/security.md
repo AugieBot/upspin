@@ -41,12 +41,11 @@ cryptographic packages.
 
 The basic idea is to choose a random number as an encryption key K, use AES to
 encrypt the data, and store the encrypted data in the storage server.
-Then, we encrypt K again, repeatedly using the public key of each potential
-reader of the file.
-We store those encrypted keys in the `DirEntry` for the item along with a
-digital signature of the data.
-To read the data, the reader looks in the `DirEntry` for the reader's
-encryption of K, decrypts K, and uses that to decrypt the data.
+Then, for each potential reader of the file, we encrypt K using that user's public key.
+We store the set of encrypted keys in the DirEntry of the item along with a digital
+signature of the data. To read the data, the reader looks in the DirEntry for the
+appearance of K that was encrypted with their public key, decrypts it to recover K, and
+then uses K to decrypt the data.
 
 The next few paragraphs explain this process in detail for security experts and
 can be skipped by less dedicated readers.
@@ -137,9 +136,7 @@ This discussion is about a data-encrypting method, or in Upspin terminology, a p
 that is called **ee**.
 It uses NIST elliptic curves for end-to-end encryption, and is the default.
 There are other packings available, notably **eeintegrity**
-which is useful when one is willing to store signed cleartext
-in order to make the content available to everyone, not just to an
-explicit list of readers.
+which is useful when one is willing to store signed cleartext.
 
 The directory server needs to store its hierarchy of directory entries
 somewhere.
@@ -168,7 +165,7 @@ report to us and the public if you ever find a mismatch.
 Compare the key.upspin.io/log hash you see with what your friend sees,
 and report any discrepancy.
 Watch for your own key in the log and report if there's ever a change, even
-momentary, that you did not iniitate yourself.
+momentary, that you did not initiate yourself.
 You'll be giving the rest of our users herd immunity.
 
 As far as Upspin is concerned, a user is an email address, authenticated by an
@@ -332,7 +329,7 @@ compromised or is malicious or is compelled under legal process or
 simply has bugs.
 
 Besides observing metadata, a bad directory server can cause harm
-by returning an incorrrect Access file to the client.
+by returning an incorrect Access file to the client.
 Access files are signed by the owner, but replay is possible;
 this might yield a stale list of readers or other permissions.
 (Similarly, the directory server could serve a stale signed DirEntry.)

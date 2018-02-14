@@ -23,9 +23,9 @@ var errorLines = strings.Split(strings.TrimSpace(`
 	.*/upspin.io/errors/debug_test.go:\d+: ...func3:
 	.*/upspin.io/errors/debug_test.go:\d+: ...func4:
 	.*/upspin.io/valid/valid.go:\d+: ...valid.UserName:
-	.*/upspin.io/user/user.go:\d+: ...user.Parse: user@home/path: op: invalid operation:
+	.*/upspin.io/user/user.go:\d+: ...user.Parse: op: user@home/path: invalid operation:
 	valid.UserName:
-	user bad-username: user.Parse: user name must contain one @ symbol
+	user.Parse: user bad-username: user name must contain one @ symbol
 `), "\n")
 
 var errorLineREs = make([]*regexp.Regexp, len(errorLines))
@@ -72,7 +72,7 @@ func func1() error {
 type T struct{}
 
 func (T) func2() error {
-	return errors.E("op", upspin.PathName("user@home/path"), func3())
+	return errors.E(errors.Op("op"), upspin.PathName("user@home/path"), func3())
 }
 
 func func3() error {
