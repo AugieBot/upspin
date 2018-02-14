@@ -23,7 +23,9 @@ import (
 func TestClientFile(t *testing.T) {
 	for _, p := range []upspin.Packing{upspin.PlainPack, upspin.EEIntegrityPack, upspin.EEPack} {
 		t.Run(fmt.Sprintf("packing=%v", p), func(t *testing.T) {
-			testFileSequentialAccess(t, newEnv(t, p))
+			env := newEnv(t, p)
+			defer env.Exit()
+			testFileSequentialAccess(t, env)
 		})
 	}
 }
@@ -113,57 +115,55 @@ func testFileSequentialAccess(t *testing.T, env *testenv.Env) {
 }
 
 func testSequenceNumbers(t *testing.T, r *testenv.Runner) {
+	r.As(ownerName)
+	ce := r.Config().CacheEndpoint()
+	if !ce.Unassigned() {
+		t.Skip("skipping sequence number test with cacheserver")
+	}
+
 	const (
+		root   = ownerName + "/"
 		base   = ownerName + "/sequencenumbers"
 		dir    = base + "/dir"
 		subdir = dir + "/subdir"
 		file   = dir + "/file"
 	)
-	r.As(ownerName)
 	r.MakeDirectory(base)
 	r.DirLookup(base)
-	seq := int64(upspin.SeqBase)
-	if !r.GotEntryWithSequenceVersion(base, seq) {
+	if r.Failed() {
 		t.Fatal(r.Diag())
 	}
+	seq := r.Entry.Sequence
+	check := func(names ...upspin.PathName) {
+		t.Helper()
+		for _, name := range names {
+			r.DirLookup(name)
+			if !r.GotEntryWithSequenceVersion(name, seq) {
+				t.Fatal(r.Diag())
+			}
+		}
+	}
+
+	// All entries on path should be the same after each change.
+	check(root)
 
 	seq++
 	r.MakeDirectory(dir)
-	r.DirLookup(base)
-	if !r.GotEntryWithSequenceVersion(base, seq) {
-		t.Fatal(r.Diag())
-	}
+	check(root, base, dir)
 
 	seq++
 	r.MakeDirectory(subdir)
-	r.DirLookup(base)
-	if !r.GotEntryWithSequenceVersion(base, seq) {
-		t.Fatal(r.Diag())
-	}
-
-	r.DirLookup(subdir)
-	if !r.GotEntryWithSequenceVersion(subdir, upspin.SeqBase) {
-		t.Fatal(r.Diag())
-	}
+	check(root, base, dir, subdir)
 
 	seq++
 	r.Delete(subdir)
-	r.DirLookup(base)
-	if !r.GotEntryWithSequenceVersion(base, seq) {
-		t.Fatal(r.Diag())
-	}
+	check(root, base, dir)
 
-	fileSeq := int64(upspin.SeqBase)
+	seq++
 	r.Put(file, "meh")
-	r.DirLookup(file)
-	if !r.GotEntryWithSequenceVersion(file, fileSeq) {
-		t.Fatal(r.Diag())
-	}
+	check(root, base, dir, file)
 
-	fileSeq++
+	seq++
 	r.Put(file, "new")
-	r.DirLookup(file)
-	if !r.GotEntryWithSequenceVersion(file, fileSeq) {
-		t.Fatal(r.Diag())
-	}
+	check(root, base, dir, file)
 }
