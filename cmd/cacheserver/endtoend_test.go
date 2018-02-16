@@ -5,16 +5,15 @@
 package main
 
 import (
-	"crypto/x509"
 	"fmt"
 	"io/ioutil"
-	"net"
 	"net/http"
 	"os"
 	"testing"
 
 	"upspin.io/bind"
 	"upspin.io/client"
+	"upspin.io/client/clientutil"
 	"upspin.io/cloud/https"
 	"upspin.io/config"
 	"upspin.io/factotum"
@@ -31,7 +30,6 @@ import (
 )
 
 var (
-	zeroEndpoint      upspin.Endpoint
 	inprocessEndpoint = upspin.Endpoint{
 		Transport: upspin.InProcess,
 		NetAddr:   "", // ignored
@@ -47,11 +45,6 @@ func TestCache(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// If bind caches dials to the servers, it will
-	// confuse the direct dial to the combined server
-	// with the indirect one via the cacheserver.
-	bind.NoCache()
-
 	// The client and all servers will run as the same user.
 	cfg := config.New()
 	cfg = config.SetUserName(cfg, upspin.UserName("tester@google.com"))
@@ -60,6 +53,8 @@ func TestCache(t *testing.T) {
 	// Use an inprocess key server.
 	cfg = config.SetKeyEndpoint(cfg, inprocessEndpoint)
 	bind.RegisterKeyServer(upspin.InProcess, inprocesskeyserver.New())
+
+	cfg = setCertPool(cfg)
 
 	var err error
 	cfg, err = setUpFactotum(cfg)
@@ -82,14 +77,9 @@ func TestCache(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cl, err := newClient(cfg, sep, cep)
-	if err != nil {
-		errorOut(err)
-	}
+	cfg, cl := newClient(cfg, sep, cep)
 
-	// Create a root directory. This will probably cause an error warning
-	// from the cacheserver's Watch since it will start watching before the
-	// rpc completes. This is not a problem.
+	// Create a root directory.
 	root := upspin.PathName(cfg.UserName())
 	if _, err := cl.MakeDirectory(root); err != nil {
 		errorOut(err)
@@ -115,6 +105,21 @@ func TestCache(t *testing.T) {
 	}
 	if _, err := cl.Get(fn); err == nil {
 		errorOut(fmt.Errorf("file persisted beyond delete"))
+	}
+
+	// Force a cache flush and make sure we get the expected response.
+	// This doesn't check functionality of the flush.
+	loc := upspin.Location{
+		Endpoint:  *sep,
+		Reference: upspin.FlushWritebacksMetadata,
+	}
+	data, err = clientutil.ReadLocation(cfg, loc)
+	if err != nil {
+		errorOut(err)
+	}
+	flushReply := "cache flushed"
+	if string(data) != flushReply {
+		errorOut(fmt.Errorf("expected %q got %q", flushReply, string(data)))
 	}
 
 	// Remove the cache files and logs.
@@ -165,7 +170,7 @@ func startCombinedServer(cfg upspin.Config) (*upspin.Endpoint, error) {
 	http.Handle("/api/Store/", ss)
 	http.Handle("/api/Dir/", ds)
 
-	port, err := pickPort()
+	port, err := testutil.PickPort()
 	if err != nil {
 		return nil, err
 	}
@@ -180,14 +185,10 @@ func startCombinedServer(cfg upspin.Config) (*upspin.Endpoint, error) {
 
 // startCacheServer starts a cache server and returns its endpoint.
 func startCacheServer(cfg upspin.Config) (*upspin.Endpoint, error) {
-	var err error
-	cfg, err = setUpCertPool(cfg)
-	if err != nil {
-		return nil, err
-	}
+	cfg = setCertPool(cfg)
 
 	// Find a free port.
-	port, err := pickPort()
+	port, err := testutil.PickPort()
 	if err != nil {
 		return nil, err
 	}
@@ -208,43 +209,16 @@ func startCacheServer(cfg upspin.Config) (*upspin.Endpoint, error) {
 }
 
 // newClient returns a client using the given servers and cache.
-func newClient(cfg upspin.Config, server, cache *upspin.Endpoint) (upspin.Client, error) {
-	var err error
-	cfg, err = setUpCertPool(cfg)
-	if err != nil {
-		return nil, err
-	}
+func newClient(cfg upspin.Config, server, cache *upspin.Endpoint) (upspin.Config, upspin.Client) {
+	cfg = setCertPool(cfg)
 	cfg = config.SetStoreEndpoint(cfg, *server)
 	cfg = config.SetDirEndpoint(cfg, *server)
 	cfg = config.SetCacheEndpoint(cfg, *cache)
-
-	return client.New(cfg), nil
+	return cfg, client.New(cfg)
 }
 
-// setUpCertPool adds trusted certs to the Config.
-func setUpCertPool(cfg upspin.Config) (upspin.Config, error) {
-	pem, err := ioutil.ReadFile(testutil.Repo("rpc", "testdata", "cert.pem"))
-	if err != nil {
-		return cfg, err
-	}
-	pool := x509.NewCertPool()
-	if ok := pool.AppendCertsFromPEM(pem); !ok {
-		err := fmt.Errorf("could not add certificates to pool")
-		return cfg, err
-	}
-	cfg = config.SetCertPool(cfg, pool)
-	return cfg, err
-}
-
-func pickPort() (string, error) {
-	listener, err := net.Listen("tcp", "localhost:0")
-	if err != nil {
-		return "", err
-	}
-	defer listener.Close()
-	_, port, err := net.SplitHostPort(listener.Addr().String())
-	if err != nil {
-		return "", err
-	}
-	return port, err
+// setCertPool adds trusted certs to the Config.
+func setCertPool(cfg upspin.Config) upspin.Config {
+	dir := testutil.Repo("rpc", "testdata")
+	return config.SetValue(cfg, "tlscerts", dir)
 }
