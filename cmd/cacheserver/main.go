@@ -12,15 +12,19 @@ import (
 	"upspin.io/config"
 	"upspin.io/flags"
 	"upspin.io/log"
-
-	"upspin.io/upspin"
+	"upspin.io/version"
 )
 
 const cmdName = "cacheserver"
 
 func main() {
 	flag.Usage = usage
-	flags.Parse(flags.Server, "cachedir")
+	flags.Parse(flags.Server, "cachedir", "cachesize", "version")
+
+	if flags.Version {
+		fmt.Print(version.Version())
+		return
+	}
 
 	// Load configuration and keys for this server. It needn't have a real username.
 	cfg, err := config.FromFile(flags.Config)
@@ -35,7 +39,8 @@ func main() {
 
 	// Serving address comes from config with flag overriding.
 	var addr string
-	if ce := cfg.CacheEndpoint(); ce.Transport == upspin.Remote {
+	ce := cfg.CacheEndpoint()
+	if !ce.Unassigned() {
 		addr = string(ce.NetAddr)
 	}
 	if flags.NetAddr != "" {
