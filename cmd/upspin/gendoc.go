@@ -16,14 +16,9 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
-)
 
-// externalCommands lists the commands that are considered part of
-// the upspin command itself but are implemented as separate binaries.
-// We show their documentation when we generate doc.go
-var externalCommands = []string{
-	"setupstorage",
-}
+	"upspin.io/flags"
+)
 
 func init() {
 	commands["gendoc"] = (*State).gendoc
@@ -50,6 +45,14 @@ func (s *State) gendoc(args ...string) {
 		names = append(names, name)
 	}
 	names = append(names, externalCommands...)
+
+	// Shell is not in "commands" to prevent init loops.
+	names = append(names, "shell")
+
+	// Audit is a separate binary but we want to promote it in the
+	// default help output.
+	names = append(names, "audit")
+
 	sort.Strings(names)
 
 	var b bytes.Buffer
@@ -68,7 +71,10 @@ func (s *State) gendoc(args ...string) {
 
 	// Generate subcommands.
 	for _, name := range names {
-		s.getCommand(name) // Make sure command exists; this will error and exit if not.
+		if name != "shell" {
+			// Make sure command exists; this will error and exit if not.
+			s.getCommand(name)
+		}
 		var docs bytes.Buffer
 		s.helpDocs(&docs, upspin, name, "-help")
 
@@ -88,10 +94,11 @@ func (s *State) gendoc(args ...string) {
 }
 
 func (s *State) helpDocs(out io.Writer, command string, args ...string) {
-	cmd := exec.Command(command, args...)
+	cmd := exec.Command(command, append(flags.Args(), args...)...)
 	var b bytes.Buffer
 	cmd.Stdout = &b
 	cmd.Stderr = &b
+	cmd.Env = append(os.Environ(), "UPSPIN_GENDOC=yes")
 	cmd.Run()
 	// Command should have exited with status 2, which we ignore,
 	// but if it's an external command the output may end with a line
@@ -107,12 +114,12 @@ Without:
 		if strings.HasPrefix(line, "upspin: ") && strings.HasSuffix(line, ": exit status 2") {
 			continue Without
 		}
+		line = strings.Replace(line, home, "/home/user", -1)
 		for _, flagLine := range flagDocs {
 			if line == flagLine {
 				continue Without
 			}
 		}
-		line = strings.Replace(line, home, "/home/user", -1)
 		fmt.Fprintf(out, "%s\n", line)
 	}
 }
