@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"math/big"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -26,44 +25,31 @@ import (
 	"upspin.io/valid"
 )
 
-// New initializes an instance of the key service.
-// Required configuration options are:
-//   gcpBucketName=<BUCKET_NAME>
-// Optional configuration options are:
-//   defaultACL=<ACL>, as defined in storage.Storage (e.g. "projectPrivate")
-//   cacheSize=<number>
+const cacheSize = 10000
+
+// New initializes an instance of the KeyServer
+// that stores its data in the given Storage implementation.
 func New(options ...string) (upspin.KeyServer, error) {
-	const op = "key/server.New"
+	const op errors.Op = "key/server.New"
 
-	cacheSize := 10000
-
-	// All options are for the Storage layer.
-	var storageOpts []storage.DialOpts
-	for _, o := range options {
-		vals := strings.Split(o, "=")
-		if len(vals) != 2 {
-			return nil, errors.E(op, "config options must be in the format 'key=value'")
+	var backend string
+	var dialOpts []storage.DialOpts
+	for _, option := range options {
+		const prefix = "backend="
+		if strings.HasPrefix(option, prefix) {
+			backend = option[len(prefix):]
+			continue
 		}
-		k, v := vals[0], vals[1]
-		switch k {
-		case "cacheSize":
-			cacheSize, err := strconv.ParseInt(v, 10, 32)
-			if err != nil {
-				return nil, errors.E(op, errors.Invalid, errors.Errorf("invalid cache size %q: %s", v, err))
-			}
-			if cacheSize < 1 {
-				return nil, errors.E(op, errors.Invalid, errors.Errorf("%s: cache size too small: %d", k, cacheSize))
-			}
-		default:
-			storageOpts = append(storageOpts, storage.WithOptions(o))
-		}
+		// Pass other options to the storage backend.
+		dialOpts = append(dialOpts, storage.WithOptions(option))
 	}
-
-	s, err := storage.Dial("GCS", storageOpts...)
+	if backend == "" {
+		return nil, errors.E(op, errors.Invalid, `storage "backend" option is missing`)
+	}
+	s, err := storage.Dial(backend, dialOpts...)
 	if err != nil {
 		return nil, errors.E(op, err)
 	}
-	log.Debug.Printf("Configured GCP user: %v", options)
 	return &server{
 		storage:   s,
 		refCount:  &refCount{count: 1},
@@ -74,7 +60,7 @@ func New(options ...string) (upspin.KeyServer, error) {
 	}, nil
 }
 
-// server is the implementation of the KeyServer Service on GCP.
+// server is the implementation of the KeyServer Service.
 type server struct {
 	storage storage.Storage
 	*refCount
@@ -113,7 +99,7 @@ type userEntry struct {
 
 // Lookup implements upspin.KeyServer.
 func (s *server) Lookup(name upspin.UserName) (*upspin.User, error) {
-	const op = "key/server.Lookup"
+	const op errors.Op = "key/server.Lookup"
 	m, span := metric.NewSpan(op)
 	defer m.Done()
 
@@ -128,7 +114,7 @@ func (s *server) Lookup(name upspin.UserName) (*upspin.User, error) {
 }
 
 // lookup looks up the internal user record, using caches when available.
-func (s *server) lookup(op string, name upspin.UserName, span *metric.Span) (*userEntry, error) {
+func (s *server) lookup(op errors.Op, name upspin.UserName, span *metric.Span) (*userEntry, error) {
 	// Check positive cache first.
 	if entry, found := s.cache.Get(name); found {
 		return entry.(*userEntry), nil
@@ -144,7 +130,7 @@ func (s *server) lookup(op string, name upspin.UserName, span *metric.Span) (*us
 	sp.End()
 	if err != nil {
 		// Not found: add to negative cache.
-		if errors.Match(errors.E(errors.NotExist), err) {
+		if errors.Is(errors.NotExist, err) {
 			s.negCache.Add(name, true)
 		}
 		return nil, err
@@ -158,12 +144,12 @@ func (s *server) lookup(op string, name upspin.UserName, span *metric.Span) (*us
 
 // Put implements upspin.KeyServer.
 func (s *server) Put(u *upspin.User) error {
-	const op = "key/server.Put"
+	const op errors.Op = "key/server.Put"
 	m, span := metric.NewSpan(op)
 	defer m.Done()
 
 	if s.user == "" {
-		return errors.E(op, errors.Internal, errors.Str("not bound to user"))
+		return errors.E(op, errors.Internal, "not bound to user")
 	}
 	if err := valid.User(u); err != nil {
 		return errors.E(op, err)
@@ -175,7 +161,7 @@ func (s *server) Put(u *upspin.User) error {
 
 	entry, err := s.lookup(op, u.Name, span)
 	switch {
-	case errors.Match(errors.E(errors.NotExist), err):
+	case errors.Is(errors.NotExist, err):
 		// OK; adding new user.
 		newUser = true
 	case err != nil:
@@ -225,7 +211,7 @@ func (s *server) Put(u *upspin.User) error {
 
 // canPut reports whether the current logged-in user can Put the (new or
 // existing) target user.
-func (s *server) canPut(op string, target upspin.UserName, isTargetNew bool, span *metric.Span) error {
+func (s *server) canPut(op errors.Op, target upspin.UserName, isTargetNew bool, span *metric.Span) error {
 	sp := span.StartSpan("canPut")
 	defer sp.End()
 
@@ -235,7 +221,7 @@ func (s *server) canPut(op string, target upspin.UserName, isTargetNew bool, spa
 	}
 	// Do not allow * wildcard in name.
 	if name == "*" {
-		return errors.E(op, errors.Invalid, target, errors.Str("user has wildcard '*' in name"))
+		return errors.E(op, errors.Invalid, target, "user has wildcard '*' in name")
 	}
 	// If the current user is the same as target, it can proceed.
 	if s.user == target {
@@ -274,12 +260,10 @@ func (s *server) canPut(op string, target upspin.UserName, isTargetNew bool, spa
 	return errors.E(op, errors.Permission, s.user, err)
 }
 
-// fetchUserEntry reads the user entry for a given user from permanent storage on GCP.
-func (s *server) fetchUserEntry(op string, name upspin.UserName) (*userEntry, error) {
-	log.Debug.Printf("%s: %s", op, name)
+// fetchUserEntry reads the user entry for a given user from the storage.
+func (s *server) fetchUserEntry(op errors.Op, name upspin.UserName) (*userEntry, error) {
 	b, err := s.storage.Download(string(name))
 	if err != nil {
-		log.Error.Printf("%s: error fetching %q: %v", op, name, err)
 		return nil, errors.E(op, name, err)
 	}
 	var entry userEntry
@@ -289,11 +273,10 @@ func (s *server) fetchUserEntry(op string, name upspin.UserName) (*userEntry, er
 	return &entry, nil
 }
 
-// putUserEntry writes the user entry for a user to permanent storage on GCP.
-func (s *server) putUserEntry(op string, entry *userEntry) error {
-	log.Debug.Printf("%s: %s", op, entry.User.Name)
+// putUserEntry writes the user entry for a user to the storage.
+func (s *server) putUserEntry(op errors.Op, entry *userEntry) error {
 	if entry == nil {
-		return errors.E(op, errors.Invalid, errors.Str("nil userEntry"))
+		return errors.E(op, errors.Invalid, "nil userEntry")
 	}
 	b, err := json.Marshal(entry)
 	if err != nil {
@@ -322,8 +305,9 @@ func (s *server) verifyOwns(u upspin.UserName, pubKey upspin.PublicKey, domain s
 		if !strings.HasPrefix(txt, prefix) {
 			continue
 		}
+		txt = txt[len(prefix):]
 		// Is there a signature with two segments after the prefix?
-		sigFields := strings.Split(txt[len(prefix):], "-")
+		sigFields := strings.Split(txt, "-")
 		if len(sigFields) != 2 {
 			continue
 		}
@@ -331,23 +315,23 @@ func (s *server) verifyOwns(u upspin.UserName, pubKey upspin.PublicKey, domain s
 		var sig upspin.Signature
 		var rs, ss big.Int
 		if _, ok := rs.SetString(sigFields[0], 16); !ok {
-			lastErr = errors.E(errors.Invalid, errors.Str("invalid signature field0"))
+			lastErr = errors.E(errors.Invalid, "invalid signature field0")
 			continue
 		}
 		if _, ok := ss.SetString(sigFields[1], 16); !ok {
-			lastErr = errors.E(errors.Invalid, errors.Str("invalid signature field1"))
+			lastErr = errors.E(errors.Invalid, "invalid signature field1")
 			continue
 		}
 		sig.R = &rs
 		sig.S = &ss
 
-		log.Debug.Printf("Verifying if %q owns %q with pubKey: %q. Got sig: %q", u, domain, pubKey, txt[len(prefix):])
 		hash := sha256.Sum256([]byte("upspin-domain:" + domain + "-" + string(u)))
 		err := factotum.Verify(hash[:], sig, pubKey)
 		if err == nil {
 			// Success!
 			return nil
 		}
+		log.Debug.Printf("key/server: failed to verify that %q owns %q with pubKey %q, sig %q: %v", u, domain, pubKey, txt, err)
 		lastErr = errors.E(errors.Errorf("%s: verifying ownership of domain %s; re-run cmd/upspin setupdomain?", err, domain))
 	}
 	return lastErr
@@ -355,7 +339,7 @@ func (s *server) verifyOwns(u upspin.UserName, pubKey upspin.PublicKey, domain s
 
 // Log implements Logger.
 func (s *server) Log() ([]byte, error) {
-	const op = "key/server.Log"
+	const op errors.Op = "key/server.Log"
 
 	data, err := s.logger.ReadAll()
 	if err != nil {
@@ -373,11 +357,6 @@ func (s *server) Dial(cfg upspin.Config, e upspin.Endpoint) (upspin.Service, err
 	svc := *s
 	svc.user = cfg.UserName()
 	return &svc, nil
-}
-
-// Ping implements upspin.Service.
-func (s *server) Ping() bool {
-	return true
 }
 
 // Close implements upspin.Service.
