@@ -11,6 +11,8 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"strings"
+	"sync"
 
 	"upspin.io/bind"
 	"upspin.io/errors"
@@ -28,11 +30,14 @@ type dialConfig struct {
 
 // remote implements upspin.StoreServer.
 type remote struct {
-	rpc.Client // For sessions, Ping, and Close.
+	rpc.Client // For sessions and Close.
 	cfg        dialConfig
 
+	// probeOnce is used to make sure we call probeDirect just once.
+	probeOnce sync.Once
 	// If non-empty, the base HTTP URL under which references for this
-	// server may be found.
+	// server may be found. It is set while probeOnce is happening, so
+	// probeDirect must be called before using baseURL.
 	baseURL string
 }
 
@@ -42,27 +47,36 @@ var _ upspin.StoreServer = (*remote)(nil)
 func (r *remote) Get(ref upspin.Reference) ([]byte, *upspin.Refdata, []upspin.Location, error) {
 	op := r.opf("Get", "%q", ref)
 
-	if r.baseURL != "" {
-		// If we can fetch this by HTTP, do so.
-		u := r.baseURL + string(ref)
-		resp, err := http.Get(u)
-		if err != nil {
-			return nil, nil, nil, op.error(err)
+	if !strings.HasPrefix(string(ref), "metadata:") {
+		if err := r.probeDirect(); err != nil {
+			op.error(err)
 		}
-		if resp.StatusCode != http.StatusOK {
-			return nil, nil, nil, op.error(errors.Errorf("fetching %s: %s", u, resp.Status))
+		if r.baseURL != "" {
+			// If we can fetch this by HTTP, do so.
+			u := r.baseURL + string(ref)
+			resp, err := http.Get(u)
+			if err != nil {
+				return nil, nil, nil, op.error(err)
+			}
+			if resp.StatusCode != http.StatusOK {
+				err := errors.Errorf("fetching %s: %s", u, resp.Status)
+				if resp.StatusCode == http.StatusNotFound {
+					err = errors.E(errors.NotExist, err)
+				}
+				return nil, nil, nil, op.error(err)
+			}
+			body, err := ioutil.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				return nil, nil, nil, op.error(err)
+			}
+			refData := &upspin.Refdata{
+				Reference: ref,
+				Volatile:  false,
+				Duration:  0,
+			}
+			return body, refData, nil, nil
 		}
-		body, err := ioutil.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			return nil, nil, nil, op.error(err)
-		}
-		refData := &upspin.Refdata{
-			Reference: ref,
-			Volatile:  false,
-			Duration:  0,
-		}
-		return body, refData, nil, nil
 	}
 
 	req := &proto.StoreGetRequest{
@@ -80,7 +94,7 @@ func (r *remote) Get(ref upspin.Reference) ([]byte, *upspin.Refdata, []upspin.Lo
 
 // Put implements upspin.StoreServer.Put.
 func (r *remote) Put(data []byte) (*upspin.Refdata, error) {
-	op := r.opf("Put", "%v bytes", len(data))
+	op := r.opf("Put", "%.16x...) (%v bytes", data, len(data))
 
 	req := &proto.StorePutRequest{
 		Data: data,
@@ -111,19 +125,17 @@ func (r *remote) Endpoint() upspin.Endpoint {
 	return r.cfg.endpoint
 }
 
-func dialCache(op *operation, config upspin.Config, proxyFor upspin.Endpoint) upspin.Service {
+func dialCache(config upspin.Config, proxyFor upspin.Endpoint) (upspin.Service, error) {
 	// Are we using a cache?
 	ce := config.CacheEndpoint()
-	if ce.Transport == upspin.Unassigned {
-		return nil
+	if ce.Unassigned() {
+		return nil, nil
 	}
 
 	// Call the cache. The cache is local so don't bother with TLS.
 	authClient, err := rpc.NewClient(config, ce.NetAddr, rpc.NoSecurity, proxyFor)
 	if err != nil {
-		// On error dial direct.
-		op.error(errors.IO, err)
-		return nil
+		return nil, err
 	}
 
 	return &remote{
@@ -132,7 +144,7 @@ func dialCache(op *operation, config upspin.Config, proxyFor upspin.Endpoint) up
 			endpoint: proxyFor,
 			userName: config.UserName(),
 		},
-	}
+	}, nil
 }
 
 // Dial implements upspin.Service.
@@ -144,7 +156,9 @@ func (r *remote) Dial(config upspin.Config, e upspin.Endpoint) (upspin.Service, 
 	}
 
 	// First try a cache
-	if svc := dialCache(op, config, e); svc != nil {
+	if svc, err := dialCache(config, e); err != nil {
+		return nil, err
+	} else if svc != nil {
 		return svc, nil
 	}
 
@@ -161,10 +175,6 @@ func (r *remote) Dial(config upspin.Config, e upspin.Endpoint) (upspin.Service, 
 			userName: config.UserName(),
 		},
 	}
-	if err := r2.probeDirect(); err != nil {
-		op.error(err)
-	}
-
 	return r2, nil
 }
 
@@ -173,24 +183,28 @@ func (r *remote) Dial(config upspin.Config, e upspin.Endpoint) (upspin.Service, 
 // base for fetching objects directly by HTTP (from Google Cloud Storage, for
 // instance).
 func (r *remote) probeDirect() error {
-	const op = "store/remote.probeDirect"
+	var err error
+	r.probeOnce.Do(func() {
+		b, _, _, err2 := r.Get(upspin.HTTPBaseMetadata)
+		if errors.Is(errors.NotExist, err2) {
+			return
+		}
+		if err2 != nil {
+			err = err2
+			return
+		}
+		s := string(b)
 
-	b, _, _, err := r.Get(upspin.HTTPBaseMetadata)
-	if errors.Match(errors.E(errors.NotExist), err) {
-		return nil
-	} else if err != nil {
-		return errors.E(op, err)
-	}
-	s := string(b)
+		u, err2 := url.Parse(s)
+		if err2 != nil {
+			err = errors.Errorf("parsing %q: %v", s, err2)
+			return
+		}
 
-	u, err := url.Parse(s)
-	if err != nil {
-		return errors.E(op, errors.Errorf("parsing %q: %v", s, err))
-	}
-
-	// We have a valid URL. Use it as a base.
-	r.baseURL = u.String()
-	return nil
+		// We have a valid URL. Use it as a base.
+		r.baseURL = u.String()
+	})
+	return err
 }
 
 const transport = upspin.Remote
@@ -201,15 +215,15 @@ func init() {
 }
 
 func (r *remote) opf(method string, format string, args ...interface{}) *operation {
-	ep := r.cfg.endpoint.String()
-	s := fmt.Sprintf("store/remote.%s(%q)", method, ep)
-	op := &operation{s, fmt.Sprintf(format, args...)}
+	addr := r.cfg.endpoint.NetAddr
+	s := fmt.Sprintf("store/remote(%q).%s", addr, method)
+	op := &operation{errors.Op(s), fmt.Sprintf(format, args...)}
 	log.Debug.Print(op)
 	return op
 }
 
 type operation struct {
-	op   string
+	op   errors.Op
 	args string
 }
 
