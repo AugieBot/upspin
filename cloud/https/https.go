@@ -7,6 +7,7 @@ package https // import "upspin.io/cloud/https"
 
 import (
 	"crypto/tls"
+	"go/build"
 	"net"
 	"net/http"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"upspin.io/errors"
 	"upspin.io/flags"
 	"upspin.io/log"
+	"upspin.io/serverutil"
 	"upspin.io/shutdown"
 )
 
@@ -26,12 +28,20 @@ import (
 // outside GCE. The default is the self-signed certificate in
 // upspin.io/rpc/testdata.
 type Options struct {
-	// Addr specifies the host and port on which the server should listen.
+	// Addr specifies the host and port on which the server should serve
+	// HTTPS requests (or HTTP requests if InsecureHTTP is set).
+	// If empty, ":443" is used.
 	Addr string
+
+	// HTTPAddr specifies the host and port on which the server should
+	// serve HTTP requests. If empty and InsecureHTTP is true, Addr is
+	// used.  If empty otherwise, ":80" is used.
+	HTTPAddr string
 
 	// AutocertCache provides a cache for use with Let's Encrypt.
 	// If non-nil, enables Let's Encrypt certificates for this server.
-	AutocertCache autocert.Cache
+	// See the comment on ErrAutocertCacheMiss before usin this feature.
+	AutocertCache AutocertCache
 
 	// LetsEncryptCache specifies the cache file for Let's Encrypt.
 	// If non-empty, enables Let's Encrypt certificates for this server.
@@ -52,12 +62,50 @@ type Options struct {
 	InsecureHTTP bool
 }
 
+// AutocertCache is a copy of the autocert.Cache interface, provided here so
+// that implementers need not import the autocert package directly.
+// See ErrAutocertCacheMiss for more details.
+type AutocertCache interface {
+	autocert.Cache
+}
+
+// ErrAutocertCacheMiss is a copy of the autocert.ErrCacheMiss variable that
+// must be used by any AutocertCache implementations used in the Options
+// struct. This is because the autocert package is vendored by the upspin.io
+// repository, and so an outside implementation that returns ErrCacheMiss from
+// another version of the package will return an error value that is not
+// recognized by the autocert package.
+var ErrAutocertCacheMiss = autocert.ErrCacheMiss
+
 var defaultOptions = &Options{
-	CertFile: filepath.Join(os.Getenv("GOPATH"), "/src/upspin.io/rpc/testdata/cert.pem"),
-	KeyFile:  filepath.Join(os.Getenv("GOPATH"), "/src/upspin.io/rpc/testdata/key.pem"),
+	CertFile: filepath.Join(testKeyDir, "cert.pem"),
+	KeyFile:  filepath.Join(testKeyDir, "key.pem"),
+}
+
+var testKeyDir = findTestKeyDir() // Do this just once.
+
+// findTestKeyDir locates the "rpc/testdata" directory within the upspin.io
+// repository in a Go workspace and returns its absolute path.
+// If the upspin.io repository cannot be found, it returns ".".
+func findTestKeyDir() string {
+	p, err := build.Import("upspin.io/rpc/testdata", "", build.FindOnly)
+	if err != nil {
+		return "."
+	}
+	return p.Dir
 }
 
 func (opt *Options) applyDefaults() {
+	if opt.Addr == "" {
+		opt.Addr = ":443"
+	}
+	if opt.HTTPAddr == "" {
+		if opt.InsecureHTTP {
+			opt.HTTPAddr = opt.Addr
+		} else {
+			opt.HTTPAddr = ":80"
+		}
+	}
 	if opt.CertFile == "" {
 		opt.CertFile = defaultOptions.CertFile
 	}
@@ -83,6 +131,7 @@ func OptionsFromFlags() *Options {
 	}
 	return &Options{
 		Addr:             addr,
+		HTTPAddr:         flags.HTTPAddr,
 		LetsEncryptCache: flags.LetsEncryptCache,
 		LetsEncryptHosts: hosts,
 		CertFile:         flags.TLSCertFile,
@@ -112,41 +161,45 @@ func ListenAndServe(ready chan<- struct{}, opt *Options) {
 		opt.applyDefaults()
 	}
 
-	var m autocert.Manager
-	m.Prompt = autocert.AcceptTOS
+	hasLetsEncryptCache := opt.LetsEncryptCache != ""
+	hasAutocertCache := opt.AutocertCache != nil
+	hasCert := opt.CertFile != defaultOptions.CertFile || opt.KeyFile != defaultOptions.KeyFile
+
+	var manager autocert.Manager
+	manager.Prompt = autocert.AcceptTOS
 	if h := opt.LetsEncryptHosts; len(h) > 0 {
-		m.HostPolicy = autocert.HostWhitelist(h...)
+		manager.HostPolicy = autocert.HostWhitelist(h...)
 	}
 
 	addr := opt.Addr
 	var config *tls.Config
-	if opt.InsecureHTTP {
+	switch {
+	case opt.InsecureHTTP:
 		log.Info.Printf("https: serving insecure HTTP on %q", addr)
 		host, _, err := net.SplitHostPort(addr)
 		if err != nil {
 			log.Fatalf("https: couldn't parse address: %v", err)
 		}
-		if host != "localhost" && host != "127.0.0.1" && host != "::1" {
-			log.Fatalf("https: cannot serve insecure HTTP on non-loopback address %q", addr)
+		if !serverutil.IsLoopback(host) {
+			log.Error.Printf("https: WARNING: serving insecure HTTP on non-loopback address %q", addr)
 		}
-	} else if dir := opt.LetsEncryptCache; dir != "" {
+	case hasLetsEncryptCache && !hasAutocertCache && !hasCert:
+		// The -letscache has a default value, so only take this path
+		// if the other options are not selected.
+		dir := opt.LetsEncryptCache
 		log.Info.Printf("https: serving HTTPS on %q using Let's Encrypt certificates", addr)
-		fi, err := os.Stat(dir)
-		if err != nil {
-			log.Fatalf("https: could not read -letscache directory: %v", err)
+		log.Info.Printf("https: caching Let's Encrypt certificates in %v", dir)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			log.Fatalf("https: could not create -letscache directory: %v", err)
 		}
-		if !fi.IsDir() {
-			log.Fatalf("https: could not read -letscache directory: %v is not a directory", dir)
-		}
-		m.Cache = autocert.DirCache(dir)
-		config = &tls.Config{GetCertificate: m.GetCertificate}
-	} else if cache := opt.AutocertCache; cache != nil {
-		addr = ":443"
+		manager.Cache = autocert.DirCache(dir)
+		config = &tls.Config{GetCertificate: manager.GetCertificate}
+	case hasAutocertCache:
 		log.Info.Printf("https: serving HTTPS on %q using Let's Encrypt certificates", addr)
-		m.Cache = cache
-		config = &tls.Config{GetCertificate: m.GetCertificate}
-	} else {
-		log.Info.Printf("https: not on GCE; serving HTTPS on %q using provided certificates", addr)
+		manager.Cache = opt.AutocertCache
+		config = &tls.Config{GetCertificate: manager.GetCertificate}
+	default:
+		log.Info.Printf("https: serving HTTPS on %q using provided certificates", addr)
 		if opt.CertFile == defaultOptions.CertFile || opt.KeyFile == defaultOptions.KeyFile {
 			log.Error.Print("https: WARNING: using self-signed test certificates.")
 		}
@@ -156,36 +209,62 @@ func ListenAndServe(ready chan<- struct{}, opt *Options) {
 			log.Fatalf("https: setting up TLS config: %v", err)
 		}
 	}
-	// WriteTimeout is set to 0 because it also pertains to streaming
-	// replies, e.g., the DirServer.Watch interface.
+
+	// Set up the main listener for HTTPS (or HTTP if InsecureHTTP is set).
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("https: %v", err)
+	}
+	shutdown.Handle(func() { ln.Close() })
+
+	httpLogger := log.NewStdLogger(log.Info)
+	if manager.Cache != nil {
+		// If we're using LetsEncrypt then we need to serve the http-01
+		// challenge by plain HTTP. We also serve a redirect to HTTPS
+		// for all other requests.
+		httpLn, err := net.Listen("tcp", opt.HTTPAddr)
+		if err != nil {
+			log.Fatalf("https: %v", err)
+		}
+		shutdown.Handle(func() { httpLn.Close() })
+		httpServer := &http.Server{
+			Handler:  manager.HTTPHandler(nil),
+			ErrorLog: httpLogger,
+		}
+		go func() {
+			err := httpServer.Serve(httpLn)
+			log.Printf("https: %v", err)
+			shutdown.Now(1)
+		}()
+	}
+
+	if ready != nil {
+		// Notify the calling packages that
+		// we're ready to accept requests.
+		close(ready)
+	}
+
+	// If we're serving HTTPS then wrap the listener with a TLS listener.
+	if !opt.InsecureHTTP {
+		ln = tls.NewListener(ln, config)
+	}
+
+	// Set up the main server.
 	server := &http.Server{
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      0,
-		IdleTimeout:       60 * time.Second,
-		TLSConfig:         config,
+		// WriteTimeout is set to 0 because it also pertains to
+		// streaming replies, e.g., the DirServer.Watch interface.
+		WriteTimeout: 0,
+		IdleTimeout:  60 * time.Second,
+		TLSConfig:    config,
+		ErrorLog:     httpLogger,
 	}
 	// TODO(adg): enable HTTP/2 once it's fast enough
 	//err := http2.ConfigureServer(server, nil)
 	//if err != nil {
 	//	log.Fatalf("https: %v", err)
 	//}
-
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.Fatalf("https: %v", err)
-	}
-	if ready != nil {
-		close(ready)
-	}
-	shutdown.Handle(func() {
-		// Stop accepting connections and forces the server to stop
-		// its serving loop.
-		ln.Close()
-	})
-	if !opt.InsecureHTTP {
-		ln = tls.NewListener(ln, config)
-	}
 	err = server.Serve(ln)
 	log.Printf("https: %v", err)
 	shutdown.Now(1)
@@ -193,7 +272,7 @@ func ListenAndServe(ready chan<- struct{}, opt *Options) {
 
 // newDefaultTLSConfig creates a new TLS config based on the certificate files given.
 func newDefaultTLSConfig(certFile string, certKeyFile string) (*tls.Config, error) {
-	const op = "cloud/https.newDefaultTLSConfig"
+	const op errors.Op = "cloud/https.newDefaultTLSConfig"
 	certReadable, err := isReadableFile(certFile)
 	if err != nil {
 		return nil, errors.E(op, errors.Invalid, errors.Errorf("SSL certificate in %q: %q", certFile, err))

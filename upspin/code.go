@@ -2,20 +2,190 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// This file contains implementations of things like marshaling of the
+// basic Upspin types.
+
 package upspin // import "upspin.io/upspin"
 
 import (
-	"crypto/rand"
 	"encoding/binary"
-	"errors" // Cannot use Upspin's error package because it would introduce a dependency cycle.
+	"errors" // Cannot use Upspin's errors package because it would introduce a dependency cycle.
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 )
 
-// This file contains implementations of things like marshaling of the
-// basic Upspin types.
+const (
+	// maxDirBlocks specifies a theoretical upper limit for the number of
+	// DirBlocks in a DirEntry. It should be high enough that the limit
+	// will never be reached in practice. 1 million seems okay.
+	maxDirBlocks = 1000000
+)
+
+// This code is very careful not to grow a buffer of length more than a 32-bit
+// int when marshaling data for transmission, possibly to a machine where ints
+// only go to 2**31-1.
+var maxInt32 uint64 = 1<<31 - 1 // Should be const, but edited by tests.
+
+// accumulator is a helper type for marshaling data.
+// It manages the buffering and keeps track of the length
+// of the marshaled data for error checking.
+type accumulator struct {
+	buf      []byte   // The marshaled data to be returned.
+	tmp      [16]byte // For use by PutVarint.
+	count    uint64   // The number of bytes written.
+	overflow bool     // Whether the length has overflowed an int32.
+}
+
+// byte appends a single byte.
+func (acc *accumulator) byte(b byte) {
+	if acc.overflow {
+		return
+	}
+	acc.count++
+	if acc.count > maxInt32 {
+		acc.overflow = true
+		return
+	}
+	acc.buf = append(acc.buf, b)
+}
+
+// string appends a string as a varint length followed by the data.
+func (acc *accumulator) string(str string) {
+	if acc.overflow {
+		return
+	}
+	n := binary.PutVarint(acc.tmp[:], int64(len(str)))
+	acc.count += uint64(n + len(str))
+	if acc.count > maxInt32 {
+		acc.overflow = true
+		return
+	}
+	acc.buf = append(acc.buf, acc.tmp[:n]...)
+	acc.buf = append(acc.buf, str...)
+}
+
+// bytes appends a byte slice as a varint length followed by the data.
+func (acc *accumulator) bytes(bytes []byte) {
+	if acc.overflow {
+		return
+	}
+	n := binary.PutVarint(acc.tmp[:], int64(len(bytes)))
+	acc.count += uint64(n + len(bytes))
+	if acc.count > maxInt32 {
+		acc.overflow = true
+		return
+	}
+	acc.buf = append(acc.buf, acc.tmp[:n]...)
+	acc.buf = append(acc.buf, bytes...)
+}
+
+// int64 appends an int64.
+func (acc *accumulator) int64(i int64) {
+	if acc.overflow {
+		return
+	}
+	n := binary.PutVarint(acc.tmp[:], i)
+	acc.count += uint64(n)
+	if acc.count > maxInt32 {
+		acc.overflow = true
+		return
+	}
+	acc.buf = append(acc.buf, acc.tmp[:n]...)
+}
+
+// result returns the resulting slice. If it is too long, it returns ErrTooLarge.
+func (acc *accumulator) result() ([]byte, error) {
+	if acc.overflow {
+		return nil, ErrTooLarge
+	}
+	return acc.buf, nil
+}
+
+// consumer is a helper type for unmarshaling data.
+// It tracks the buffer and simplifies error handling.
+type consumer struct {
+	buf []byte // The marshaled data to be unpacked.
+	err error  // First error that occured.
+}
+
+// byte unpacks a single byte.
+func (c *consumer) byte() byte {
+	if c.err != nil {
+		return 0
+	}
+	if len(c.buf) == 0 {
+		c.err = ErrTooShort
+		return 0
+	}
+	b := c.buf[0]
+	c.buf = c.buf[1:]
+	return b
+}
+
+// bytes unpacks a byte slice.
+func (c *consumer) bytes() []byte {
+	if c.err != nil {
+		return c.buf[:0] // Not nil, so we can convert to string etc.
+	}
+	u, n := binary.Varint(c.buf)
+	// If n <= 0, Varint returned an error. Otherwise we know n <= len(b).
+	// We also test that u is good and u bytes remain in the buffer after the count.
+	if n <= 0 || u < 0 || len(c.buf[n:]) < int(u) {
+		c.err = ErrTooShort
+		return c.buf[:0]
+	}
+	if uint64(u) > maxInt32 {
+		c.err = ErrTooLarge
+		return c.buf[:0]
+	}
+	c.buf = c.buf[n:]
+	data := c.buf[:u]
+	c.buf = c.buf[u:]
+	return data
+}
+
+// bytes unpacks a bit slice of length n, already recovered.
+func (c *consumer) nBytes(n int) []byte {
+	if c.err != nil {
+		return c.buf[:0] // Not nil, so we can convert to string etc.
+	}
+	if n < 0 {
+		c.err = ErrTooShort
+		return c.buf[:0]
+	}
+	if len(c.buf) < n || maxInt32 < uint64(n) {
+		c.err = ErrTooLarge
+		return c.buf[:0]
+	}
+	data := c.buf[:n]
+	c.buf = c.buf[n:]
+	return data
+}
+
+// int64 unpacks a varint-encoded int64.
+func (c *consumer) int64() int64 {
+	if c.err != nil {
+		return 0
+	}
+	i, n := binary.Varint(c.buf)
+	switch {
+	case n == 0:
+		c.err = ErrTooShort
+		return 0
+	case n < 0:
+		c.err = errors.New("integer overflow")
+		return 0
+	}
+	c.buf = c.buf[n:]
+	return i
+}
+
+// remainder returns the remaining data and the first error encountered.
+func (c *consumer) remainder() ([]byte, error) {
+	return c.buf, c.err
+}
 
 // Marshal packs the DirBlock into a byte slice for transport.
 func (d *DirBlock) Marshal() ([]byte, error) {
@@ -23,85 +193,63 @@ func (d *DirBlock) Marshal() ([]byte, error) {
 }
 
 // MarshalAppend packs the DirBlock and appends it onto the given
-// byte slice for transport. It will create a new slice if b is nil
-// and grow the slice if necessary. However, if b's capacity is large
+// byte slice for transport. It will create a new slice if buf is nil
+// and grow the slice if necessary. However, if buf's capacity is large
 // enough, MarshalAppend will do no allocation. If it does allocate,
 // the returned slice will point to different storage than does the
 // input argument, as with the built-in append function.
 func (d *DirBlock) MarshalAppend(b []byte) ([]byte, error) {
-	var tmp [16]byte // For use by PutVarint.
+	acc := accumulator{buf: b}
+	return acc.DirBlock(d)
+}
 
+func (acc *accumulator) DirBlock(d *DirBlock) ([]byte, error) {
 	// Location:
 	// Location.Endpoint:
 	//	Transport: 1 byte.
 	//	NetAddr: count n followed by n bytes.
-	b = append(b, byte(d.Location.Endpoint.Transport))
-	b = appendString(b, string(d.Location.Endpoint.NetAddr))
+	acc.byte(byte(d.Location.Endpoint.Transport))
+	acc.string(string(d.Location.Endpoint.NetAddr))
 	// Location.Reference: count n followed by n bytes.
-	b = appendString(b, string(d.Location.Reference))
+	acc.string(string(d.Location.Reference))
 
-	// Offset
-	n := binary.PutVarint(tmp[:], d.Offset)
-	b = append(b, tmp[:n]...)
+	acc.int64(d.Offset)
+	// Safety check.
+	if d.Size > MaxBlockSize {
+		return nil, ErrTooLarge
+	}
+	acc.int64(d.Size)
+	acc.bytes(d.Packdata)
 
-	// Size
-	n = binary.PutVarint(tmp[:], d.Size)
-	b = append(b, tmp[:n]...)
-
-	// Packdata
-	b = appendBytes(b, d.Packdata)
-
-	return b, nil
+	return acc.result()
 }
 
 // Unmarshal unpacks the byte slice to recover the encoded DirBlock.
 func (d *DirBlock) Unmarshal(b []byte) ([]byte, error) {
+	cons := &consumer{buf: b}
+	return cons.DirBlock(d)
+}
+
+// DirBlock unmarshals a DirBlock.
+func (cons *consumer) DirBlock(d *DirBlock) ([]byte, error) {
 	// Location:
 	// Location.Endpoint:
 	//	Transport: 1 byte.
 	//	NetAddr: count n followed by n bytes.
-	if len(b) < 1 {
-		return nil, ErrTooShort
-	}
-	d.Location.Endpoint.Transport = Transport(b[0])
-	b = b[1:]
-	var bytes []byte
-	bytes, b = getBytes(b)
-	if b == nil {
-		return nil, ErrTooShort
-	}
+	d.Location.Endpoint.Transport = Transport(cons.byte())
+	bytes := cons.bytes()
 	d.Location.Endpoint.NetAddr = NetAddr(bytes)
 
 	// d.Location.Reference
 	//	Packing: 1 byte.
 	//	Key: count h followed by h bytes.
-	bytes, b = getBytes(b)
-	if b == nil {
-		return nil, ErrTooShort
-	}
-	d.Location.Reference = Reference(bytes)
+	d.Location.Reference = Reference(cons.bytes())
 
-	// Offset.
-	offset, n := binary.Varint(b)
-	if n == 0 {
-		return nil, ErrTooShort
-	}
-	d.Offset = offset
-	b = b[n:]
+	d.Offset = cons.int64()
+	d.Size = cons.int64()
 
-	// Size.
-	size, n := binary.Varint(b)
-	if n == 0 {
-		return nil, ErrTooShort
-	}
-	d.Size = size
-	b = b[n:]
-
-	bytes, b = getBytes(b)
-	if b == nil {
-		return nil, ErrTooShort
-	}
-	if len(bytes) > 0 {
+	// Packdata.
+	if bytes = cons.bytes(); len(bytes) > 0 {
 		// Must copy Packdata - can't return buffer's own contents.
 		// (All the other slices are turned into strings, so are intrinsically copied.)
 		d.Packdata = append([]byte(nil), bytes...)
@@ -109,7 +257,7 @@ func (d *DirBlock) Unmarshal(b []byte) ([]byte, error) {
 		d.Packdata = nil
 	}
 
-	return b, nil
+	return cons.remainder()
 }
 
 // Size returns the total length of the data underlying the DirEntry
@@ -143,206 +291,120 @@ func (d *DirEntry) Marshal() ([]byte, error) {
 // the returned slice will point to different storage than does the
 // input argument, as with the built-in append function.
 func (d *DirEntry) MarshalAppend(b []byte) ([]byte, error) {
-	var tmp [16]byte // For use by PutVarint.
+	acc := accumulator{buf: b}
 
-	// SignedName: count n followed by n bytes.
-	b = appendString(b, string(d.SignedName))
-
-	// Packing: One byte.
-	b = append(b, byte(d.Packing))
-
-	// Time.
-	n := binary.PutVarint(tmp[:], int64(d.Time))
-	b = append(b, tmp[:n]...)
+	acc.string(string(d.SignedName))
+	acc.byte(byte(d.Packing))
+	acc.int64(int64(d.Time))
 
 	// Blocks.
 	// First a varint count, then the data.
-	n = binary.PutVarint(tmp[:], int64(len(d.Blocks)))
-	b = append(b, tmp[:n]...)
+	if uint64(len(d.Blocks)) > maxDirBlocks {
+		return nil, ErrTooLarge
+	}
+	acc.int64(int64(len(d.Blocks)))
 	for i := range d.Blocks {
-		var err error
-		b, err = d.Blocks[i].MarshalAppend(b)
-		if err != nil {
-			return nil, err
-		}
+		acc.DirBlock(&d.Blocks[i])
 	}
 
-	// Packdata.
-	b = appendBytes(b, d.Packdata)
-
-	// Link.
-	b = appendString(b, string(d.Link))
-
-	// Writer.
-	b = appendString(b, string(d.Writer))
+	acc.bytes(d.Packdata)
+	acc.string(string(d.Link))
+	acc.string(string(d.Writer))
 
 	// Name: if different from SignedName, count n followed by n bytes.
 	// Otherwise, count zero with no bytes following.
 	if d.Name != d.SignedName {
-		b = appendString(b, string(d.Name))
+		acc.string(string(d.Name))
 	} else {
 		// Encode a special -1 that denotes Name == SignedName.
-		n = binary.PutVarint(tmp[:], int64(-1))
-		b = append(b, tmp[:n]...)
+		acc.int64(-1)
 	}
 
-	// Attr: One byte.
-	b = append(b, byte(d.Attr))
+	acc.byte(byte(d.Attr))
+	acc.int64(d.Sequence)
 
-	// Sequence.
-	n = binary.PutVarint(tmp[:], d.Sequence)
-	b = append(b, tmp[:n]...)
-
-	return b, nil
-}
-
-func appendString(b []byte, str string) []byte {
-	var tmp [16]byte // For use by PutVarint.
-	n := binary.PutVarint(tmp[:], int64(len(str)))
-	b = append(b, tmp[:n]...)
-	b = append(b, str...)
-	return b
-}
-
-func appendBytes(b, bytes []byte) []byte {
-	var tmp [16]byte // For use by PutVarint.
-	n := binary.PutVarint(tmp[:], int64(len(bytes)))
-	b = append(b, tmp[:n]...)
-	b = append(b, bytes...)
-	return b
+	return acc.result()
 }
 
 // ErrTooShort is returned by Unmarshal methods if the data is incomplete.
 var ErrTooShort = errors.New("Unmarshal buffer too short")
 
+// ErrTooLarge reports that an item is too large to be marshaled for transport to a
+// potentially smaller machine. The limit is becase len(x) is of type int, which
+// can be as small as 32 bits.
+var ErrTooLarge = errors.New("data item too large")
+
 // Unmarshal unpacks a marshaled DirEntry and stores it in the receiver.
 // If successful, every field of d will be overwritten and the remaining
 // data will be returned.
 func (d *DirEntry) Unmarshal(b []byte) ([]byte, error) {
+	cons := consumer{buf: b}
 	// SignedName: count N followed by N bytes.
-	bytes, b := getBytes(b)
-	if len(b) < 1 { // Check for packing here too.
-		return nil, ErrTooShort
-	}
+	bytes := cons.bytes()
 	d.SignedName = PathName(bytes)
 
 	// Packing: One byte.
-	d.Packing = Packing(b[0])
-	b = b[1:]
+	d.Packing = Packing(cons.byte())
 
 	// Time.
-	time, n := binary.Varint(b)
-	if n == 0 {
-		return nil, ErrTooShort
-	}
-	d.Time = Time(time)
-	b = b[n:]
+	d.Time = Time(cons.int64())
 
 	// Blocks. First a varint count, then the blocks.
-	nBlocks, n := binary.Varint(b)
-	if n == 0 {
-		return nil, ErrTooShort
-	}
-	b = b[n:]
+	nBlocks := cons.int64()
 	d.Blocks = nil
-	if nBlocks > 0 {
+	switch {
+	case nBlocks > maxDirBlocks:
+		return nil, fmt.Errorf("block count out of range (max %d): %d", maxDirBlocks, nBlocks)
+	case nBlocks < 0:
+		return nil, fmt.Errorf("negative block count: %d", nBlocks)
+	case nBlocks > 0:
 		d.Blocks = make([]DirBlock, nBlocks)
 		for i := range d.Blocks {
-			var err error
-			b, err = d.Blocks[i].Unmarshal(b)
-			if err != nil {
-				return nil, err
-			}
+			cons.DirBlock(&d.Blocks[i])
 		}
 	}
 
 	// Packdata.
-	bytes, b = getBytes(b)
-	if b == nil {
-		return nil, ErrTooShort
-	}
-	if len(bytes) > 0 {
-		// Must copy the data for Packdata - can't return buffer's own contents.
-		// (Most other slices are turned into strings, so are intrinsically copied.)
+	if bytes = cons.bytes(); len(bytes) > 0 {
+		// Must copy Packdata - can't return buffer's own contents.
+		// (All the other slices are turned into strings, so are intrinsically copied.)
 		d.Packdata = append([]byte(nil), bytes...)
 	} else {
 		d.Packdata = nil
 	}
 
 	// Link: count N followed by N bytes.
-	bytes, b = getBytes(b)
-	d.Link = PathName(bytes) // Zero-length is OK here.
+	d.Link = PathName(cons.bytes())
 
 	// Writer.
-	bytes, b = getBytes(b)
-	if len(b) < 1 { // At least one byte for Name.
-		return nil, ErrTooShort
-	}
-	d.Writer = UserName(bytes)
+	d.Writer = UserName(cons.bytes())
 
-	// Name: count N followed by N bytes.
+	// Name.
 	// If N is -1 Name equals SignedName.
-	length, n := binary.Varint(b)
-	if n == 0 {
-		return nil, ErrTooShort
+	length64 := cons.int64()
+	if length64 > MaxBlockSize {
+		return nil, ErrTooLarge
 	}
-	b = b[n:]
-	if length == -1 {
+	length := int(length64)
+	switch {
+	case length == -1:
 		// -1 is a special code that indicates Name == SignedName
 		d.Name = d.SignedName
-	} else {
-		bytes, b = getNBytes(b, int(length))
-		if bytes == nil {
-			return nil, ErrTooShort
-		}
-		d.Name = PathName(bytes)
+	case length < 0:
+		return nil, fmt.Errorf("DirEntry has bad Name length: %d", length)
+	default:
+		d.Name = PathName(cons.nBytes(length))
 	}
 
-	// Attr: One byte.
-	if len(b) < 1 {
-		return nil, ErrTooShort
-	}
-	d.Attr = Attribute(b[0])
-	b = b[1:]
+	d.Attr = Attribute(cons.byte())
+	d.Sequence = cons.int64()
 
-	// Sequence.
-	seq, n := binary.Varint(b)
-	if n == 0 {
-		return nil, ErrTooShort
-	}
-	d.Sequence = seq
-	b = b[n:]
-
-	return b, nil
-}
-
-// getBytes unmarshals the byte slice at b (varint count followed by bytes)
-// and returns the slice followed by the remaining bytes.
-// If there is insufficient data, both return values will be nil.
-func getBytes(b []byte) (data, remaining []byte) {
-	u, n := binary.Varint(b)
-	if u < 0 {
-		return nil, nil
-	}
-	if n == 0 || len(b) < n+int(u) {
-		return nil, nil
-	}
-	return getNBytes(b[n:], int(u))
-}
-
-// getNBytes unmarshals n bytes from b and returns the slice followed by the
-// remaining bytes. If there is insufficient data, both return values will be
-// nil.
-func getNBytes(b []byte, n int) (data, remaining []byte) {
-	if len(b) < n {
-		return nil, nil
-	}
-	return b[:n], b[n:]
+	return cons.remainder()
 }
 
 // String returns a default string representation of the time,
 // in the format similar to RFC 3339: "2006-01-02T15:04:05 UTC"
-// The time zone always UTC.
+// The time zone is always UTC.
 func (t Time) String() string {
 	return t.Go().Format("2006-01-02T15:04:05 UTC")
 }
@@ -466,43 +528,6 @@ func SortDirEntries(slice []*DirEntry, unique bool) []*DirEntry {
 		}
 	}
 	return result
-}
-
-// NewSequence creates a sequence for a new directory entry.
-//
-// The sequence is intended to be different for each Put of a
-// Pathname. We achieve this by
-// - incrementing the sequence on every Put of an existing DirEntry.
-// - choosing a unique value for the top 41 bits of the sequence on a
-//   Put of a new DirEntry.
-//
-// The unique value is provided by a cryptographic random number generator if one is
-// available. Failing that, we use nanosecond time.
-func NewSequence() int64 {
-	x := make([]byte, 5)
-	_, err := rand.Read(x)
-	var s int64
-	if err == nil {
-		s = int64(x[0])<<32 | int64(x[1])<<24 | int64(x[2])<<16 | int64(x[3])<<8 | int64(x[4])
-	} else {
-		s = (time.Now().UnixNano() & 0xffffffffff)
-	}
-	return (s << 23) | SeqBase
-}
-
-// SeqVersion returns the version part of a sequence number. It is incremented
-// on every Put of an existing DirEntry and wraps at 2^23.
-func SeqVersion(s int64) int64 {
-	return s & 0x7fffff
-}
-
-// SeqNext returns the next sequence number. It wraps to avoid values less than SeqBase.
-func SeqNext(s int64) int64 {
-	s++
-	if s < SeqBase {
-		return SeqBase
-	}
-	return s
 }
 
 func isMeta(b byte) bool {
