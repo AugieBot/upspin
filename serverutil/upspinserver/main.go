@@ -9,7 +9,6 @@
 package upspinserver // import "upspin.io/serverutil/upspinserver"
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -19,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"upspin.io/client"
 	"upspin.io/config"
@@ -30,9 +30,11 @@ import (
 	"upspin.io/rpc/dirserver"
 	"upspin.io/rpc/storeserver"
 	"upspin.io/serverutil/perm"
+	"upspin.io/serverutil/web"
 	storeServer "upspin.io/store/server"
 	"upspin.io/subcmd"
 	"upspin.io/upspin"
+	"upspin.io/version"
 
 	// Packers.
 	_ "upspin.io/pack/ee"
@@ -44,22 +46,35 @@ import (
 )
 
 var (
-	cfgPath   = flag.String("serverconfig", filepath.Join(config.Home(), "upspin", "server"), "server configuration `directory`")
+	cfgPath   = flag.String("serverconfig", defaultCfgPath(), "server configuration `directory`")
 	enableWeb = flag.Bool("web", false, "enable Upspin web interface")
 	readyCh   = make(chan struct{})
 )
 
+func defaultCfgPath() string {
+	home, err := config.Homedir()
+	if err != nil {
+		home = "/"
+	}
+	return filepath.Join(home, "upspin", "server")
+}
+
 func Main() (ready chan struct{}) {
 	flags.Parse(flags.Server)
 
+	if git := version.GitSHA; git != "" {
+		log.Info.Printf("upspinserver built on %s at commit %s",
+			version.BuildTime.In(time.UTC).Format(time.Stamp+" UTC"),
+			git)
+	}
 	_, cfg, perm, err := initServer(startup)
 	if err == noConfig {
-		log.Print("Configuration file not found. Running in setup mode.")
+		log.Info.Print("Configuration file not found. Running in setup mode.")
 		http.Handle("/", &setupHandler{})
 	} else if err != nil {
 		log.Fatal(err)
-	} else {
-		http.Handle("/", newWeb(cfg, perm))
+	} else if *enableWeb {
+		http.Handle("/", web.New(cfg, perm))
 	}
 
 	return readyCh
@@ -122,7 +137,8 @@ func initServer(mode initMode) (*subcmd.ServerConfig, upspin.Config, *perm.Perm,
 	if err := os.MkdirAll(logDir, 0700); err != nil {
 		return nil, nil, nil, err
 	}
-	dir, err := dirServer.New(dirCfg, "userCacheSize=1000", "logDir="+logDir)
+	dirServerConfig := append([]string{"logDir=" + logDir}, storeServerConfig...)
+	dir, err := dirServer.New(dirCfg, dirServerConfig...)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -156,15 +172,25 @@ func initServer(mode initMode) (*subcmd.ServerConfig, upspin.Config, *perm.Perm,
 }
 
 // fmtStoreConfig formats a ServerConfig.StoreConfig value as a string,
-// ommitting any privateKeyData fields as they include sensitive information.
+// omitting any fields that may include sensitive information.
 func fmtStoreConfig(cfg []string) string {
 	var out []string
 	for _, s := range cfg {
-		if !strings.HasPrefix(s, "privateKeyData=") {
+		if !containsAny(s, "appkey", "token", "private") {
 			out = append(out, s)
 		}
 	}
 	return strings.Join(out, " ")
+}
+
+func containsAny(s string, lowerCaseNeedles ...string) bool {
+	ls := strings.ToLower(s)
+	for _, n := range lowerCaseNeedles {
+		if strings.Contains(ls, n) {
+			return true
+		}
+	}
+	return false
 }
 
 type setupHandler struct {
@@ -234,7 +260,9 @@ func (h *setupHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "OK")
 
 	h.done = true
-	h.web = newWeb(cfg, perm)
+	if *enableWeb {
+		h.web = web.New(cfg, perm)
+	}
 }
 
 func setupWriters(cfg upspin.Config) error {
@@ -263,7 +291,7 @@ func setupWriters(cfg upspin.Config) error {
 // existsOK returns err if it is not an errors.Exist error,
 // in which case it returns nil.
 func existsOK(_ *upspin.DirEntry, err error) error {
-	if errors.Match(errors.E(errors.Exist), err) {
+	if errors.Is(errors.Exist, err) {
 		return nil
 	}
 	return err
@@ -273,6 +301,9 @@ func readServerConfig() (*subcmd.ServerConfig, error) {
 	cfgFile := filepath.Join(*cfgPath, subcmd.ServerConfigFile)
 	b, err := ioutil.ReadFile(cfgFile)
 	if err != nil {
+		// We can't return the usual errors.E because the caller wants
+		// to match on the raw error.  But give the admin a clue.
+		log.Printf("unable to read configuration: %s", err)
 		return nil, err
 	}
 	cfg := &subcmd.ServerConfig{}
@@ -280,37 +311,5 @@ func readServerConfig() (*subcmd.ServerConfig, error) {
 		return nil, err
 	}
 
-	return cfg, updateServerConfig(cfg)
-}
-
-// If Bucket is set, look for the old style serviceaccount.json file, stuff it
-// into the StoreConfig field, clear the Bucket field, and rewrite the config.
-// TODO(adg): remove this at the same time as removing the Bucket field.
-func updateServerConfig(cfg *subcmd.ServerConfig) error {
-	if cfg.Bucket != "" {
-		cfgFile := filepath.Join(*cfgPath, subcmd.ServerConfigFile)
-		serviceFile := filepath.Join(*cfgPath, "serviceaccount.json")
-		b, err := ioutil.ReadFile(serviceFile)
-		if err != nil {
-			return fmt.Errorf("Bucket set in %v, but: %v", cfgFile, err)
-		}
-		privateKeyData := base64.StdEncoding.EncodeToString(b)
-		cfg.StoreConfig = []string{
-			"backend=GCS",
-			"defaultACL=publicRead",
-			"gcpBucketName=" + cfg.Bucket,
-			"privateKeyData=" + privateKeyData,
-		}
-		cfg.Bucket = ""
-		b, err = json.Marshal(cfg)
-		if err != nil {
-			return fmt.Errorf("encoding config %v: %v", cfgFile, err)
-		}
-		err = ioutil.WriteFile(cfgFile, b, 0700)
-		if err != nil {
-			return fmt.Errorf("rewriting config: %v", err)
-		}
-		os.Remove(serviceFile)
-	}
-	return nil
+	return cfg, nil
 }

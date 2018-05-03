@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"upspin.io/errors"
+	"upspin.io/upspin"
 )
 
 // Storage is a low-level storage interface for services to store their data
@@ -31,6 +32,19 @@ type Storage interface {
 	Delete(ref string) error
 }
 
+// Lister provides a mechanism to report the set of items held in a
+// StoreServer. Clients can use a type assertion to verify whether
+// the StoreServer implements this interface.
+type Lister interface {
+	// List returns a list of references contained by the storage backend.
+	// The token argument is for pagination: it specifies a starting point
+	// for the list. To obtain a complete list of references, pass an empty
+	// string for the first call, and the last nextToken value for for each
+	// subsequent call. The pagination tokens are opaque values particular
+	// to the storage implementation.
+	List(token string) (refs []upspin.ListRefsItem, nextToken string, err error)
+}
+
 // StorageConstructor is a function that initializes and returns a Storage
 // implementation with the given options.
 type StorageConstructor func(*Opts) (Storage, error)
@@ -48,7 +62,7 @@ type DialOpts func(*Opts) error
 
 // Register registers a new Storage under a name. It is typically used in init functions.
 func Register(name string, fn StorageConstructor) error {
-	const op = "cloud/storage.Register"
+	const op errors.Op = "cloud/storage.Register"
 	if _, exists := registration[name]; exists {
 		return errors.E(op, errors.Exist)
 	}
@@ -60,7 +74,7 @@ func Register(name string, fn StorageConstructor) error {
 // are specific to each storage backend. Neither key nor value may contain the characters "," or "=".
 // Use WithKeyValue repeatedly if these characters need to be used.
 func WithOptions(options string) DialOpts {
-	const op = "cloud/storage.WithOptions"
+	const op errors.Op = "cloud/storage.WithOptions"
 	return func(o *Opts) error {
 		pairs := strings.Split(options, ",")
 		for _, p := range pairs {
@@ -84,7 +98,7 @@ func WithKeyValue(key, value string) DialOpts {
 
 // Dial dials the named storage backend using the dial options opts.
 func Dial(name string, opts ...DialOpts) (Storage, error) {
-	const op = "cloud/storage.Dial"
+	const op errors.Op = "cloud/storage.Dial"
 	fn, found := registration[name]
 	if !found {
 		return nil, errors.E(op, errors.Invalid, errors.Errorf("unknown storage backend type %q", name))
