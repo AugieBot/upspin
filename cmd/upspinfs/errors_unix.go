@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build darwin linux freebsd netbsd
+// +build !windows
 
 package main
 
@@ -83,6 +83,10 @@ func e2e(err error) *errnoError {
 	}
 	log.Debug.Println(err.Error())
 	return &errnoError{errno, err}
+}
+
+func unsupported(err error) *errnoError {
+	return &errnoError{syscall.ENOTSUP, err}
 }
 
 // classify returns the Kind of error whether or not this is from the upspin errors pkg.
