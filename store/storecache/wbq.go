@@ -7,6 +7,7 @@ package storecache
 import (
 	"expvar"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -23,9 +24,6 @@ const (
 
 	// Initial maximum number of parallel writebacks.
 	initialMaxParallel = 6
-
-	// Terminating characters for writeback link names.
-	writebackSuffix = "_wbf"
 
 	// Retry interval for endpoints that we failed to Put to.
 	retryInterval = 5 * time.Minute
@@ -70,7 +68,8 @@ type writebackQueue struct {
 
 	// All queued writeback requests. Also used/modified
 	// exclusively by the scheduler goroutine.
-	queued map[upspin.Location]*request
+	queued   map[upspin.Location]*request
+	enqueued int
 
 	// request carries writeback requests to the scheduler.
 	request chan *request
@@ -93,13 +92,14 @@ type writebackQueue struct {
 	// Writers and scheduler send to terminated on exit.
 	terminated chan bool
 
+	// Queue of clients waiting for all writebacks to be flushed.
+	flushChans []chan bool
+
 	goodput *serverutil.RateCounter
 	output  *serverutil.RateCounter
 }
 
 func newWritebackQueue(sc *storeCache) *writebackQueue {
-	const op = "store/storecache.newWritebackQueue"
-
 	wbq := &writebackQueue{
 		sc:           sc,
 		byEndpoint:   make(map[upspin.Endpoint]*endpointQueue),
@@ -112,9 +112,9 @@ func newWritebackQueue(sc *storeCache) *writebackQueue {
 		die:          make(chan bool),
 		terminated:   make(chan bool),
 	}
-	wbq.goodput, _ = serverutil.NewRateCounter(60, 5*time.Second)
+	wbq.goodput = serverutil.NewRateCounter(60, 5*time.Second)
 	expvar.Publish("storecache-goodput", wbq.goodput)
-	wbq.output, _ = serverutil.NewRateCounter(60, 5*time.Second)
+	wbq.output = serverutil.NewRateCounter(60, 5*time.Second)
 	expvar.Publish("storecache-output", wbq.output)
 
 	// Start scheduler.
@@ -129,49 +129,35 @@ func newWritebackQueue(sc *storeCache) *writebackQueue {
 }
 
 // enqueueWritebackFile populates the writeback queue on startup.
-// It returns true if this was indeed a write back file.
-func (wbq *writebackQueue) enqueueWritebackFile(path string) bool {
-	const op = "store/storecache.isWritebackFile"
-	f := strings.TrimSuffix(path, writebackSuffix)
-	if f == path {
-		return false
-	}
+func (wbq *writebackQueue) enqueueWritebackFile(relPath string) {
+	const op errors.Op = "store/storecache.isWritebackFile"
 
-	// At this point we know it is a writeback link so we will
-	// take care of it.
 	if wbq == nil {
-		log.Error.Printf("%s: writeback file %s but running as writethrough", op, path)
-		return true
+		log.Error.Printf("%s: writeback file %s but running as writethrough", op, relPath)
+		return
 	}
-	f = strings.TrimPrefix(f, wbq.sc.dir+"/")
-	elems := strings.Split(f, "/")
+	elems := strings.Split(relPath, string(filepath.Separator))
 	if len(elems) != 3 {
-		log.Error.Printf("%s: odd writeback file %s", op, path)
-		return true
+		log.Error.Printf("%s: odd writeback file %s", op, relPath)
+		return
 	}
 	e, err := upspin.ParseEndpoint(elems[0])
 	if err != nil {
-		log.Error.Printf("%s: odd writeback file %s: %s", op, path, err)
-		return true
+		log.Error.Printf("%s: odd writeback file %s: %s", op, relPath, err)
+		return
 	}
 	wbq.request <- &request{
 		Location:   upspin.Location{Reference: upspin.Reference(elems[2]), Endpoint: *e},
 		err:        nil,
 		flushChans: nil,
 	}
-	return true
 }
 
-func (wbq *writebackQueue) close() {
-	close(wbq.die)
-	for i := 0; i < writers+1; i++ {
-		<-wbq.terminated
-	}
-}
+var emptyLocation upspin.Location
 
 // scheduler puts requests into the ready queue for the writers to work on.
 func (wbq *writebackQueue) scheduler() {
-	const op = "store/storecache.scheduler"
+	const op errors.Op = "store/storecache.scheduler"
 	p := newParallelism(initialMaxParallel)
 	for {
 		select {
@@ -180,6 +166,7 @@ func (wbq *writebackQueue) scheduler() {
 			// Keep a map of requests so that we can handle flushes
 			// and avoid Duplicates.
 			if wbq.queued[r.Location] != nil {
+				log.Debug.Printf("%s: %s %s already queued", op, r.Reference, r.Endpoint)
 				// Already queued. Unusual but OK.
 				break
 			}
@@ -193,6 +180,8 @@ func (wbq *writebackQueue) scheduler() {
 				wbq.byEndpoint[r.Endpoint] = epq
 			}
 			epq.queue = append(epq.queue, r)
+			wbq.enqueued++
+			log.Debug.Printf("%s: %s %s queued", op, r.Reference, r.Endpoint)
 		case r := <-wbq.done:
 			// A request has been completed.
 			epq := wbq.byEndpoint[r.Endpoint]
@@ -226,12 +215,23 @@ func (wbq *writebackQueue) scheduler() {
 			epq.state = live
 			p.success()
 
-			// Awaken everyone waiting for a flush.
+			// Awaken everyone waiting for a flush of a particular block.
 			for _, c := range r.flushChans {
-				log.Debug.Printf("flushing...")
+				log.Debug.Printf("awakening block flusher")
 				close(c)
 			}
 			delete(wbq.queued, r.Location)
+			wbq.enqueued--
+
+			// Awaken everyone waiting for a flush of all writebacks.
+			if wbq.enqueued == 0 {
+				for _, c := range wbq.flushChans {
+					log.Debug.Printf("awakening all flusher")
+					close(c)
+				}
+				wbq.flushChans = nil
+			}
+
 			log.Debug.Printf("%s: %s %s done", op, r.Reference, r.Endpoint)
 		case epq := <-wbq.retry:
 			// Set its state to unknown so we'll try a single request to feel it out.
@@ -239,14 +239,21 @@ func (wbq *writebackQueue) scheduler() {
 				epq.state = unknown
 			}
 		case fr := <-wbq.flushRequest:
-			r := wbq.queued[fr.Location]
-			if r == nil {
-				// Not in flight
-				close(fr.flushed)
-				break
+			if fr.Location == emptyLocation {
+				if wbq.enqueued == 0 {
+					close(fr.flushed)
+					break
+				}
+				wbq.flushChans = append(wbq.flushChans, fr.flushed)
+			} else {
+				r := wbq.queued[fr.Location]
+				if r == nil {
+					// Not in flight
+					close(fr.flushed)
+					break
+				}
+				r.flushChans = append(r.flushChans, fr.flushed)
 			}
-			// Could be multiple outstanding flush requests.
-			r.flushChans = append(r.flushChans, fr.flushed)
 		case <-wbq.die:
 			wbq.terminated <- true
 			return
@@ -319,11 +326,12 @@ func (wbq *writebackQueue) writer(me int) {
 // TODO(p): still figuring out how to tell them apart.
 func (wbq *writebackQueue) writeback(r *request) error {
 	// Read it in.
-	file := wbq.sc.cachePath(r.Reference, r.Endpoint) + writebackSuffix
-	data, err := readFromCacheFile(file)
+	relPath := wbq.sc.cachePath(r.Reference, r.Endpoint)
+	absPath := wbq.sc.absWritebackPath(relPath)
+	data, err := wbq.sc.readFromCacheFile(absPath)
 	if err != nil {
 		// Nothing we can do, log it but act like we succeeded.
-		log.Error.Printf("store/storecache.writer: disappeared before writeback: %s", err)
+		log.Error.Printf("store/storecache.writer: data for %s@%s disappeared before writeback: %s", r.Reference, r.Endpoint, err)
 		return nil
 	}
 	r.len = int64(len(data))
@@ -341,23 +349,34 @@ func (wbq *writebackQueue) writeback(r *request) error {
 		err := errors.Errorf("refdata mismatch expected %q got %q", r.Reference, refdata.Reference)
 		return err
 	}
-	if err := os.Remove(file); err != nil {
-		log.Info.Printf("store/storecache.writer: fail remove after writeback: %s", err)
+	if err := os.Remove(absPath); err != nil {
+		log.Error.Printf("store/storecache.writer: fail remove after writeback: %s", err)
 	}
+	log.Info.Printf("store/storecache.writer: %s@%s writeback successful", r.Reference, r.Endpoint)
 	return nil
 }
 
 // requestWriteback makes a hard link to the cache file sends a request to the scheduler queue.
 func (wbq *writebackQueue) requestWriteback(ref upspin.Reference, e upspin.Endpoint) error {
 	// Make a link to the cache file.
-	cf := wbq.sc.cachePath(ref, e)
-	wbf := cf + writebackSuffix
+	relPath := wbq.sc.cachePath(ref, e)
+	cf := wbq.sc.absCachePath(relPath)
+	wbf := wbq.sc.absWritebackPath(relPath)
 	if err := os.Link(cf, wbf); err != nil {
 		if strings.Contains(err.Error(), "exists") {
 			// Someone else is already writing it back.
 			return nil
 		}
-		return err
+		os.MkdirAll(filepath.Dir(wbf), 0700)
+		err := os.Link(cf, wbf)
+		if err != nil {
+			if strings.Contains(err.Error(), "exists") {
+				// Someone else is already writing it back.
+				return nil
+			}
+			log.Debug.Printf("%s", err)
+			return err
+		}
 	}
 
 	// Let the scheduler know.
@@ -406,7 +425,7 @@ func newParallelism(max int) *parallelism {
 // failure is called when a writeback fails. It returns true if it
 // has dealt with the error.
 func (p *parallelism) failure(err error) bool {
-	const op = "store/storecache.failure"
+	const op errors.Op = "store/storecache.failure"
 
 	p.inFlight--
 
@@ -439,7 +458,7 @@ func (p *parallelism) failure(err error) bool {
 
 // success is called whenever a writeback succeeds.
 func (p *parallelism) success() {
-	const op = "store/storecache.success"
+	const op errors.Op = "store/storecache.success"
 
 	p.inFlight--
 
