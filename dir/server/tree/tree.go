@@ -14,23 +14,19 @@ import (
 	"sort"
 	"sync"
 
-	"upspin.io/client/clientutil"
+	"upspin.io/dir/server/serverlog"
 	"upspin.io/errors"
 	"upspin.io/log"
 	"upspin.io/pack"
 	"upspin.io/path"
 	"upspin.io/upspin"
-	"upspin.io/valid"
 )
 
 // node is an internal representation of a node in the tree.
-// All node accesses must be protected the tree's mutex.
+// All node accesses must be protected by the tree's mutex.
 type node struct {
 	// entry is the DirEntry this node represents.
 	entry upspin.DirEntry
-
-	// watchers is the set of watchers for this node.
-	watchers []*watcher
 
 	// kids maps a path element of a path name to the dir entries that represent them.
 	// It is empty if this node's dirEntry represents a file or an empty directory;
@@ -52,81 +48,85 @@ type Tree struct {
 	// be held when calling all unexported methods.
 	mu sync.Mutex
 
-	user     upspin.UserName
+	user     *serverlog.User
+	sequence int64 // Most recent sequence number for user.
 	config   upspin.Config
 	packer   upspin.Packer
-	log      *Log
-	logIndex *LogIndex
 	root     *node
 	// dirtyNodes is the set of dirty nodes, grouped by path length.
 	// The index of the slice is the path length of the nodes therein.
-	// The value of the map is ignored.
-	dirtyNodes []map[*node]bool
+	// The value of the map is unused - the map is just a set.
+	dirtyNodes []map[*node]struct{}
+
+	// shutdown is closed when the tree is closed. Any goroutine that needs
+	// to exit can select on it. Especially useful for watchers.
+	shutdown chan struct{}
+
+	// watcherWG tracks the number of running watchers.
+	// Its Add method should be called with mu held,
+	// and only if the shutdown channel is not closed.
+	watcherWG sync.WaitGroup
+
+	// watchers holds the active watchers of this tree.
+	watchers map[upspin.PathName][]*watcher
 }
 
 // String implements fmt.Stringer.
-// t.mu must be held.
+// The node's tree's mutex must be held.
 func (n *node) String() string {
 	return fmt.Sprintf("node: %q, dirty: %v, kids: %d", n.entry.Name, n.dirty, len(n.kids))
 }
 
-// New creates an empty Tree using the server's config, a Log and a
-// LogIndex for a particular user's tree. Config is used for contacting
+func (t *Tree) User() *serverlog.User {
+	return t.user
+}
+
+// New creates an empty Tree using the server's config and the set
+// of logs for a user.
+// Config is used for contacting
 // StoreServer, defining the default packing and setting the server name.
-// All fields of the config must be defined. Log manipulates the log on behalf
-// of the tree for a user. LogIndex is used by Tree to track the most recent
-// changes stored in the log for the user. The user name in Log and LogIndex
-// must be for the exact same user. If there are unprocessed log entries in
+// All fields of the config must be defined.
+// If there are unprocessed log entries in
 // the Log, the Tree's state is recovered from it.
-// TODO: Maybe new is doing too much work. Figure out how to break in two without
+// TODO: Maybe New is doing too much work. Figure out how to break in two without
 // returning an inconsistent new tree if log is unprocessed.
-func New(config upspin.Config, log *Log, logIndex *LogIndex) (*Tree, error) {
-	const op = "dir/server/tree.New"
+func New(config upspin.Config, user *serverlog.User) (*Tree, error) {
 	if config == nil {
-		return nil, errors.E(op, errors.Invalid, errors.Str("config is nil"))
+		return nil, errors.E(errors.Invalid, "config is nil")
 	}
-	if log == nil {
-		return nil, errors.E(op, errors.Invalid, errors.Str("log is nil"))
-	}
-	if logIndex == nil {
-		return nil, errors.E(op, errors.Invalid, errors.Str("logIndex is nil"))
+	if user == nil {
+		return nil, errors.E(errors.Invalid, "user is nil")
 	}
 	if config.StoreEndpoint().Transport == upspin.Unassigned {
-		return nil, errors.E(op, errors.Invalid, errors.Str("unassigned store endpoint"))
+		return nil, errors.E(errors.Invalid, "unassigned store endpoint")
 	}
 	if config.KeyEndpoint().Transport == upspin.Unassigned {
-		return nil, errors.E(op, errors.Invalid, errors.Str("unassigned key endpoint"))
+		return nil, errors.E(errors.Invalid, "unassigned key endpoint")
 	}
 	if config.Factotum() == nil {
-		return nil, errors.E(op, errors.Invalid, errors.Str("factotum is nil"))
+		return nil, errors.E(errors.Invalid, "factotum is nil")
 	}
 	if config.UserName() == "" {
-		return nil, errors.E(op, errors.Invalid, errors.Str("username in tree config is empty"))
+		return nil, errors.E(errors.Invalid, "username in tree config is empty")
 	}
-	if log.User() == "" {
-		return nil, errors.E(op, errors.Invalid, errors.Str("username in log is empty"))
-	}
-	if log.User() != logIndex.User() {
-		return nil, errors.E(op, errors.Invalid, errors.Str("username in log and logIndex mismatch"))
-	}
-	if err := valid.UserName(log.User()); err != nil {
-		return nil, errors.E(op, errors.Invalid, err)
+	if user.Name() == "" {
+		return nil, errors.E(errors.Invalid, "username in log is empty")
 	}
 	packer := pack.Lookup(config.Packing())
 	if packer == nil {
-		return nil, errors.E(op, errors.Invalid, errors.Errorf("no packing %s registered", config.Packing()))
+		return nil, errors.E(errors.Invalid, errors.Errorf("no packing %s registered", config.Packing()))
 	}
 	t := &Tree{
-		user:     log.User(),
+		user:     user,
 		config:   config,
 		packer:   packer,
-		log:      log,
-		logIndex: logIndex,
+		shutdown: make(chan struct{}),
+		watchers: make(map[upspin.PathName][]*watcher),
 	}
 	// Do we have entries in the log to process, to recover from a crash?
 	err := t.recoverFromLog()
 	if err != nil {
-		return nil, errors.E(op, err)
+		return nil, err
 	}
 	return t, nil
 }
@@ -140,16 +140,15 @@ func New(config upspin.Config, log *Log, logIndex *LogIndex) (*Tree, error) {
 // operation as outlined in the description for upspin.ErrFollowLink.
 // Otherwise in the case of error the returned DirEntry will be nil.
 func (t *Tree) Lookup(p path.Parsed) (de *upspin.DirEntry, dirty bool, err error) {
-	const op = "dir/server/tree.Lookup"
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	node, _, err := t.loadPath(p)
+	node, err := t.loadPath(p)
 	if err == upspin.ErrFollowLink {
 		return &node.entry, node.dirty, err
 	}
 	if err != nil {
-		return nil, false, errors.E(op, err)
+		return nil, false, err
 	}
 	return node.entry.Copy(), node.dirty, nil
 }
@@ -162,14 +161,14 @@ func (t *Tree) Lookup(p path.Parsed) (de *upspin.DirEntry, dirty bool, err error
 // (with the added step of updating the Name field of the argument
 // DirEntry). Otherwise, the returned DirEntry will be the one put.
 func (t *Tree) Put(p path.Parsed, de *upspin.DirEntry) (*upspin.DirEntry, error) {
-	const op = "dir/server/tree.Put"
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	if p.IsRoot() {
 		return de, t.createRoot(p, de)
 	}
-	node, watchers, err := t.put(p, de)
+
+	node, err := t.put(p, de)
 	if err == upspin.ErrFollowLink {
 		return node.entry.Copy(), err
 	}
@@ -177,46 +176,45 @@ func (t *Tree) Put(p path.Parsed, de *upspin.DirEntry) (*upspin.DirEntry, error)
 		return nil, err
 	}
 	// Generate log entry.
-	logEntry := &LogEntry{
-		Op:    Put,
+	logEntry := &serverlog.Entry{
+		Op:    serverlog.Put,
 		Entry: *de,
 	}
-	err = t.log.Append(logEntry)
+	err = t.user.Append(logEntry)
 	if err != nil {
-		return nil, errors.E(op, err)
+		return nil, err
 	}
-	notifyWatchers(watchers)
+	t.notifyWatchers(de.Name)
 	return de.Copy(), nil
 }
 
 // put implements the bulk of Tree.Put, but does not append to the log so it
 // can be used to recover the Tree's state from the log.
 // t.mu must be held.
-func (t *Tree) put(p path.Parsed, de *upspin.DirEntry) (*node, []*watcher, error) {
+func (t *Tree) put(p path.Parsed, de *upspin.DirEntry) (*node, error) {
+	t.sequence++
+	de.Sequence = t.sequence
 	// If putting a/b/c/d, ensure a/b/c is loaded.
 	parentPath := p.Drop(1)
-	parent, watchers, err := t.loadPath(parentPath)
+	parent, err := t.loadPath(parentPath)
 	if err == upspin.ErrFollowLink { // encountered a link along the path.
-		return parent, watchers, err
+		return parent, err
 	}
 	if err != nil {
-		return nil, watchers, err
+		return nil, err
 	}
 	if parent.entry.IsLink() {
-		return parent, watchers, upspin.ErrFollowLink
+		return parent, upspin.ErrFollowLink
 	}
 	// Now add this dirEntry as a new node
 	node := &node{
 		entry: *de,
 	}
-	// If any parent watchers were watching this node, move them to this
-	// node.
-	moveDownWatchers(node, parent)
 	err = t.addKid(node, p, parent, parentPath)
 	if err != nil {
-		return nil, watchers, err
+		return nil, err
 	}
-	return node, watchers, nil
+	return node, nil
 }
 
 // PutDir puts a DirEntry representing an existing directory (with existing
@@ -224,13 +222,23 @@ func (t *Tree) put(p path.Parsed, de *upspin.DirEntry) (*node, []*watcher, error
 // element of dstDir must not yet exist. dstDir must not cross a link nor be
 // the root directory. It returns the newly put entry.
 func (t *Tree) PutDir(dstDir path.Parsed, de *upspin.DirEntry) (*upspin.DirEntry, error) {
-	const op = "dir/server/tree.PutDir"
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	if dstDir.IsRoot() {
 		// TODO: handle this later. It might come in handy for reinstating an old root.
-		return nil, errors.E(op, errors.Invalid, errors.Str("can't PutDir at the root"))
+		return nil, errors.E(errors.Invalid, "can't PutDir at the root")
+	}
+
+	// The destination must not exist nor cross a link.
+	if node, err := t.loadPath(dstDir); errors.Is(errors.NotExist, err) {
+		// Destination does not exist; OK.
+	} else if err == upspin.ErrFollowLink {
+		return nil, errors.E(dstDir.Path(), errors.Errorf("destination path crosses link: %s", node.entry.Name))
+	} else if err != nil {
+		return nil, err
+	} else {
+		return nil, errors.E(dstDir.Path(), errors.Exist)
 	}
 
 	// Create a synthetic node and load its kids.
@@ -240,24 +248,34 @@ func (t *Tree) PutDir(dstDir path.Parsed, de *upspin.DirEntry) (*upspin.DirEntry
 	existingEntryNode.entry.Name = dstDir.Path()
 	err := t.loadKids(existingEntryNode)
 	if err != nil {
-		return nil, errors.E(op, err)
+		return nil, err
 	}
 
 	// Put the synthetic node into the tree at dst.
-	n, watchers, err := t.put(dstDir, &existingEntryNode.entry)
+	n, err := t.put(dstDir, &existingEntryNode.entry)
 	if err == upspin.ErrFollowLink {
-		return nil, errors.E(op, errors.Invalid, dstDir.Path(), errors.Str("path cannot contain a link"))
+		return nil, errors.E(errors.Invalid, dstDir.Path(), "path cannot contain a link")
 	}
 	if err != nil {
-		return nil, errors.E(op, err)
+		return nil, err
 	}
-	notifyWatchers(watchers)
+	de = n.entry.Copy()
+	// Generate log entry.
+	logEntry := &serverlog.Entry{
+		Op:    serverlog.Put,
+		Entry: *de,
+	}
+	err = t.user.Append(logEntry)
+	if err != nil {
+		return nil, err
+	}
+	t.notifyWatchers(de.Name)
 	// Flush now to create a new version of the root.
 	err = t.flush() // TODO: avoid this. Create a log operation PutDir.
 	if err != nil {
-		return nil, errors.E(op, err)
+		return nil, err
 	}
-	return n.entry.Copy(), nil
+	return de, nil
 }
 
 // addKid adds a node n with path nodePath as the kid of parent, whose path is parentPath.
@@ -280,7 +298,7 @@ func (t *Tree) addKid(n *node, nodePath path.Parsed, parent *node, parentPath pa
 	}
 	nElem := parentPath.NElem()
 	if nodePath.Drop(1).Path() != parentPath.Path() {
-		err := errors.E(nodePath.Path(), errors.Internal, errors.Str("parent path does match parent of dir path"))
+		err := errors.E(nodePath.Path(), errors.Internal, "parent path does match parent of dir path")
 		log.Error.Print(err)
 		return err
 	}
@@ -299,7 +317,7 @@ func (t *Tree) addKid(n *node, nodePath path.Parsed, parent *node, parentPath pa
 func (t *Tree) markDirty(p path.Parsed) error {
 	// Do we have room to track the max path depth in p?
 	if n := p.NElem() + 1; len(t.dirtyNodes) < n { // +1 for the root.
-		newDirtyNodes := make([]map[*node]bool, n)
+		newDirtyNodes := make([]map[*node]struct{}, n)
 		copy(newDirtyNodes, t.dirtyNodes)
 		t.dirtyNodes = newDirtyNodes
 	}
@@ -320,7 +338,7 @@ func (t *Tree) markDirty(p path.Parsed) error {
 		// only their parents (directories), which have their kids'
 		// names and references packed in them.
 		if !n.entry.IsDir() {
-			err := errors.E(errors.Internal, n.entry.Name, errors.Str("marking non-dir dirty"))
+			err := errors.E(errors.Internal, n.entry.Name, "marking non-dir dirty")
 			log.Error.Printf("%s", err)
 			return err
 		}
@@ -335,10 +353,10 @@ func (t *Tree) markDirty(p path.Parsed) error {
 func (t *Tree) setNodeDirtyAt(level int, n *node) {
 	n.dirty = true
 	if t.dirtyNodes[level] == nil {
-		t.dirtyNodes[level] = make(map[*node]bool)
+		t.dirtyNodes[level] = make(map[*node]struct{})
 	}
-	t.dirtyNodes[level][n] = true // repetitions don't matter.
-	n.entry.Sequence++
+	t.dirtyNodes[level][n] = struct{}{} // repetitions don't matter.
+	n.entry.Sequence = t.sequence
 }
 
 // loadPath ensures the tree contains all nodes up to p and returns p's node.
@@ -346,34 +364,28 @@ func (t *Tree) setNodeDirtyAt(level int, n *node) {
 // If while loading the path a link is discovered, the link is returned and if
 // it's not the last element of the path, ErrFollowLink is returned. If the node
 // does not exist, loadPath returns a NotExist error and the closest existing
-// ancestor of p, if any. Along with node, loadPath also returns all watchers on
-// p's node and in all of p's node's ancestors.
+// ancestor of p, if any.
 // t.mu must be held.
-func (t *Tree) loadPath(p path.Parsed) (*node, []*watcher, error) {
+func (t *Tree) loadPath(p path.Parsed) (*node, error) {
 	err := t.loadRoot()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	node := t.root
-	// Keep track of all of p's ancestors watchers.
-	removeDeadWatchers(node)
-	watchers := append([]*watcher(nil), node.watchers...)
 	for i := 0; i < p.NElem(); i++ {
 		child, err := t.loadNode(node, p.Elem(i))
-		if errors.Match(errors.E(errors.NotExist), err) {
-			return node, watchers, err
+		if errors.Is(errors.NotExist, err) {
+			return node, err
 		}
 		node = child
 		if err != nil {
-			return node, watchers, err // err could be upspin.ErrFollowLink.
+			return node, err // err could be upspin.ErrFollowLink.
 		}
-		removeDeadWatchers(node)
-		watchers = append(watchers, node.watchers...)
 	}
 	if node.entry.Name != p.Path() {
-		return node, watchers, errors.E(errors.NotExist, p.Path())
+		return node, errors.E(errors.NotExist, p.Path())
 	}
-	return node, watchers, nil
+	return node, nil
 }
 
 // loadDir loads the contents of a directory's node if it's not already loaded.
@@ -416,14 +428,17 @@ func (t *Tree) loadNode(parent *node, elem string) (*node, error) {
 // loadKids loads all kids of a parent node from the Store.
 // t.mu must be held.
 func (t *Tree) loadKids(parent *node) error {
-	data, err := clientutil.ReadAll(t.config, &parent.entry)
+	if parent.dirty {
+		return errors.E(errors.Internal, parent.entry.Name, "trying to load a block from storage when the node is dirty")
+	}
+	if len(parent.kids) > 0 {
+		return errors.E(errors.Internal, parent.entry.Name, "attempt to reload kids for populated node")
+	}
+	kids, err := t.load(&parent.entry)
 	if err != nil {
 		return err
 	}
-	err = loadKidsFromBlock(parent, data)
-	if err != nil {
-		return err
-	}
+	parent.kids = kids
 	return nil
 }
 
@@ -433,40 +448,40 @@ func (t *Tree) loadRoot() error {
 	if t.root != nil {
 		return nil
 	}
-	rootDirEntry, err := t.logIndex.Root()
+	rootDirEntry, err := t.user.Root()
 	if err != nil {
 		return err
 	}
 	if rootDirEntry == nil {
-		return errors.E(errors.NotExist, t.user)
+		return errors.E(errors.NotExist, t.user.Name())
 	}
 	t.root = &node{
 		entry: *rootDirEntry,
 	}
+	t.sequence = rootDirEntry.Sequence
 	return nil
 }
 
 // createRoot creates the root at p using the given dir entry. A root must not already exist.
 // t.mu must be held.
 func (t *Tree) createRoot(p path.Parsed, de *upspin.DirEntry) error {
-	const op = "dir/server/tree.createRoot"
 	// Do we have a root already?
 	if t.root != nil {
 		// Root already exists.
-		return errors.E(op, errors.Exist, errors.Str("root already created"))
+		return errors.E(errors.Exist, "root already created")
 	}
 	// Check that we're trying to create a root for the owner of the Tree only.
-	if p.User() != t.user {
-		return errors.E(p.User(), p.Path(), errors.Invalid, errors.Str("can't create root for another user"))
+	if p.User() != t.user.Name() {
+		return errors.E(p.User(), p.Path(), errors.Invalid, "can't create root for another user")
 	}
-	_, err := t.logIndex.Root()
-	if err != nil && !errors.Match(errors.E(errors.NotExist), err) {
+	_, err := t.user.Root()
+	if err != nil && !errors.Is(errors.NotExist, err) {
 		// Error reading the root.
 		return err
 	}
 	// To be sure, the log must be empty too (or t.root wouldn't be empty).
-	if t.log.LastOffset() != 0 {
-		err := errors.E(errors.Internal, errors.Str("index not empty, but root not found"))
+	if t.user.AppendOffset() != 0 {
+		err := errors.E(errors.Internal, "index not empty, but root not found")
 		log.Error.Print(err)
 		return err
 	}
@@ -475,6 +490,8 @@ func (t *Tree) createRoot(p path.Parsed, de *upspin.DirEntry) error {
 		entry: *de,
 	}
 	t.root = node
+	t.sequence = upspin.SeqBase
+	de.Sequence = upspin.SeqBase
 	err = t.markDirty(p)
 	if err != nil {
 		return err
@@ -482,7 +499,7 @@ func (t *Tree) createRoot(p path.Parsed, de *upspin.DirEntry) error {
 	// The root of the tree must be flushed immediately or its recovery
 	// becomes cumbersome. Nothing else exists prior to a root existing,
 	// so only the root will be flushed.
-	log.Printf("Created root: %s", p)
+	log.Debug.Printf("Created root: %s", p)
 	return t.flush()
 }
 
@@ -497,23 +514,25 @@ func (t *Tree) createRoot(p path.Parsed, de *upspin.DirEntry) error {
 // upspin.ErrFollowLink. (And in that case, only one DirEntry will be
 // returned, that of the link itself.)
 func (t *Tree) List(prefix path.Parsed) ([]*upspin.DirEntry, bool, error) {
-	const op = "dir/server/tree.List"
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	node, _, err := t.loadPath(prefix)
+	node, err := t.loadPath(prefix)
 	if err == upspin.ErrFollowLink {
 		return []*upspin.DirEntry{node.entry.Copy()}, node.dirty, err
 	}
 	if err != nil {
-		return nil, false, errors.E(op, err)
+		return nil, false, err
+	}
+	if node.entry.IsLink() {
+		return []*upspin.DirEntry{node.entry.Copy()}, node.dirty, upspin.ErrFollowLink
 	}
 	if !node.entry.IsDir() {
 		return []*upspin.DirEntry{node.entry.Copy()}, node.dirty, nil
 	}
 	err = t.loadDir(node)
 	if err != nil {
-		return nil, false, errors.E(op, err)
+		return nil, false, err
 	}
 	dirty := node.dirty
 	var entries []*upspin.DirEntry
@@ -533,7 +552,6 @@ func (t *Tree) List(prefix path.Parsed) ([]*upspin.DirEntry, bool, error) {
 // returned DirEntry will be nil whether the operation succeeded
 // or not.
 func (t *Tree) Delete(p path.Parsed) (*upspin.DirEntry, error) {
-	const op = "dir/server/tree.Delete"
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -541,53 +559,57 @@ func (t *Tree) Delete(p path.Parsed) (*upspin.DirEntry, error) {
 		return nil, t.deleteRoot()
 	}
 
-	node, watchers, err := t.delete(p)
+	node, err := t.delete(p)
 	if err == upspin.ErrFollowLink {
 		return node.entry.Copy(), err
 	}
 	if err != nil {
-		return nil, errors.E(op, err)
+		return nil, err
 	}
 	// Generate log entry.
-	logEntry := &LogEntry{
-		Op:    Delete,
+	logEntry := &serverlog.Entry{
+		Op:    serverlog.Delete,
 		Entry: node.entry,
 	}
-	err = t.log.Append(logEntry)
+	err = t.user.Append(logEntry)
 	if err != nil {
-		return nil, errors.E(op, err)
+		return nil, err
 	}
-	notifyWatchers(watchers)
+	t.notifyWatchers(node.entry.Name)
 	return node.entry.Copy(), err
 }
 
 // delete implements the bulk of Tree.Delete, but does not append to the log
 // so it can be used to recover from the Tree's state from the log.
 // t.mu must be held.
-func (t *Tree) delete(p path.Parsed) (*node, []*watcher, error) {
+func (t *Tree) delete(p path.Parsed) (*node, error) {
 	parentPath := p.Drop(1)
-	parent, watchers, err := t.loadPath(parentPath)
+	parent, err := t.loadPath(parentPath)
 	if err == upspin.ErrFollowLink {
-		return parent, watchers, err
+		return parent, err
 	}
 	if err != nil {
-		return nil, watchers, err
+		return nil, err
 	}
 	// Load the node of interest, which is the NElem-th element in its
 	// parent's path.
 	elem := p.Elem(parentPath.NElem())
 	node, err := t.loadNode(parent, elem)
 	if err == upspin.ErrFollowLink {
-		return node, watchers, err
+		return node, err
 	}
 	if err != nil {
 		// Can't load parent.
-		return nil, watchers, err
+		return nil, err
 	}
 	if len(node.kids) > 0 {
 		// Node is a non-empty directory.
-		return nil, watchers, errors.E(errors.NotEmpty, p.Path())
+		return nil, errors.E(errors.NotEmpty, p.Path())
 	}
+
+	t.sequence++                     // We know it will succeed now.
+	node.entry.Sequence = t.sequence // Updated sequence will be logged.
+
 	// Remove this elem from the parent's kids map.
 	// No need to check if it was there -- it wouldn't have loaded if it weren't.
 	delete(parent.kids, elem)
@@ -595,26 +617,23 @@ func (t *Tree) delete(p path.Parsed) (*node, []*watcher, error) {
 	// If node was dirty, there's no need to flush it to Store ever.
 	t.removeFromDirtyList(p, node)
 
-	// If there were watchers on this node, move them to the parent.
-	parent.watchers = append(parent.watchers, node.watchers...)
-
 	// Update parent: mark it dirty and log its new version.
 	err = t.markDirty(parentPath)
 	if err != nil {
 		// In practice this can't happen, since the entire path is
 		// already loaded.
-		return nil, watchers, err
+		return nil, err
 	}
-	return node, watchers, nil
+	return node, nil
 }
 
 // deleteRoot deletes the root, if it's empty.
 // t.mu must be held.
 func (t *Tree) deleteRoot() error {
 	if t.root == nil {
-		return errors.E(errors.NotExist, errors.Str("root does not exist"))
+		return errors.E(errors.NotExist, "root does not exist")
 	}
-	log.Printf("Deleting root %q", t.root.entry.Name)
+	log.Debug.Printf("Deleting root %q", t.root.entry.Name)
 	if len(t.root.kids) > 0 {
 		// Root is not empty.
 		return errors.E(errors.NotEmpty, t.root.entry.Name)
@@ -628,11 +647,11 @@ func (t *Tree) deleteRoot() error {
 	}
 	// We're all caught up now. Hopefully, some other entry somewhere has a
 	// link to this root, because we're about to lose it forever.
-	err = t.logIndex.DeleteRoot()
+	err = t.user.DeleteRoot()
 	if err != nil {
 		return err
 	}
-	err = t.log.Truncate(0)
+	err = t.user.Truncate(0)
 	if err != nil {
 		return err
 	}
@@ -655,14 +674,12 @@ func (t *Tree) removeFromDirtyList(p path.Parsed, n *node) {
 
 // Flush flushes all dirty dir entries to the Tree's Store.
 func (t *Tree) Flush() error {
-	const op = "dir/server/tree.Flush"
-
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	err := t.loadRoot()
 	if err != nil {
-		return errors.E(op, err)
+		return err
 	}
 
 	return t.flush()
@@ -671,7 +688,6 @@ func (t *Tree) Flush() error {
 // flush flushes all dirty entries.
 // t.mu must be held.
 func (t *Tree) flush() error {
-	const op = "dir/server/tree.Flush"
 
 	if t.root == nil {
 		// Nothing to do.
@@ -683,9 +699,9 @@ func (t *Tree) flush() error {
 		m := t.dirtyNodes[i]
 		// For each node at level i, flush it.
 		for n := range m {
-			err := t.store(n)
+			err := t.store(&n.entry, n.kids)
 			if err != nil {
-				return errors.E(op, err)
+				return err
 			}
 			n.dirty = false
 		}
@@ -697,20 +713,26 @@ func (t *Tree) flush() error {
 	// (it could have more because of deletes).
 
 	// Save the last index we operated on.
-	err := t.logIndex.SaveOffset(t.log.LastOffset())
+	err := t.user.SaveOffset(t.user.AppendOffset())
 	if err != nil {
-		return errors.E(op, err)
+		return err
 	}
 
 	// Save new root to the log index.
-	return t.logIndex.SaveRoot(&t.root.entry)
+	return t.user.SaveRoot(&t.root.entry)
 }
 
 // Close flushes all dirty blocks to Store and releases all resources
 // used by the tree. Further uses of the tree will have unpredictable
 // results.
 func (t *Tree) Close() error {
-	const op = "dir/server/tree.Close"
+	// Notify watchers and any other goroutine that the tree is closing
+	// immediately.
+	t.mu.Lock()
+	close(t.shutdown)
+	t.mu.Unlock()
+	t.watcherWG.Wait()
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -721,49 +743,46 @@ func (t *Tree) Close() error {
 		}
 	}
 
-	check(t.flush())
-	check(t.log.Close())
-	check(t.logIndex.Close())
+	check(t.user.Close())
 
 	if firstErr != nil {
-		return errors.E(op, firstErr)
+		return errors.E(firstErr)
 	}
 
 	return nil
 }
 
-// recoverFromLog inspects the LogIndex and the Log and replays the missing
+// recoverFromLog inspects the user's Logs and replays the missing
 // operations. It can only be called from New.
 func (t *Tree) recoverFromLog() error {
-	const op = "dir/server/tree.recoverFromLog"
-	lastOffset := t.log.LastOffset()
-	lastProcessed, err := t.logIndex.ReadOffset()
+	lastOffset := t.user.AppendOffset()
+	lastProcessed, err := t.user.ReadOffset()
 	if err != nil {
 		return err
 	}
 	if lastOffset == lastProcessed {
 		// All caught up.
-		log.Debug.Printf("%s: Tree is all caught up for user %s", op, t.user)
+		log.Debug.Printf("recoverFromLog: Tree is all caught up for user %s", t.user.Name())
 		return nil
 	}
 	err = t.loadRoot()
 	if err != nil {
-		return errors.E(op, err)
+		return err
 	}
 
 	// Tree is not current. Replay all entries from the log.
+	lrd, err := t.user.NewReader()
+	if err != nil {
+		return err
+	}
 	recovered := 0
 	curr := lastProcessed
 	for {
-		log.Debug.Printf("%s: Recovering from log... %d", op, curr)
-		logEntry, next, err := t.log.ReadAt(curr)
+		log.Debug.Printf("recoverFromLog: Recovering from log... %d", curr)
+		logEntry, next, err := lrd.ReadAt(curr)
 		if err != nil {
-			log.Error.Printf("%s: Error in log recovery, possible data loss at offset %d: %s", op, lastProcessed, err)
-			err = t.log.Truncate(curr)
-			if err != nil {
-				return errors.E(op, err)
-			}
-			return nil
+			log.Error.Printf("recoverFromLog: Error in log recovery, possible data loss at offset %d: %s", lastProcessed, err)
+			return t.user.Truncate(curr)
 		}
 		if next == curr {
 			break
@@ -775,46 +794,45 @@ func (t *Tree) recoverFromLog() error {
 			// We don't expect this to fail because
 			// de.Name was in the log already and thus
 			// has been validated.
-			return errors.E(op, err)
+			return err
 		}
 
 		switch logEntry.Op {
-		case Put:
-			log.Debug.Printf("%s: Putting dirEntry: %q", op, de.Name)
-			_, _, err = t.put(p, &de)
-		case Delete:
-			log.Debug.Printf("%s: Deleting path: %q", op, p.Path())
-			_, _, err = t.delete(p)
+		case serverlog.Put:
+			log.Debug.Printf("recoverFromLog: Putting dirEntry: %q", de.Name)
+			_, err = t.put(p, &de)
+		case serverlog.Delete:
+			log.Debug.Printf("recoverFromLog: Deleting path: %q", p.Path())
+			_, err = t.delete(p)
 		default:
-			return errors.E(op, errors.Internal, errors.Errorf("no such log operation: %v", logEntry.Op))
+			return errors.E(errors.Internal, errors.Errorf("no such log operation: %v", logEntry.Op))
 		}
 		if err != nil {
 			// Now we're in serious trouble. We can't recover.
-			return errors.E(op, t.user, errors.Errorf("can't recover log: %v", err))
+			return errors.E(t.user.Name(), errors.Errorf("can't recover log: %v", err))
 		}
 		recovered++
 		curr = next
 	}
-	log.Debug.Printf("%s: %d entries recovered. Tree is current.", op, recovered)
-	log.Debug.Printf("%s: Tree:\n%s\n", op, t)
+	log.Debug.Printf("recoverFromLog: %d entries recovered. Tree is current.", recovered)
+	log.Debug.Printf("recoverFromLog: Tree:\n%s\n", t)
 	return nil
 }
 
 // OnEviction implements cache.EvictionNotifier.
 func (t *Tree) OnEviction(key interface{}) {
-	const op = "dir/server/tree.OnEviction"
-	log.Debug.Printf("%s: tree being evicted: %s", op, t.log.User())
+	log.Debug.Printf("OnEviction: tree being evicted: %s", t.user.Name())
 	// We do not call t.Close here because we can't be sure the DirServer
 	// is done using us. But because this is likely our last chance to clean
 	// up, we set a finalizer.
 	err := t.Flush()
 	if err != nil {
-		log.Error.Printf("%s: flush: %v", op, err)
+		log.Error.Printf("OnEviction: flush: %v", err)
 	}
 	runtime.SetFinalizer(t, func(t *Tree) {
 		err := t.Close()
 		if err != nil {
-			log.Error.Printf("%s: finalizing tree: %s", op, err)
+			log.Error.Printf("OnEviction: finalizing tree: %s", err)
 		}
 	})
 }

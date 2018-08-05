@@ -18,8 +18,8 @@ import (
 
 func (s *State) repack(args ...string) {
 	const help = `
-Repack rewrites the data referred to by each path , storing it again using the
-packing specificied by its -pack option, ee by default. If the data is already
+Repack rewrites the data referred to by each path, storing it again using the
+packing specified by its -pack option, ee by default. If the data is already
 packed with the specified packing, the data is untouched unless the -f (force)
 flag is specified, which can be helpful if the data is to be repacked using a
 fresh key.
@@ -116,7 +116,7 @@ func (s *State) repackFileOrDir(entry *upspin.DirEntry, packer upspin.Packer, fo
 		s.Exit(err)
 	}
 	// Scary moment!
-	err = s.Client.Rename(new.Name(), old.Name())
+	_, err = s.Client.Rename(new.Name(), old.Name())
 	if err != nil {
 		log.Printf("rename failed, but repacked contents are now in %q", new.Name())
 		s.Exit(err)
