@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -19,8 +18,8 @@ import (
 
 	"upspin.io/bind"
 	"upspin.io/errors"
-	"upspin.io/log"
 	"upspin.io/rpc/local"
+	"upspin.io/serverutil"
 	"upspin.io/upspin"
 
 	pb "github.com/golang/protobuf/proto"
@@ -29,7 +28,6 @@ import (
 // Client is a partial upspin.Service that uses HTTP as a transport
 // and implements authentication using out-of-band headers.
 type Client interface {
-	Ping() bool
 	Close()
 
 	// Invoke calls the given RPC method ("Server/Method") with the
@@ -93,7 +91,7 @@ type httpClient struct {
 // it indicates that this connection is being used to proxy request to that
 // endpoint.
 func NewClient(cfg upspin.Config, netAddr upspin.NetAddr, security SecurityLevel, proxyFor upspin.Endpoint) (Client, error) {
-	const op = "rpc.NewClient"
+	const op errors.Op = "rpc.NewClient"
 
 	c := &httpClient{
 		proxyFor: proxyFor,
@@ -104,12 +102,16 @@ func NewClient(cfg upspin.Config, netAddr upspin.NetAddr, security SecurityLevel
 	switch security {
 	case NoSecurity:
 		// Only allow insecure connections to the loop back network.
-		if !isLocal(string(netAddr)) {
+		if !serverutil.IsLoopback(string(netAddr)) {
 			return nil, errors.E(op, errors.IO, errors.Errorf("insecure dial to non-loopback destination %q", netAddr))
 		}
 		c.baseURL = "http://" + string(netAddr)
 	case Secure:
-		tlsConfig = &tls.Config{RootCAs: cfg.CertPool()}
+		certPool, err := CertPoolFromConfig(cfg)
+		if err != nil {
+			return nil, errors.E(op, errors.Invalid, err)
+		}
+		tlsConfig = &tls.Config{RootCAs: certPool}
 		c.baseURL = "https://" + string(netAddr)
 	default:
 		return nil, errors.E(op, errors.Invalid, errors.Errorf("invalid security level to NewClient: %v", security))
@@ -125,11 +127,12 @@ func NewClient(cfg upspin.Config, netAddr upspin.NetAddr, security SecurityLevel
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
-	// TOOD(adg): Re-enable HTTP/2 once it's fast enough to be usable.
+	// TODO(adg): Re-enable HTTP/2 once it's fast enough to be usable.
 	//if err := http2.ConfigureTransport(t); err != nil {
 	//	return nil, errors.E(op, err)
 	//}
@@ -138,7 +141,7 @@ func NewClient(cfg upspin.Config, netAddr upspin.NetAddr, security SecurityLevel
 	return c, nil
 }
 
-func (c *httpClient) makeAuthenticatedRequest(op, method string, req pb.Message) (*http.Response, bool, error) {
+func (c *httpClient) makeAuthenticatedRequest(op errors.Op, method string, req pb.Message) (*http.Response, bool, error) {
 	token, haveToken := c.authToken()
 	header := make(http.Header)
 	needServerAuth := false
@@ -149,7 +152,6 @@ func (c *httpClient) makeAuthenticatedRequest(op, method string, req pb.Message)
 		// Otherwise prepare an auth request.
 		authMsg, err := signUser(c.config, clientAuthMagic, serverAddr(c))
 		if err != nil {
-			log.Error.Printf("%s: signUser: %s using key %s", op, err, c.config.Factotum().PublicKey())
 			return nil, false, errors.E(op, err)
 		}
 		header.Set(authRequestHeader, strings.Join(authMsg, ","))
@@ -162,7 +164,7 @@ func (c *httpClient) makeAuthenticatedRequest(op, method string, req pb.Message)
 	return resp, needServerAuth, err
 }
 
-func (c *httpClient) makeRequest(op, method string, req pb.Message, header http.Header) (*http.Response, error) {
+func (c *httpClient) makeRequest(op errors.Op, method string, req pb.Message, header http.Header) (*http.Response, error) {
 	// Encode the payload.
 	payload, err := pb.Marshal(req)
 	if err != nil {
@@ -181,13 +183,12 @@ func (c *httpClient) makeRequest(op, method string, req pb.Message, header http.
 	if err != nil {
 		return nil, errors.E(op, errors.IO, err)
 	}
-	c.setLastActivity()
 	return resp, nil
 }
 
 // InvokeUnauthenticated implements Client.
 func (c *httpClient) InvokeUnauthenticated(method string, req, resp pb.Message) error {
-	const op = "rpc.InvokeUnauthenticated"
+	const op errors.Op = "rpc.InvokeUnauthenticated"
 
 	httpResp, err := c.makeRequest(op, method, req, make(http.Header))
 	if err != nil {
@@ -199,10 +200,10 @@ func (c *httpClient) InvokeUnauthenticated(method string, req, resp pb.Message) 
 
 // Invoke implements Client.
 func (c *httpClient) Invoke(method string, req, resp pb.Message, stream ResponseChan, done <-chan struct{}) error {
-	const op = "rpc.Invoke"
+	const op errors.Op = "rpc.Invoke"
 
 	if (resp == nil) == (stream == nil) {
-		return errors.E(op, errors.Str("exactly one of resp and stream must be nil"))
+		return errors.E(op, "exactly one of resp and stream must be nil")
 	}
 
 	var httpResp *http.Response
@@ -216,6 +217,13 @@ func (c *httpClient) Invoke(method string, req, resp pb.Message, stream Response
 		if httpResp.StatusCode != http.StatusOK {
 			msg, _ := ioutil.ReadAll(httpResp.Body)
 			httpResp.Body.Close()
+			if httpResp.Header.Get("Content-type") == "application/octet-stream" {
+				err := errors.UnmarshalError(msg)
+				if err.Error() == upspin.ErrNotSupported.Error() {
+					return upspin.ErrNotSupported
+				}
+				return errors.E(op, err)
+			}
 			// TODO(edpin,adg): unmarshal and check as it's more robust.
 			if bytes.Contains(msg, []byte(errUnauthenticated.Error())) {
 				// If the server restarted it will have forgotten about
@@ -243,7 +251,7 @@ func (c *httpClient) Invoke(method string, req, resp pb.Message, stream Response
 		authErr := httpResp.Header.Get(authErrorHeader)
 		if len(authErr) > 0 {
 			body.Close()
-			return errors.E(op, errors.Permission, errors.Str(authErr))
+			return errors.E(op, errors.Permission, authErr)
 		}
 		// No authentication token returned, but no error either.
 		// Proceed.
@@ -256,7 +264,7 @@ func (c *httpClient) Invoke(method string, req, resp pb.Message, stream Response
 		msg, ok := httpResp.Header[authRequestHeader]
 		if !ok {
 			body.Close()
-			return errors.E(op, errors.Permission, errors.Str("proxy server must authenticate"))
+			return errors.E(op, errors.Permission, "proxy server must authenticate")
 		}
 		if err := c.verifyServerUser(msg); err != nil {
 			body.Close()
@@ -270,7 +278,7 @@ func (c *httpClient) Invoke(method string, req, resp pb.Message, stream Response
 	return nil
 }
 
-func readResponse(op string, body io.ReadCloser, resp pb.Message) error {
+func readResponse(op errors.Op, body io.ReadCloser, resp pb.Message) error {
 	respBytes, err := ioutil.ReadAll(body)
 	body.Close()
 	if err != nil {
@@ -299,7 +307,8 @@ func decodeStream(stream ResponseChan, r io.ReadCloser, done <-chan struct{}) {
 		return
 	}
 	if ok[0] != 'O' || ok[1] != 'K' {
-		stream.Error(errors.E(errors.IO, errors.Str("unexpected stream preamble")))
+		stream.Error(errors.E(errors.IO, "unexpected stream preamble"))
+		return
 	}
 
 	var msgLen [4]byte
@@ -317,6 +326,11 @@ func decodeStream(stream ResponseChan, r io.ReadCloser, done <-chan struct{}) {
 
 		l := binary.BigEndian.Uint32(msgLen[:])
 
+		const reasonableMessageSize = 1 << 26 // 64MB
+		if l > reasonableMessageSize {
+			stream.Error(errors.E(errors.Invalid, errors.Errorf("message too long (%d bytes)", l)))
+			return
+		}
 		if cap(buf) < int(l) {
 			buf = make([]byte, l)
 		} else {
@@ -357,60 +371,20 @@ func readFull(r io.Reader, b []byte, done <-chan struct{}) (int, error) {
 	}
 }
 
-func isLocal(addr string) bool {
-	// Check for local IPC.
-	if local.IsLocal(addr) {
-		return true
-	}
-
-	// Check for loopback network.
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return false
-	}
-	ips, err := net.LookupIP(host)
-	if err != nil {
-		return false
-	}
-	for _, ip := range ips {
-		if !ip.IsLoopback() {
-			return false
-		}
-	}
-	return true
-}
-
 func (c *httpClient) isProxy() bool {
 	return c.proxyFor.Transport != upspin.Unassigned
 }
 
 // Stubs for unused methods.
-func (c *httpClient) Ping() bool { return true }
-func (c *httpClient) Close()     {}
+func (c *httpClient) Close() {}
 
 // clientAuth tracks the auth token and its freshness.
 type clientAuth struct {
 	config upspin.Config
 
-	mu              sync.Mutex // protects the fields below.
-	token           string
-	lastRefresh     time.Time
-	lastNetActivity time.Time // last known time of some network activity.
-}
-
-// lastActivity reports the time of the last known network activity.
-func (ca *clientAuth) lastActivity() time.Time {
-	ca.mu.Lock()
-	defer ca.mu.Unlock()
-	return ca.lastNetActivity
-}
-
-// setLastActivity records the current time as that of the last known network activity.
-// It is used to prevent unnecessarily frequent pings.
-func (ca *clientAuth) setLastActivity() {
-	ca.mu.Lock()
-	ca.lastNetActivity = time.Now()
-	ca.mu.Unlock()
+	mu          sync.Mutex // protects the fields below.
+	token       string
+	lastRefresh time.Time
 }
 
 // invalidateSession forgets the authentication token.
@@ -471,10 +445,5 @@ func (ca *clientAuth) verifyServerUser(msg []string) error {
 	}
 
 	// Validate signature.
-	err = verifyUser(key.PublicKey, msg, serverAuthMagic, "[localproxy]", time.Now())
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return verifyUser(key.PublicKey, msg, serverAuthMagic, "[localproxy]", time.Now())
 }

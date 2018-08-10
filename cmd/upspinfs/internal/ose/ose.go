@@ -3,7 +3,6 @@
 // license that can be found in the LICENSE file.
 
 // +build !windows
-// +build !openbsd
 
 /*
 Package ose is a version of the file ops from the os package using encrypted files.
@@ -26,6 +25,8 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 
+	"upspin.io/cache"
+
 	"fmt"
 	"os"
 	"sync"
@@ -40,19 +41,28 @@ const (
 	O_EXCL   = os.O_EXCL   // used with O_CREATE, file must not exist
 	O_SYNC   = os.O_SYNC   // open for synchronous I/O.
 	O_TRUNC  = os.O_TRUNC  // if possible, truncate file when opened.
+
+	// maxUnopenedCached is the maximum number of unopened files cached.
+	maxUnopenedCached = 200
 )
 
 var state = struct {
 	sync.Mutex
-	mapping map[string]*File
-}{mapping: make(map[string]*File)}
+	nameToFile map[string]*File
+	toRemove   *cache.LRU
+}{
+	nameToFile: make(map[string]*File),
+	toRemove:   cache.NewLRU(maxUnopenedCached),
+}
 
 // File represents an encrypted file.
+// There are no holes, in other words the disk file is not sparse.
 type File struct {
 	name string
 	f    *os.File
 	benc cipher.Block
 	refs int
+	size int64
 }
 
 // OpenFile opens an encrypted file.
@@ -63,7 +73,11 @@ func OpenFile(name string, flag int, mode os.FileMode) (*File, error) {
 	}
 	state.Lock()
 	defer state.Unlock()
-	file, ok := state.mapping[name]
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	file, ok := state.nameToFile[name]
 	if ok {
 		file.f.Close()
 	} else {
@@ -72,10 +86,12 @@ func OpenFile(name string, flag int, mode os.FileMode) (*File, error) {
 			return nil, err
 		}
 		file = &File{name: name, benc: benc}
-		state.mapping[name] = file
+		state.nameToFile[name] = file
 	}
 	file.f = f
 	file.refs++
+	file.size = st.Size()
+	state.toRemove.Remove(file.name)
 	return file, nil
 }
 
@@ -87,7 +103,7 @@ func Create(name string) (*File, error) {
 	}
 	state.Lock()
 	defer state.Unlock()
-	file, ok := state.mapping[name]
+	file, ok := state.nameToFile[name]
 	if ok {
 		file.f.Close()
 	} else {
@@ -96,10 +112,12 @@ func Create(name string) (*File, error) {
 			return nil, err
 		}
 		file = &File{name: name, benc: benc}
-		state.mapping[name] = file
+		state.nameToFile[name] = file
 	}
 	file.f = f
 	file.refs++
+	file.size = 0
+	state.toRemove.Remove(file.name)
 	return file, nil
 }
 
@@ -107,16 +125,17 @@ func Create(name string) (*File, error) {
 func Rename(from, to string) error {
 	state.Lock()
 	defer state.Unlock()
-	file, ok := state.mapping[from]
+	file, ok := state.nameToFile[from]
 	if !ok {
 		return fmt.Errorf("old file doesn't exist: %s", from)
 	}
 	if err := os.Rename(from, to); err != nil {
 		return err
 	}
-	delete(state.mapping, from)
-	state.mapping[to] = file
+	delete(state.nameToFile, from)
+	state.nameToFile[to] = file
 	file.name = to
+	state.toRemove.Remove(file.name)
 	return nil
 }
 
@@ -132,7 +151,9 @@ func MkdirAll(name string, mode os.FileMode) error {
 
 // Remove removes the named file.
 func Remove(name string) error {
-	delete(state.mapping, name)
+	state.Lock()
+	defer state.Unlock()
+	delete(state.nameToFile, name)
 	return os.Remove(name)
 }
 
@@ -143,7 +164,17 @@ func RemoveAll(subtree string) error {
 
 // Truncate shortens a file.
 func Truncate(name string, size int64) error {
-	return os.Truncate(name, size)
+	state.Lock()
+	defer state.Unlock()
+	file, ok := state.nameToFile[name]
+	if !ok {
+		return fmt.Errorf("file to truncate doesn't exist: %s", name)
+	}
+	err := os.Truncate(name, size)
+	if err == nil {
+		file.size = size
+	}
+	return err
 }
 
 // Close closes a file. If the ref count goes to zero, the file is removed.
@@ -154,7 +185,7 @@ func (file *File) Close() error {
 	if file.refs != 0 {
 		return nil
 	}
-	os.Remove(file.name)
+	state.toRemove.Add(file.name, evictable(true))
 	return file.f.Close()
 }
 
@@ -181,10 +212,39 @@ func (file *File) ReadAt(b []byte, off int64) (int, error) {
 }
 
 // WriteAt encrypts the content and writes it to the file.
-// Unlile os.WriteAt, this changes the contents of b.
+// Unlike os.WriteAt, this changes the contents of b.
 func (file *File) WriteAt(b []byte, off int64) (int, error) {
+	if off > file.size {
+		// This WriteAt implicitly extends the file. Fill the hole.
+		state.Lock()
+		for off > file.size {
+			m := off - file.size
+			if m > 1024*1024 {
+				m = 1024 * 1024
+			}
+			hole := make([]byte, m)
+			file.xor(hole, file.size)
+			n, err := file.f.WriteAt(hole, file.size)
+			if err != nil {
+				state.Unlock()
+				return 0, err
+			}
+			if n == 0 {
+				state.Unlock()
+				return 0, fmt.Errorf("zero write filling hole, expected %d", len(hole))
+			}
+			file.size += int64(n)
+		}
+		state.Unlock()
+	}
 	file.xor(b, off)
-	return file.f.WriteAt(b, off)
+	n, err := file.f.WriteAt(b, off)
+	state.Lock()
+	if n > 0 && file.size < off+int64(n) {
+		file.size = off + int64(n)
+	}
+	state.Unlock()
+	return n, err
 }
 
 const aesKeyLen = 32
@@ -219,4 +279,12 @@ func (file *File) xor(b []byte, off int64) {
 		}
 		b[i] ^= mask[x]
 	}
+}
+
+// A type for LRU to call when evicting an entry.
+type evictable bool
+
+func (e evictable) OnEviction(key interface{}) {
+	// TODO(p): figure out where we might log errors.
+	os.Remove(key.(string))
 }

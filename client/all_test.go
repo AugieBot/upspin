@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
+	"strings"
 	"testing"
 
 	"upspin.io/bind"
@@ -15,6 +16,7 @@ import (
 	"upspin.io/factotum"
 	"upspin.io/flags"
 	"upspin.io/log"
+	"upspin.io/pack"
 	"upspin.io/test/testutil"
 	"upspin.io/upspin"
 
@@ -41,20 +43,20 @@ func init() {
 	}
 
 	baseCfg = config.New()
-	baseCfg = config.SetPacking(baseCfg, upspin.EEIntegrityPack)
+	baseCfg = config.SetPacking(baseCfg, upspin.EEPack)
 	baseCfg = config.SetKeyEndpoint(baseCfg, inProcess)
 	baseCfg = config.SetStoreEndpoint(baseCfg, inProcess)
 	baseCfg = config.SetDirEndpoint(baseCfg, inProcess)
 	baseCfg = config.SetFactotum(baseCfg, f)
 
 	// Create baseCfg2 with joe's keys.
-	f, err = factotum.NewFromDir(testutil.Repo("key", "testdata", "joe")) // Always use user1's keys.
+	f, err = factotum.NewFromDir(testutil.Repo("key", "testdata", "test")) // Always use test's keys.
 	if err != nil {
 		panic("cannot initialize factotum: " + err.Error())
 	}
 
 	baseCfg2 = config.New()
-	baseCfg2 = config.SetPacking(baseCfg, upspin.EEIntegrityPack)
+	baseCfg2 = config.SetPacking(baseCfg, upspin.EEPack)
 	baseCfg2 = config.SetKeyEndpoint(baseCfg, inProcess)
 	baseCfg2 = config.SetStoreEndpoint(baseCfg, inProcess)
 	baseCfg2 = config.SetDirEndpoint(baseCfg, inProcess)
@@ -74,7 +76,7 @@ func checkTransport(s upspin.Service) {
 	}
 }
 
-func setup(base upspin.Config, userName upspin.UserName, publicKey upspin.PublicKey) upspin.Config {
+func setup(base upspin.Config, userName upspin.UserName) upspin.Config {
 	cfg := config.SetUserName(base, userName)
 	key, _ := bind.KeyServer(cfg, cfg.KeyEndpoint())
 	checkTransport(key)
@@ -82,7 +84,6 @@ func setup(base upspin.Config, userName upspin.UserName, publicKey upspin.Public
 	checkTransport(dir)
 	if cfg.Factotum().PublicKey() == "" {
 		panic("empty public key")
-		// publicKey = upspin.PublicKey(fmt.Sprintf("key for %s", userName))
 	}
 	user := &upspin.User{
 		Name:      upspin.UserName(userName),
@@ -102,7 +103,7 @@ func setup(base upspin.Config, userName upspin.UserName, publicKey upspin.Public
 		Writer:     userName,
 	}
 	_, err = dir.Put(entry)
-	if err != nil {
+	if err != nil && !errors.Is(errors.Exist, err) {
 		panic(err)
 	}
 	return cfg
@@ -113,7 +114,7 @@ func TestPutGetTopLevelFile(t *testing.T) {
 		user = "user1@google.com"
 		root = user + "/"
 	)
-	client := New(setup(baseCfg, user, ""))
+	client := New(setup(baseCfg, user))
 	const (
 		fileName = root + "file"
 		text     = "hello sailor"
@@ -134,7 +135,7 @@ func TestPutGetTopLevelFile(t *testing.T) {
 const Max = 100 * 1000 // Must be > 100.
 
 func setupFileIO(user upspin.UserName, fileName upspin.PathName, max int, t *testing.T) (upspin.Client, upspin.File, []byte) {
-	client := New(setup(baseCfg, user, ""))
+	client := New(setup(baseCfg, user))
 	f, err := client.Create(fileName)
 	if err != nil {
 		t.Fatal("create file:", err)
@@ -151,7 +152,6 @@ func setupFileIO(user upspin.UserName, fileName upspin.PathName, max int, t *tes
 func TestFileSequentialAccess(t *testing.T) {
 	const (
 		user     = "user3@google.com"
-		root     = user + "/"
 		fileName = user + "/" + "file"
 	)
 	client, f, data := setupFileIO(user, fileName, Max, t)
@@ -446,7 +446,7 @@ func TestFileZeroFill(t *testing.T) {
 		user     = "zerofill@google.com"
 		fileName = user + "/" + "file"
 	)
-	client, f, _ := setupFileIO(user, fileName, 0, t)
+	client, _, _ := setupFileIO(user, fileName, 0, t)
 	// Create and write one byte 100 bytes out.
 	f, err := client.Create(fileName)
 	if err != nil {
@@ -520,7 +520,7 @@ func globAndCheck(t *testing.T, client upspin.Client, pattern string, expect ...
 
 func TestGlob(t *testing.T) {
 	const user = "multiuser@a.co"
-	client := New(setup(baseCfg, user, ""))
+	client := New(setup(baseCfg, user))
 	var err error
 
 	for _, fno := range []int{0, 1, 7, 17} {
@@ -549,7 +549,7 @@ func TestGlob(t *testing.T) {
 
 func TestPutDuplicateAndRename(t *testing.T) {
 	const user = "link@a.com"
-	client := New(setup(baseCfg, user, ""))
+	client := New(setup(baseCfg, user))
 	original := upspin.PathName(fmt.Sprintf("%s/original", user))
 	text := "the rain in spain"
 	if _, err := client.Put(original, []byte(text)); err != nil {
@@ -585,7 +585,7 @@ func TestPutDuplicateAndRename(t *testing.T) {
 
 	// Rename the new file.
 	renamed := upspin.PathName(fmt.Sprintf("%s/renamed", user))
-	if err := client.Rename(dup, renamed); err != nil {
+	if _, err := client.Rename(dup, renamed); err != nil {
 		t.Fatal("link file:", err)
 	}
 	if _, err := client.Get(dup); err == nil {
@@ -597,6 +597,44 @@ func TestPutDuplicateAndRename(t *testing.T) {
 	}
 	if string(in) != text {
 		t.Fatal(fmt.Sprintf("contents of %q and %q don't match", renamed, original))
+	}
+}
+func TestPutDuplicateDifferentUser(t *testing.T) {
+	t.Run(fmt.Sprintf("packing=ee"), func(t *testing.T) {
+		testPutDuplicateDifferentUser(t, upspin.EEPack)
+	})
+	t.Run(fmt.Sprintf("packing=eeintegrity"), func(t *testing.T) {
+		testPutDuplicateDifferentUser(t, upspin.EEIntegrityPack)
+	})
+}
+
+func testPutDuplicateDifferentUser(t *testing.T, packing upspin.Packing) {
+	const user1, user2 = "ann@example.com", "bob@example.org"
+	client1 := New(setup(config.SetPacking(baseCfg, packing), user1))
+	client2 := New(setup(config.SetPacking(baseCfg2, packing), user2))
+
+	acc := "*:" + user1 + "\nread,list:" + user2
+	if _, err := client1.Put(user1+"/Access", []byte(acc)); err != nil {
+		t.Fatal(err)
+	}
+
+	oldName := upspin.PathName(fmt.Sprintf("%s/%s-old", user1, packing))
+	text := "the rain in spain"
+	if _, err := client1.Put(oldName, []byte(text)); err != nil {
+		t.Fatal(err)
+	}
+
+	newName := upspin.PathName(fmt.Sprintf("%s/%s-new", user2, packing))
+	if _, err := client2.PutDuplicate(oldName, newName); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := client2.Get(newName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []byte(text); !bytes.Equal(got, want) {
+		t.Errorf("duplicate entry content is %q, want %q", got, want)
 	}
 }
 
@@ -612,9 +650,9 @@ func testRenames(t *testing.T, packing upspin.Packing) {
 
 	// Use different keys for the two users.
 	cfg := config.SetPacking(baseCfg, packing)
-	ownerClient := New(setup(cfg, owner, ""))
+	ownerClient := New(setup(cfg, owner))
 	cfg = config.SetPacking(baseCfg2, packing)
-	userClient := New(setup(cfg, user, ""))
+	userClient := New(setup(cfg, user))
 
 	// Allow user to use owner's directory.
 	access := upspin.PathName(fmt.Sprintf("%s/Access", owner))
@@ -629,12 +667,12 @@ func testRenames(t *testing.T, packing upspin.Packing) {
 		t.Fatal("put file:", err)
 	}
 	renamed := upspin.PathName(fmt.Sprintf("%s/user_renamed", owner))
-	if err := userClient.Rename(original, renamed); err != nil {
+	if _, err := userClient.Rename(original, renamed); err != nil {
 		t.Fatal("rename file:", err)
 	}
 
 	// Owner renames user created file.
-	if err := ownerClient.Rename(renamed, original); err != nil {
+	if _, err := ownerClient.Rename(renamed, original); err != nil {
 		t.Fatal("rename file:", err)
 	}
 	if err := ownerClient.Delete(original); err != nil {
@@ -647,16 +685,50 @@ func testRenames(t *testing.T, packing upspin.Packing) {
 		t.Fatal("put file:", err)
 	}
 	renamed = upspin.PathName(fmt.Sprintf("%s/owner_renamed", owner))
-	if err := userClient.Rename(original, renamed); err != nil {
+	if _, err := userClient.Rename(original, renamed); err != nil {
 		t.Fatal("link file:", err)
 	}
 
 	// User renames owner created file.
-	if err := userClient.Rename(renamed, original); err != nil {
+	if _, err := userClient.Rename(renamed, original); err != nil {
 		t.Fatal("link file:", err)
 	}
 	if err := userClient.Delete(original); err != nil {
 		t.Fatal("delete file:", err)
+	}
+}
+
+func TestSetTimes(t *testing.T) {
+	testSetTimes(t, upspin.PlainPack)
+	testSetTimes(t, upspin.EEPack)
+	testSetTimes(t, upspin.EEIntegrityPack)
+}
+
+func testSetTimes(t *testing.T, packing upspin.Packing) {
+	owner := upspin.UserName(fmt.Sprintf("owner@%d.testsettimes.com", packing))
+	cfg := config.SetPacking(baseCfg, packing)
+	client := New(setup(cfg, owner))
+	text := "the rain in spain"
+
+	// Create.
+	path := upspin.PathName(fmt.Sprintf("%s/file", owner))
+	oldDirEntry, err := client.Put(path, []byte(text))
+	if err != nil {
+		t.Fatal("put file:", err)
+	}
+
+	// Updates the time.
+	if err := client.SetTime(path, oldDirEntry.Time+100); err != nil {
+		t.Fatal("rename file:", err)
+	}
+
+	// Make sure it was really updated.
+	newDirEntry, err := client.Lookup(path, followFinalLink)
+	if err != nil {
+		t.Fatal("lookup file:", err)
+	}
+	if newDirEntry.Time != oldDirEntry.Time+100 {
+		t.Fatalf("time mismatch: got %d expected %d", newDirEntry.Time, oldDirEntry.Time+100)
 	}
 }
 
@@ -670,7 +742,7 @@ func TestSimpleLinks(t *testing.T) {
 		text     = "hello sailor"
 		linkText = "what a lovely day"
 	)
-	client := New(setup(baseCfg, user, ""))
+	client := New(setup(baseCfg, user))
 	// Install and check file.
 	_, err := client.MakeDirectory(dirName)
 	if err != nil {
@@ -745,7 +817,7 @@ func TestGlobLinks(t *testing.T) {
 		linkName = root + "/link" // Will point to dir.
 		text     = "ignored"
 	)
-	client := New(setup(baseCfg, user, ""))
+	client := New(setup(baseCfg, user))
 	_, err := client.MakeDirectory(dirName)
 	if err != nil {
 		t.Fatal(err)
@@ -791,7 +863,7 @@ func TestBrokenLink(t *testing.T) {
 		linkName = root + "/link"
 		linkText = "what a lovely day"
 	)
-	client := New(setup(baseCfg, user, ""))
+	client := New(setup(baseCfg, user))
 	// Install and check file.
 	_, err := client.MakeDirectory(dirName)
 	if err != nil {
@@ -806,8 +878,8 @@ func TestBrokenLink(t *testing.T) {
 		t.Fatal("empty entry from PutLink")
 	}
 	// Attempt Get through the broken link.
-	data, err := client.Get(linkName)
-	if !errors.Match(errors.E(errors.BrokenLink), err) {
+	_, err = client.Get(linkName)
+	if !errors.Is(errors.BrokenLink, err) {
 		t.Fatalf("BrokenLink error not raised for %q: %q", linkName, err)
 	}
 	// Put through the link.
@@ -816,7 +888,7 @@ func TestBrokenLink(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Get through the file.
-	data, err = client.Get(fileName)
+	data, err := client.Get(fileName)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -850,7 +922,7 @@ func TestRejectBadAccessFile(t *testing.T) {
 		accessFile    = root + "/Access"
 		accessContent = "all:*"
 	)
-	client := New(setup(baseCfg, user, ""))
+	client := New(setup(baseCfg, user))
 	_, err := client.Put(accessFile, []byte(accessContent))
 	expectedErr := errors.E(upspin.PathName(accessFile), errors.Invalid)
 	if !errors.Match(expectedErr, err) {
@@ -866,7 +938,7 @@ func TestRejectBadGroupFile(t *testing.T) {
 		groupFile    = groupDir + "/mygroup"
 		groupContent = "foo@x, yo! ; whoo-hoo!"
 	)
-	client := New(setup(baseCfg, user, ""))
+	client := New(setup(baseCfg, user))
 	_, err := client.MakeDirectory(groupDir)
 	if err != nil {
 		t.Fatal(err)
@@ -875,6 +947,87 @@ func TestRejectBadGroupFile(t *testing.T) {
 	expectedErr := errors.E(upspin.PathName(groupFile), errors.Invalid)
 	if !errors.Match(expectedErr, err) {
 		t.Fatalf("error = %s, want = %s", err, expectedErr)
+	}
+}
+
+func TestAllUsers(t *testing.T) {
+	const (
+		user1      = "aly@example.com"
+		user2      = "kim@example.org"
+		accessFile = user1 + "/Access"
+		file       = user1 + "/file"
+	)
+	var (
+		cfg1    = config.SetPacking(setup(baseCfg, user1), upspin.EEPack)
+		cfg2    = setup(baseCfg2, user2)
+		client1 = New(cfg1)
+		client2 = New(cfg2)
+		packer  = pack.Lookup(cfg1.Packing())
+	)
+
+	// Allow all users to read the user's root.
+	de, err := client1.Put(accessFile, []byte("r:all\n*:"+user1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := packer.UnpackableByAll(de); err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Errorf("UnpackableByAll(%q) returned false, want true", accessFile)
+	}
+
+	// Write a file and check its permissions.
+	de, err = client1.Put(file, []byte("some content"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := packer.UnpackableByAll(de); err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Errorf("UnpackableByAll(%q) returned false, want true", file)
+	}
+	_, err = client2.Get(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Remove all users from access file.
+	de, err = client1.Put(accessFile, []byte("*:"+user1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := packer.UnpackableByAll(de); err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Errorf("UnpackableByAll(%q) returned false, want true", accessFile)
+	}
+
+	// Re-write the file and check permissions.
+	de, err = client1.Put(file, []byte("more content"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := packer.UnpackableByAll(de); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Errorf("UnpackableByAll(%q) returned true, want false", file)
+	}
+	_, err = client2.Get(file)
+	if !errors.Is(errors.Private, err) {
+		t.Fatalf("Get(%q) returned %v, want Private error", file, err)
+	}
+
+	// Allow all users again, and check that client2 still can't read file
+	// (it hasn't been re-wrapped yet).
+	_, err = client1.Put(accessFile, []byte("r:all\n*:"+user1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client2.Get(file)
+	if want := "no wrapped key for user"; err == nil {
+		t.Fatalf("Get(%q) returned nil, want %q error", file, want)
+	} else if got := err.Error(); !strings.Contains(got, want) {
+		t.Fatalf("Get(%q) returned %v, want %q error", file, err, want)
 	}
 }
 
