@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// TOOD(adg,r): should test the cases where these ops return NotExist
+// TODO(adg,r): should test the cases where these ops return NotExist
 
 package test
 
@@ -373,6 +373,9 @@ func testWhichAccess(t *testing.T, r *testenv.Runner) {
 	if r.Failed() {
 		t.Fatal(r.Diag())
 	}
+	if r.Entry == nil {
+		t.Fatal("entry is nil")
+	}
 	if got, want := r.Entry.Name, accessFile; got != want {
 		t.Errorf("entry.Name = %q, want = %q", got, want)
 	}
@@ -495,14 +498,16 @@ func testGroupAccess(t *testing.T, r *testenv.Runner) {
 	// both the reader and the owner, and then use that
 	// Group in the owner's Access file.
 	const (
-		readerGroupDir  = readerName + "/Group"
-		readerGroupFile = readerGroupDir + "/team"
+		readerGroupDir        = readerName + "/Group"
+		readerGroupAccessFile = readerGroupDir + "/Access"
+		readerGroupFile       = readerGroupDir + "/team"
 	)
 
 	// Create a tree for reader.
 	r.As(readerName)
 	r.MakeDirectory(readerName + "/")
 	r.MakeDirectory(readerGroupDir)
+	r.Put(readerGroupAccessFile, "r:all\n*:"+readerName)
 	r.Put(readerGroupFile, ownerName+","+readerName)
 
 	// Use only readerGroupFile in Access file.
@@ -542,6 +547,7 @@ func testGroupAccess(t *testing.T, r *testenv.Runner) {
 	// Clean up the reader's tree, as the integration test's cleanup
 	// process doesn't know about it.
 	r.As(readerName)
+	r.Delete(readerGroupAccessFile)
 	r.Delete(readerGroupFile)
 	r.Delete(readerGroupDir)
 	r.Delete(readerName + "/")
@@ -636,6 +642,62 @@ func testWriteReadAllAccessFile(t *testing.T, r *testenv.Runner) {
 	if r.Failed() {
 		t.Fatal(r.Diag())
 	}
+}
+
+// Access files can be created by the owner even if the containing
+// directory does not have Create permission. Others never can.
+func testCreateAccessFile(t *testing.T, r *testenv.Runner) {
+	const (
+		user             = readerName
+		owner            = ownerName
+		base             = ownerName + "/create-access"
+		accessFile       = base + "/Access"
+		subDir           = base + "/dir"
+		subDirAccessFile = subDir + "/Access"
+	)
+
+	const (
+		readAll = "read:all\n"
+		allAll  = "*:all\n"
+	)
+
+	// Create base and subdirectory.
+	r.As(ownerName)
+	r.MakeDirectory(base)
+	r.MakeDirectory(subDir)
+
+	// Put Access file with only read permission.
+	r.Put(accessFile, readAll)
+	if r.Failed() {
+		t.Fatal(r.Diag())
+	}
+
+	// Cannot create Access file if not owner.
+	r.As(user)
+	r.Put(subDirAccessFile, readAll)
+	if !r.Failed() {
+		t.Fatal("expected permission error for non-owner writing Access file with only read:all permission")
+	}
+
+	// Can create Access file as owner, even without Create permission.
+	r.As(owner)
+	r.Put(subDirAccessFile, readAll)
+	if r.Failed() {
+		t.Fatal(r.Diag())
+	}
+
+	// Try again with Create permission for user. Should still fail, as
+	// non-owners cannot create Access files.
+	r.Put(subDirAccessFile, allAll)
+	if r.Failed() {
+		t.Fatal(r.Diag())
+	}
+	r.As(user)
+	r.Put(subDirAccessFile, readAll)
+	if !r.Failed() {
+		t.Fatal("expected permission error for non-owner writing Access file even with Create permission")
+	}
+
 }
 
 // TODO: cross DirServer support for Group files.
